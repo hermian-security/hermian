@@ -1,0 +1,23 @@
+[workspace]
+members = ["hermian-core", "hermian", "hermian-ebpf", "hermian-pam"]
+# hermian-ebpf is a bpfel-unknown-none target built by hermian/build.rs; it must
+# never be compiled for the host, so it is excluded from plain `cargo build`/`test`.
+default-members = ["hermian-core", "hermian", "hermian-pam"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+
+[profile.dev]
+panic = "abort"
+debug = 0

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  core:
+    name: core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p hermian-core --all-targets -- -D warnings
+      - run: cargo test -p hermian-core
+
+  linux:
+    name: daemon + eBPF (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install bpf-linker and libpam
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpam0g-dev
+          cargo install bpf-linker --locked
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Smoke-test the binary
+        run: |
+          ./target/release/hermian --version
+          HERMIAN_COLOR=never ./target/release/hermian test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermian-linux-amd64
+          path: |
+            target/release/hermian
+            target/release/libpam_hermian.so

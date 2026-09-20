@@ -1,0 +1,59 @@
+[Unit]
+Description=HERMIAN defensive security daemon
+Documentation=https://github.com/hermian-security/hermian
+After=network-online.target local-fs.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%EXEC% run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# eBPF maps and perf ring buffers are locked memory; the 64 KiB default makes
+# the perf mmap fail with EPERM on multi-core hosts.
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# State and logs are owned by systemd so ProtectSystem=strict still allows them.
+RuntimeDirectory=hermian
+RuntimeDirectoryMode=0700
+StateDirectory=hermian
+StateDirectoryMode=0700
+LogsDirectory=hermian
+LogsDirectoryMode=0700
+ConfigurationDirectory=hermian
+ConfigurationDirectoryMode=0700
+
+# Hardening. The daemon needs read access to all of /proc and /etc, write
+# access only to its own directories, and the capabilities listed below.
+ProtectSystem=strict
+ReadWritePaths=/etc/hermian
+# PrivateTmp must stay OFF: it would give the daemon an empty private /tmp and
+# hide exactly the directories attackers stage payloads in. The daemon never
+# writes to /tmp itself.
+PrivateTmp=false
+NoNewPrivileges=true
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is intentionally NOT set: the eBPF perf ring buffer
+# requires a shared writable mmap and the option blocks it (EPERM at mmap).
+SystemCallArchitectures=native
+%CAP_BOUNDING%
+%CAP_AMBIENT%
+
+[Install]
+WantedBy=multi-user.target

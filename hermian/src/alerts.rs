@@ -1,0 +1,150 @@
+//! `hermian alerts` and `hermian show`: read alerts back from the JSON store.
+
+use std::fs;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use hermian_core::{render, Alert, DetectionId};
+
+use crate::cli::{severity_filter, AlertsArgs, ShowArgs};
+use crate::paths;
+use crate::ui::{ago, Style};
+
+fn load_all() -> Result<Vec<Alert>> {
+    let dir = paths::alerts_dir();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+    let mut alerts: Vec<Alert> = entries
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+        .filter_map(|e| fs::read_to_string(e.path()).ok())
+        .filter_map(|t| serde_json::from_str(&t).ok())
+        .collect();
+    // Newest first; the ref id is a monotonic per-day sequence so it breaks
+    // ties between alerts raised in the same instant.
+    alerts.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.ref_id.cmp(&a.ref_id)));
+    Ok(alerts)
+}
+
+fn parse_detection(s: &str) -> Option<DetectionId> {
+    match s.to_ascii_uppercase().as_str() {
+        "D1" => Some(DetectionId::D1),
+        "D2" => Some(DetectionId::D2),
+        "D3" => Some(DetectionId::D3),
+        "D4" => Some(DetectionId::D4),
+        "D5" => Some(DetectionId::D5),
+        "SELF" => Some(DetectionId::Self_),
+        _ => None,
+    }
+}
+
+pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
+    let st = Style::detect();
+    let min = severity_filter(args.severity.as_deref())?;
+    let det = match &args.detection {
+        Some(d) => {
+            Some(parse_detection(d).ok_or_else(|| anyhow::anyhow!("unknown detection '{}'", d))?)
+        }
+        None => None,
+    };
+    let alerts: Vec<Alert> = load_all()?
+        .into_iter()
+        .filter(|a| min.map(|m| a.severity >= m).unwrap_or(true))
+        .filter(|a| det.map(|d| a.detection == d).unwrap_or(true))
+        .take(args.limit.max(1))
+        .collect();
+
+    if args.json {
+        for a in &alerts {
+            println!("{}", serde_json::to_string(a)?);
+        }
+        return Ok(());
+    }
+
+    if alerts.is_empty() {
+        println!("{}", st.banner("HERMIAN alerts", ""));
+        println!("{}", st.rule());
+        println!("  {}", st.dim("No alerts recorded."));
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        st.banner(
+            "HERMIAN alerts",
+            &format!(
+                "{} shown{}",
+                alerts.len(),
+                match min {
+                    Some(m) => format!(" \u{00B7} {}+", m.as_str()),
+                    None => String::new(),
+                }
+            )
+        )
+    );
+    println!("{}", st.rule());
+    for a in &alerts {
+        let sev = st.sev(a.severity, &format!("{:<8}", a.severity.as_str()));
+        let when = a.ts.format("%m-%d %H:%M").to_string();
+        let ref_short = a.ref_id.rsplit('-').next().unwrap_or(&a.ref_id);
+        let repeats = if a.repeats > 1 {
+            st.dim(&format!(" x{}", a.repeats))
+        } else {
+            String::new()
+        };
+        println!(
+            "  {} {}  {} {}  {}{}",
+            st.dim(&when),
+            st.dim(&format!("{:>3}", ref_short)),
+            sev,
+            st.dim(&format!("{:<4}", a.detection.short())),
+            a.title,
+            repeats
+        );
+    }
+    println!("{}", st.rule());
+    println!(
+        "  {}",
+        st.dim(&format!(
+            "hermian show <ref>  \u{00B7}  hermian collect <ref>  \u{00B7}  newest first, latest {}",
+            ago(alerts[0].ts)
+        ))
+    );
+    Ok(())
+}
+
+/// Accept a full ref or a bare sequence number for today.
+fn resolve_ref(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.to_ascii_uppercase().starts_with("HER-") {
+        return trimmed.to_ascii_uppercase();
+    }
+    if let Ok(n) = trimmed.parse::<u32>() {
+        return format!("HER-{}-{:03}", Utc::now().format("%Y-%m%d"), n);
+    }
+    trimmed.to_string()
+}
+
+pub fn load_alert(ref_id: &str) -> Result<Alert> {
+    let ref_id = resolve_ref(ref_id);
+    let path = paths::alerts_dir().join(format!("{}.json", ref_id));
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no alert {} (looked in {})",
+            ref_id,
+            paths::alerts_dir().display()
+        )
+    })?;
+    serde_json::from_str(&text).context("alert file is corrupt")
+}
+
+pub fn cmd_show(args: &ShowArgs) -> Result<()> {
+    let alert = load_alert(&args.ref_id)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&alert)?);
+    } else {
+        print!("{}", render(&alert, Style::detect().theme()));
+    }
+    Ok(())
+}

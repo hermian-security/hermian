@@ -1,0 +1,22 @@
+Source: hermian
+Section: admin
+Priority: optional
+Maintainer: HERMIAN Security <security@hermian.security>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.79), llvm, clang, libpam0g-dev
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/hermian-security/hermian
+Vcs-Browser: https://github.com/hermian-security/hermian
+Vcs-Git: https://github.com/hermian-security/hermian.git
+
+Package: hermian
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd
+Recommends: nftables
+Suggests: libpam-modules
+Description: lightweight defensive security daemon
+ HERMIAN detects high-confidence signs of compromise on a Linux host using
+ deterministic, contextual detection (process chains, SSH abuse, persistence,
+ privilege escalation, anomalous network behavior) and alerts locally via
+ journald, a log file, or a webhook. No dashboard, no YAML rules, no alert
+ fatigue: install, enable, forget - HERMIAN only interrupts you when it matters.

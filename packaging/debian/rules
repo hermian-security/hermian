@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+# The systemd unit is rendered and installed by `hermian enable` (run from
+# postinst), so the raw template is intentionally NOT shipped under /lib/systemd.
+export CARGO_HOME ?= $(CURDIR)/debian/cargo
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	cargo test --release --locked --no-fail-fast
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/hermian debian/hermian/usr/bin/hermian
+	install -D -m 0644 README.md debian/hermian/usr/share/doc/hermian/README.md
+	install -D -m 0644 PROJECT.md debian/hermian/usr/share/doc/hermian/PROJECT.md
+	if [ -f target/release/libpam_hermian.so ]; then \
+		install -D -m 0644 target/release/libpam_hermian.so debian/hermian/usr/lib/security/pam_hermian.so; \
+	fi
+
+override_dh_installsystemd:
+	# unit is generated at `hermian enable` time
+
+override_dh_auto_clean:
+	cargo clean || true

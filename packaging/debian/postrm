@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        rm -f /etc/systemd/system/hermian.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    ;;
+    purge)
+        rm -f /etc/systemd/system/hermian.service
+        rm -rf /etc/hermian /var/lib/hermian /var/log/hermian /run/hermian
+        if [ -f /etc/pam.d/sshd ] && grep -q pam_hermian.so /etc/pam.d/sshd 2>/dev/null; then
+            sed -i '/pam_hermian.so/d' /etc/pam.d/sshd
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    ;;
+esac
+
+exit 0

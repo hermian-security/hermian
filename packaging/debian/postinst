@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Renders the systemd unit for the installed binary path, initialises
+        # integrity hashes and the baseline, then starts the daemon.
+        if command -v hermian >/dev/null 2>&1; then
+            hermian enable --quiet || echo "hermian: 'hermian enable' failed; run it manually" >&2
+        fi
+    ;;
+esac
+
+exit 0

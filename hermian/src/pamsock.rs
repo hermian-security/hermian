@@ -1,0 +1,114 @@
+//! Datagram socket receiving auth events from `pam_hermian.so`.
+
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use hermian_core::{AuthEvent, AuthResult, Event};
+use tokio::sync::mpsc;
+
+use crate::paths;
+
+pub fn pam_module_installed() -> bool {
+    std::path::Path::new(paths::PAM_MODULE_PATH).exists()
+}
+
+pub fn spawn_pam_listener(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) -> Result<()> {
+    let dir = paths::run_dir();
+    std::fs::create_dir_all(&dir)?;
+    // The PAM module runs as root inside sshd; keep the dir private but the
+    // socket itself must be writable by root only, which is the default.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = paths::pam_socket();
+    let _ = std::fs::remove_file(&path);
+    let sock = UnixDatagram::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    sock.set_read_timeout(Some(Duration::from_secs(1)))?;
+
+    std::thread::Builder::new()
+        .name("hermian-pam".to_string())
+        .spawn(move || pam_listener_loop(sock, tx, shutdown))?;
+    Ok(())
+}
+
+fn pam_listener_loop(sock: UnixDatagram, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
+    let mut buf = [0u8; 4096];
+    while !shutdown.load(Ordering::Relaxed) {
+        match sock.recv(&mut buf) {
+            Ok(n) if n > 0 => {
+                if let Some(ev) = parse_pam_payload(&String::from_utf8_lossy(&buf[..n])) {
+                    if tx.blocking_send(Event::Auth(ev)).is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let _ = std::fs::remove_file(paths::pam_socket());
+}
+
+pub fn parse_pam_payload(payload: &str) -> Option<AuthEvent> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let result = match v.get("result")?.as_str()? {
+        "attempt" => AuthResult::Attempt,
+        "success" => AuthResult::Success,
+        "failure" => AuthResult::Failure,
+        _ => return None,
+    };
+    let user = v.get("user")?.as_str()?.to_string();
+    if user.is_empty() {
+        return None;
+    }
+    let service = v
+        .get("service")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sshd")
+        .to_string();
+    let tty = v
+        .get("tty")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rhost = v
+        .get("rhost")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
+    let ts = v
+        .get("ts")
+        .and_then(|t| t.as_u64())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs as i64, 0))
+        .unwrap_or_else(chrono::Utc::now);
+    Some(AuthEvent {
+        ts,
+        result,
+        user,
+        rhost,
+        service,
+        tty,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_module_payload() {
+        let ev = parse_pam_payload(r#"{"ts":1700000000,"result":"success","user":"alice","rhost":"10.0.0.5","service":"sshd","tty":"ssh"}"#).unwrap();
+        assert_eq!(ev.result, AuthResult::Success);
+        assert_eq!(ev.user, "alice");
+        assert_eq!(ev.rhost, Some("10.0.0.5".parse().unwrap()));
+        assert!(parse_pam_payload(r#"{"result":"success","user":""}"#).is_none());
+        assert!(parse_pam_payload("garbage").is_none());
+    }
+}
