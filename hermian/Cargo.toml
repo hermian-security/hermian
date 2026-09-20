@@ -26,3 +26,30 @@ sha2 = "0.10"
 hex = "0.4"
 inotify = "0.11"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "sendmail-transport", "rustls-tls", "builder"] }
+
+# `cargo deb -p hermian` builds the Debian/Ubuntu package (see docs/RELEASE.md).
+[package.metadata.deb]
+name = "hermian"
+maintainer = "HERMIAN Security <security@hermian.security>"
+copyright = "2025, HERMIAN Security"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+HERMIAN detects high-confidence signs of compromise on a Linux host using \
+deterministic, contextual detection (process chains, SSH abuse, persistence, \
+privilege escalation, anomalous network behavior) and alerts locally or via \
+Telegram, email or webhook. No dashboard, no YAML rules, no alert fatigue: \
+install, enable, forget - HERMIAN only interrupts you when it matters."""
+depends = "$auto, systemd"
+recommends = "nftables"
+section = "admin"
+priority = "optional"
+assets = [
+    ["target/release/hermian", "usr/bin/", "755"],
+    ["target/release/libpam_hermian.so", "usr/lib/security/pam_hermian.so", "644"],
+    ["../README.md", "usr/share/doc/hermian/", "644"],
+    ["../PROJECT.md", "usr/share/doc/hermian/", "644"],
+    ["../packaging/sysctl/60-hermian.conf", "etc/sysctl.d/", "644"],
+]
+conf-files = ["/etc/sysctl.d/60-hermian.conf"]
+maintainer-scripts = "../packaging/debian"

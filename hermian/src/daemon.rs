@@ -102,6 +102,8 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             last_delivery_note: s.last_delivery_note,
             failures: s.failures,
             pending: 0,
+            last_error: String::new(),
+            per_channel: Default::default(),
         })
         .unwrap_or_default();
     let notifier =
@@ -753,6 +755,8 @@ fn write_status_snapshot(
         last_delivery_note: ns.last_delivery_note,
         failures: ns.failures,
         pending_notifications: ns.pending,
+        last_notify_error: ns.last_error.clone(),
+        delivered_per_channel: ns.per_channel.clone(),
         config_hash: integrity.config_hash.clone(),
         binary_hash: integrity.binary_hash.clone(),
         integrity_ok: integrity.binary_ok && integrity.config_ok,

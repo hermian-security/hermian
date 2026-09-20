@@ -38,6 +38,8 @@ pub struct StatusState {
     pub last_delivery_note: String,
     pub failures: u64,
     pub pending_notifications: usize,
+    pub last_notify_error: String,
+    pub delivered_per_channel: BTreeMap<String, u64>,
     pub config_hash: String,
     pub binary_hash: String,
     pub integrity_ok: bool,
@@ -72,6 +74,8 @@ impl Default for StatusState {
             last_delivery_note: String::new(),
             failures: 0,
             pending_notifications: 0,
+            last_notify_error: String::new(),
+            delivered_per_channel: BTreeMap::new(),
             config_hash: String::new(),
             binary_hash: String::new(),
             integrity_ok: true,
@@ -225,11 +229,26 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     };
     out.push_str(&st.row("Last delivery", &last));
     out.push('\n');
+    if !state.delivered_per_channel.is_empty() {
+        let parts: Vec<String> = state
+            .delivered_per_channel
+            .iter()
+            .map(|(k, v)| format!("{} {}", k, v))
+            .collect();
+        out.push_str(&st.row("Delivered", &st.dim(&parts.join(" \u{00B7} "))));
+        out.push('\n');
+    }
     if state.pending_notifications > 0 {
         out.push_str(&st.row(
             "Queued",
             &st.warn(&format!("{} undelivered", state.pending_notifications)),
         ));
+        out.push('\n');
+    }
+    if !state.last_notify_error.is_empty()
+        && (state.pending_notifications > 0 || state.failures > 0)
+    {
+        out.push_str(&st.row("Last error", &st.warn(&state.last_notify_error)));
         out.push('\n');
     }
     if state.failures > 0 {

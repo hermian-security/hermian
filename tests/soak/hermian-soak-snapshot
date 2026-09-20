@@ -1,0 +1,28 @@
+#!/bin/sh
+# Append one JSON line with alert counts since the soak started plus the
+# daemon's resource figures. Installed to /usr/local/bin and run hourly by
+# /etc/cron.d/hermian-soak (see start.sh).
+set -eu
+START_FILE=/var/lib/hermian/soak-start
+[ -f "$START_FILE" ] || date -u +%Y-%m-%dT%H:%M:%SZ > "$START_FILE"
+START=$(cat "$START_FILE")
+mkdir -p /var/log/hermian
+hermian alerts -n 5000 --json 2>/dev/null | python3 -c '
+import sys, json, collections, datetime
+start = sys.argv[1]
+c = collections.Counter(); titles = collections.Counter()
+for l in sys.stdin:
+    a = json.loads(l)
+    if a["ts"] < start: continue
+    c[a["severity"]] += 1
+    if a["severity"] in ("High", "Critical"):
+        titles["%s %s" % (a["detection"], a["title"])] += 1
+try:
+    st = json.load(open("/var/lib/hermian/state.json"))
+    st = {k: st[k] for k in ("cpu_avg_1h", "rss_mb", "events_processed", "watches_active", "watches_failed", "ebpf", "pending_notifications", "failures") if k in st}
+except Exception:
+    st = {}
+print(json.dumps({
+    "snapshot": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "since": start, "counts": dict(c), "high_plus": dict(titles), "status": st}))
+' "$START" >> /var/log/hermian/soak.jsonl

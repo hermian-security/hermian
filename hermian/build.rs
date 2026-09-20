@@ -151,13 +151,30 @@ fn main() {
         return;
     }
 
+    // Order of preference:
+    //   1. build from source when a BPF toolchain is present (developers);
+    //   2. the vendored object in hermian-ebpf/prebuilt (release builds and
+    //      hosts whose LLVM is too old for bpf-linker);
+    //   3. fail with instructions.
+    // HERMIAN_EBPF_FROM_SOURCE=1 forces (1) and refuses to fall back, so CI
+    // can prove the vendored object is up to date.
+    let vendored = ebpf_dir.join("prebuilt/hermian-ebpf.o");
+    println!("cargo:rerun-if-changed={}", vendored.display());
+    println!("cargo:rerun-if-env-changed=HERMIAN_EBPF_FROM_SOURCE");
+    let force_source = env::var_os("HERMIAN_EBPF_FROM_SOURCE").is_some();
+
     let obj_path = match build_ebpf(&ebpf_dir, &out_dir) {
         Ok(p) => p,
+        Err(why) if vendored.is_file() && !force_source => {
+            println!("cargo:warning=hermian-ebpf: no BPF toolchain ({why}); using vendored hermian-ebpf/prebuilt/hermian-ebpf.o");
+            vendored
+        }
         Err(why) => panic!(
-            "\n\nhermian-ebpf build failed ({why}).\n\
+            "\n\nhermian-ebpf build failed ({why}) and no vendored object was found.\n\
              One of the following is required on the build host:\n  \
              a) rustup target add bpfel-unknown-none && cargo install bpf-linker\n  \
-             b) rustup toolchain install nightly --component rust-src && cargo install bpf-linker\n"
+             b) rustup toolchain install nightly --component rust-src && cargo install bpf-linker\n  \
+             c) HERMIAN_EBPF_PREBUILT=/path/to/hermian-ebpf.o\n"
         ),
     };
 

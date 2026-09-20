@@ -2,6 +2,7 @@ mod alerts;
 mod auditnetlink;
 mod authlog;
 mod btf;
+mod channels;
 mod cli;
 mod collect;
 mod config;
@@ -31,6 +32,7 @@ fn main() {
         cli::Cmd::Alerts(args) => alerts::cmd_alerts(&args),
         cli::Cmd::Show(args) => alerts::cmd_show(&args),
         cli::Cmd::Test(args) => cli::cmd_test(&args),
+        cli::Cmd::NotifyTest(args) => cli::cmd_notify_test(&args),
         cli::Cmd::Collect(args) => collect::run(&args),
         cli::Cmd::Isolate => isolate::cmd_isolate(),
         cli::Cmd::Unisolate => isolate::cmd_unisolate(),

@@ -26,6 +26,22 @@ pub enum ConfigError {
     WebhookScheme,
     #[error("notifications.webhook.format must be one of generic, slack, discord, ntfy")]
     WebhookFormat,
+    #[error("notifications.telegram.bot_token is required (format: 123456:ABC-DEF...)")]
+    TelegramToken,
+    #[error("notifications.telegram.chat_id is required")]
+    TelegramChat,
+    #[error("notifications.email.transport must be smtp or sendmail")]
+    EmailTransport,
+    #[error("notifications.email.from must be a valid address")]
+    EmailFrom,
+    #[error("notifications.email.to must contain at least one valid address")]
+    EmailTo,
+    #[error("notifications.email.smtp_host is required for the smtp transport")]
+    EmailSmtpHost,
+    #[error("notifications.email.smtp_security must be starttls, tls or none")]
+    EmailSmtpSecurity,
+    #[error("notifications.email.smtp_username and smtp_password must be set together")]
+    EmailSmtpAuth,
     #[error("ssh.off_hours_start/end must be between 0 and 23")]
     OffHours,
     #[error("response.auto_isolate requires at least one entry in response.management_cidrs")]
@@ -141,13 +157,81 @@ impl Default for WebhookCfg {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct TelegramCfg {
+    /// Bot token from @BotFather, e.g. "123456789:AAH...".
+    pub bot_token: String,
+    /// Chat, group or channel id (negative for groups). Get it from
+    /// https://api.telegram.org/bot<token>/getUpdates after messaging the bot.
+    pub chat_id: String,
+    /// Optional topic id for forum-style supergroups.
+    pub message_thread_id: Option<i64>,
+    /// Send CRITICAL alerts with notification sound (others are silent).
+    pub silent_below_critical: bool,
+    pub timeout_secs: u64,
+}
+
+impl Default for TelegramCfg {
+    fn default() -> Self {
+        TelegramCfg {
+            bot_token: String::new(),
+            chat_id: String::new(),
+            message_thread_id: None,
+            silent_below_critical: true,
+            timeout_secs: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmailCfg {
+    /// smtp | sendmail
+    pub transport: String,
+    pub from: String,
+    pub to: Vec<String>,
+    /// Prefix for the subject line, e.g. "[HERMIAN]".
+    pub subject_prefix: String,
+    // --- smtp transport ---
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    /// starttls | tls | none
+    pub smtp_security: String,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub timeout_secs: u64,
+    // --- sendmail transport ---
+    pub sendmail_path: String,
+}
+
+impl Default for EmailCfg {
+    fn default() -> Self {
+        EmailCfg {
+            transport: "smtp".to_string(),
+            from: String::new(),
+            to: Vec::new(),
+            subject_prefix: "[HERMIAN]".to_string(),
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_security: "starttls".to_string(),
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            timeout_secs: 20,
+            sendmail_path: "/usr/sbin/sendmail".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct NotificationsCfg {
     pub channels: Vec<String>,
     pub dedup_window_secs: u64,
-    /// Minimum severity that is *notified* (sent to webhook/stdout). Everything
-    /// is always written to journald/file regardless.
+    /// Minimum severity that is *notified* (sent to webhook/telegram/email/
+    /// stdout). Everything is always written to journald/file regardless.
     pub min_severity: String,
     pub webhook: WebhookCfg,
+    pub telegram: TelegramCfg,
+    pub email: EmailCfg,
 }
 
 impl Default for NotificationsCfg {
@@ -157,6 +241,8 @@ impl Default for NotificationsCfg {
             dedup_window_secs: 300,
             min_severity: "HIGH".to_string(),
             webhook: WebhookCfg::default(),
+            telegram: TelegramCfg::default(),
+            email: EmailCfg::default(),
         }
     }
 }
@@ -190,7 +276,10 @@ pub struct Config {
     pub allowlist: Allowlist,
 }
 
-pub const SUPPORTED_CHANNELS: &[&str] = &["journald", "file", "stdout", "webhook"];
+pub const SUPPORTED_CHANNELS: &[&str] =
+    &["journald", "file", "stdout", "webhook", "telegram", "email"];
+pub const SUPPORTED_EMAIL_TRANSPORTS: &[&str] = &["smtp", "sendmail"];
+pub const SUPPORTED_SMTP_SECURITY: &[&str] = &["starttls", "tls", "none"];
 pub const SUPPORTED_WEBHOOK_FORMATS: &[&str] = &["generic", "slack", "discord", "ntfy"];
 
 impl Config {
@@ -237,6 +326,38 @@ impl Config {
                 return Err(ConfigError::WebhookFormat);
             }
         }
+        if self.notifications.has_channel("telegram") {
+            let t = &self.notifications.telegram;
+            if t.bot_token.is_empty() || !t.bot_token.contains(':') {
+                return Err(ConfigError::TelegramToken);
+            }
+            if t.chat_id.is_empty() {
+                return Err(ConfigError::TelegramChat);
+            }
+        }
+        if self.notifications.has_channel("email") {
+            let e = &self.notifications.email;
+            if !SUPPORTED_EMAIL_TRANSPORTS.contains(&e.transport.as_str()) {
+                return Err(ConfigError::EmailTransport);
+            }
+            if e.from.is_empty() || !e.from.contains('@') {
+                return Err(ConfigError::EmailFrom);
+            }
+            if e.to.is_empty() || e.to.iter().any(|a| !a.contains('@')) {
+                return Err(ConfigError::EmailTo);
+            }
+            if e.transport == "smtp" {
+                if e.smtp_host.is_empty() {
+                    return Err(ConfigError::EmailSmtpHost);
+                }
+                if !SUPPORTED_SMTP_SECURITY.contains(&e.smtp_security.as_str()) {
+                    return Err(ConfigError::EmailSmtpSecurity);
+                }
+                if e.smtp_username.is_empty() != e.smtp_password.is_empty() {
+                    return Err(ConfigError::EmailSmtpAuth);
+                }
+            }
+        }
         if self.response.auto_isolate && self.response.management_cidrs.is_empty() {
             return Err(ConfigError::IsolateWithoutCidrs);
         }
@@ -278,14 +399,36 @@ d4_priv_esc = true
 d5_network = true
 
 [notifications]
-# journald and file receive every alert. stdout and webhook receive alerts at or
-# above min_severity.
+# journald and file receive every alert. The other channels receive alerts at
+# or above min_severity. Enable a channel by adding it to this list:
+#   "telegram", "email", "webhook", "stdout"
 channels = ["journald", "file"]
 dedup_window_secs = 300
 min_severity = "HIGH"
 
+[notifications.telegram]
+# 1. Message @BotFather, /newbot, copy the token.
+# 2. Send any message to your new bot (or add it to a group).
+# 3. curl https://api.telegram.org/bot<TOKEN>/getUpdates  -> "chat":{"id":...}
+bot_token = ""
+chat_id = ""
+silent_below_critical = true   # only CRITICAL makes a sound
+timeout_secs = 10
+
+[notifications.email]
+transport = "smtp"             # smtp | sendmail (use the host's MTA)
+from = ""                      # e.g. "hermian@example.com"
+to = []                        # e.g. ["ops@example.com"]
+subject_prefix = "[HERMIAN]"
+smtp_host = ""                 # e.g. "smtp.gmail.com" (use an app password)
+smtp_port = 587
+smtp_security = "starttls"     # starttls (587) | tls (465) | none (25, local relay)
+smtp_username = ""
+smtp_password = ""
+timeout_secs = 20
+sendmail_path = "/usr/sbin/sendmail"
+
 [notifications.webhook]
-# Enable by adding "webhook" to channels above.
 url = ""
 format = "generic"      # generic | slack | discord | ntfy
 token = ""
@@ -388,6 +531,40 @@ reason = "ansible"
         assert!(matches!(cfg.validate(), Err(ConfigError::WebhookScheme)));
         let cfg = Config::parse(
             "[notifications]\nchannels = [\"journald\", \"webhook\"]\n[notifications.webhook]\nurl = \"https://hooks.example/x\"\nformat = \"slack\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn telegram_and_email_validation() {
+        let cfg = Config::parse("[notifications]\nchannels = [\"telegram\"]\n").unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::TelegramToken)));
+        let cfg = Config::parse(
+            "[notifications]\nchannels = [\"telegram\"]\n[notifications.telegram]\nbot_token = \"1:x\"\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::TelegramChat)));
+        let cfg = Config::parse(
+            "[notifications]\nchannels = [\"telegram\"]\n[notifications.telegram]\nbot_token = \"1:x\"\nchat_id = \"-100\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let cfg = Config::parse("[notifications]\nchannels = [\"email\"]\n").unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::EmailFrom)));
+        let cfg = Config::parse(
+            "[notifications]\nchannels = [\"email\"]\n[notifications.email]\nfrom = \"a@b\"\nto = [\"c@d\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::EmailSmtpHost)));
+        let cfg = Config::parse(
+            "[notifications]\nchannels = [\"email\"]\n[notifications.email]\nfrom = \"a@b\"\nto = [\"c@d\"]\nsmtp_host = \"h\"\nsmtp_username = \"u\"\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::EmailSmtpAuth)));
+        let cfg = Config::parse(
+            "[notifications]\nchannels = [\"email\"]\n[notifications.email]\ntransport = \"sendmail\"\nfrom = \"a@b\"\nto = [\"c@d\"]\n",
         )
         .unwrap();
         cfg.validate().unwrap();

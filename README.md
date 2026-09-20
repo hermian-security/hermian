@@ -120,6 +120,7 @@ sudo hermian collect HER-2025-0914-001   # forensic bundle: processes, files, ha
 
 sudo hermian test                   # synthetic attack self-test + sample alert
 sudo hermian test --verbose         # print every sample alert
+sudo hermian notify-test            # verify Telegram/email/webhook and send a test alert
 
 sudo hermian isolate                # nftables isolation; management CIDRs stay reachable
 sudo hermian unisolate
@@ -127,6 +128,81 @@ sudo hermian uninstall --yes
 ```
 
 Colour is used only on a TTY; set `NO_COLOR=1` or `HERMIAN_COLOR=never|always`.
+
+## Getting notified
+
+`journald` and the alert log always receive everything. To be *told* about
+HIGH/CRITICAL alerts, enable one or more notifying channels. The daemon
+applies the change on save (or `systemctl reload hermian`) and
+`hermian notify-test` proves the path works before you rely on it.
+
+### Telegram
+
+1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, copy the token.
+2. Open a chat with your new bot and send it any message (or add it to a
+   group/channel and post there).
+3. Find the chat id:
+   ```bash
+   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":-\?[0-9]*'
+   ```
+   Personal chats are positive, groups negative, supergroups start with `-100`.
+4. Configure and test:
+   ```toml
+   [notifications]
+   channels = ["journald", "file", "telegram"]
+
+   [notifications.telegram]
+   bot_token = "123456789:AAH..."
+   chat_id = "-1001234567890"
+   silent_below_critical = true   # HIGH arrives muted, CRITICAL makes a sound
+   ```
+   ```bash
+   sudo hermian notify-test            # probes token + chat, sends one test alert
+   ```
+
+### Email
+
+**Via an SMTP account** (Gmail/Workspace need an *app password*; Fastmail,
+Postmark, SES, Mailgun all work the same way):
+
+```toml
+[notifications]
+channels = ["journald", "file", "email"]
+
+[notifications.email]
+transport = "smtp"
+from = "hermian@example.com"
+to = ["ops@example.com", "you@example.com"]
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_security = "starttls"       # starttls (587) | tls (465) | none (25, local relay)
+smtp_username = "hermian@example.com"
+smtp_password = "app-password-here"
+```
+
+**Via the host's own MTA** (postfix/exim/msmtp already configured):
+
+```toml
+[notifications.email]
+transport = "sendmail"
+from = "hermian@example.com"
+to = ["ops@example.com"]
+```
+
+```bash
+sudo hermian notify-test --channel email --probe-only   # connect + auth only
+sudo hermian notify-test                                # send a test alert
+```
+
+Emails are multipart: a plain-text body identical to the terminal rendering
+and an HTML version with the same layout. Subjects are
+`[HERMIAN] CRITICAL D3 | host | title` so mail filters can key on them.
+
+Both channels: failed deliveries are retried with backoff and never
+duplicated across channels; `hermian status` shows the last error and
+per-channel delivery counts, and 15 minutes of continuous failure raises a
+local CRITICAL. Secrets live only in the 0600 config file and are redacted
+from error messages.
 
 ## Configuration
 
@@ -136,8 +212,8 @@ tampering is never silent. `systemctl reload hermian` (SIGHUP) also reloads.
 
 ```toml
 [notifications]
-channels = ["journald", "file", "webhook"]   # journald + file always get everything
-min_severity = "HIGH"                         # stdout/webhook threshold
+channels = ["journald", "file", "telegram", "email"]   # journald + file always get everything
+min_severity = "HIGH"                                  # threshold for notifying channels
 dedup_window_secs = 300
 
 [notifications.webhook]

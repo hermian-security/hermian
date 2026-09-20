@@ -44,9 +44,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpam0g-dev
           cargo install bpf-linker --locked
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --release
-      - run: cargo build --release
+      # Build the eBPF object from source and refuse the vendored fallback, so a
+      # stale hermian-ebpf/prebuilt/hermian-ebpf.o fails CI instead of shipping.
+      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo clippy --all-targets -- -D warnings
+      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release
+      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release
+      - name: Vendored eBPF object is current
+        run: |
+          OBJ=$(find target/release/build -path '*/ebpf-target/bpfel-unknown-none/release/hermian-ebpf' | head -1)
+          cmp "$OBJ" hermian-ebpf/prebuilt/hermian-ebpf.o
       - name: Smoke-test the binary
         run: |
           ./target/release/hermian --version

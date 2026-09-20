@@ -27,6 +27,12 @@ pub struct NotifyState {
     pub failures: u64,
     #[serde(default)]
     pub pending: usize,
+    /// Most recent channel error, e.g. "telegram: HTTP 401 Unauthorized".
+    #[serde(default)]
+    pub last_error: String,
+    /// Successful deliveries per channel since the daemon started.
+    #[serde(default)]
+    pub per_channel: std::collections::BTreeMap<String, u64>,
 }
 
 pub struct Notifier {
@@ -98,12 +104,22 @@ impl Notifier {
 /// Alerts waiting for a notifying channel to accept them.
 const MAX_PENDING: usize = 500;
 
+/// Channels that deliver to a human (gated by `min_severity`, retried).
+pub const NOTIFYING_CHANNELS: &[&str] = &["telegram", "email", "webhook", "stdout"];
+
+/// An alert plus the channels that have not yet accepted it, so a failure on
+/// one channel never causes a duplicate on another.
+struct Pending {
+    alert: Alert,
+    owed: Vec<&'static str>,
+}
+
 async fn worker(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     mut cfg: NotificationsCfg,
     state: Arc<Mutex<NotifyState>>,
 ) {
-    let mut pending: VecDeque<Alert> = VecDeque::new();
+    let mut pending: VecDeque<Pending> = VecDeque::new();
     let mut failing_since: Option<DateTime<Utc>> = None;
     let mut failing_alarm_sent = false;
     let mut backoff = Duration::from_secs(5);
@@ -119,11 +135,12 @@ async fn worker(
                         // never block on network.
                         let rendered_plain = hermian_core::render(&alert, Theme::Plain);
                         persist(&alert, &rendered_plain, &cfg);
-                        if alert.severity >= cfg.min_severity() && has_notifying_channel(&cfg) {
+                        let owed = notifying_channels(&cfg);
+                        if alert.severity >= cfg.min_severity() && !owed.is_empty() {
                             if pending.len() >= MAX_PENDING {
                                 pending.pop_front();
                             }
-                            pending.push_back(alert);
+                            pending.push_back(Pending { alert, owed });
                         } else {
                             mark_delivered(&state, &alert);
                         }
@@ -138,42 +155,74 @@ async fn worker(
         }
 
         // Attempt delivery of everything pending, in order, stop at first failure
-        // to preserve ordering and avoid hammering a down endpoint.
+        // to preserve ordering and avoid hammering a down endpoint. Network I/O
+        // runs on the blocking pool so the daemon's event loop is never stalled
+        // by a slow SMTP server.
         let mut delivered_any = false;
-        while let Some(alert) = pending.front() {
-            match notify(alert, &cfg) {
-                Ok(()) => {
-                    mark_delivered(&state, alert);
-                    pending.pop_front();
-                    delivered_any = true;
-                }
-                Err(e) => {
-                    let now = Utc::now();
-                    let since = *failing_since.get_or_insert(now);
-                    if now - since > chrono::Duration::minutes(15) && !failing_alarm_sent {
-                        failing_alarm_sent = true;
+        let mut last_error = String::new();
+        while let Some(p) = pending.front_mut() {
+            let alert = p.alert.clone();
+            let owed = p.owed.clone();
+            let cfg_c = cfg.clone();
+            let results = tokio::task::spawn_blocking(move || {
+                owed.iter()
+                    .map(|ch| (*ch, notify_one(ch, &alert, &cfg_c)))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let mut still_owed = Vec::new();
+            for (ch, r) in results {
+                match r {
+                    Ok(()) => {
+                        delivered_any = true;
                         if let Ok(mut s) = state.lock() {
-                            s.failures += 1;
+                            *s.per_channel.entry(ch.to_string()).or_default() += 1;
                         }
-                        syslog_msg(
-                            Severity::Critical,
-                            &format!(
-                                "HERMIAN CRITICAL: alert notification delivery has been failing for more than 15 minutes ({} queued, last error: {})",
-                                pending.len(),
-                                e
-                            ),
-                        );
                     }
-                    break;
+                    Err(e) => {
+                        last_error = format!("{}: {}", ch, e);
+                        if let Ok(mut s) = state.lock() {
+                            s.last_error = last_error.clone();
+                        }
+                        still_owed.push(ch);
+                    }
                 }
             }
+            if still_owed.is_empty() {
+                mark_delivered(&state, &p.alert);
+                pending.pop_front();
+            } else {
+                p.owed = still_owed;
+                break;
+            }
         }
-        if delivered_any || pending.is_empty() {
+        if pending.is_empty() {
             failing_since = None;
             failing_alarm_sent = false;
             backoff = Duration::from_secs(5);
         } else {
-            backoff = (backoff * 2).min(Duration::from_secs(120));
+            let now = Utc::now();
+            let since = *failing_since.get_or_insert(now);
+            if now - since > chrono::Duration::minutes(15) && !failing_alarm_sent {
+                failing_alarm_sent = true;
+                if let Ok(mut s) = state.lock() {
+                    s.failures += 1;
+                }
+                syslog_msg(
+                    Severity::Critical,
+                    &format!(
+                        "HERMIAN CRITICAL: alert notification delivery has been failing for more than 15 minutes ({} queued, last error: {})",
+                        pending.len(),
+                        last_error
+                    ),
+                );
+            }
+            backoff = if delivered_any {
+                Duration::from_secs(5)
+            } else {
+                (backoff * 2).min(Duration::from_secs(120))
+            };
         }
         if let Ok(mut s) = state.lock() {
             s.pending = pending.len();
@@ -184,8 +233,26 @@ async fn worker(
     }
 }
 
-fn has_notifying_channel(cfg: &NotificationsCfg) -> bool {
-    cfg.has_channel("webhook") || cfg.has_channel("stdout")
+fn notifying_channels(cfg: &NotificationsCfg) -> Vec<&'static str> {
+    NOTIFYING_CHANNELS
+        .iter()
+        .copied()
+        .filter(|c| cfg.has_channel(c))
+        .collect()
+}
+
+/// Deliver one alert to one notifying channel.
+pub fn notify_one(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), String> {
+    match channel {
+        "stdout" => {
+            println!("{}", hermian_core::render(alert, Theme::Plain));
+            Ok(())
+        }
+        "webhook" => webhook::send(alert, &cfg.webhook),
+        "telegram" => crate::channels::telegram::send(alert, &cfg.telegram),
+        "email" => crate::channels::email::send(alert, &cfg.email),
+        other => Err(format!("unknown channel {}", other)),
+    }
 }
 
 fn mark_delivered(state: &Arc<Mutex<NotifyState>>, alert: &Alert) {
@@ -209,17 +276,6 @@ fn persist(alert: &Alert, rendered: &str, cfg: &NotificationsCfg) {
             eprintln!("hermian: failed to write alert log: {}", e);
         }
     }
-}
-
-/// Notifying channels; returns Err if any configured channel failed.
-fn notify(alert: &Alert, cfg: &NotificationsCfg) -> Result<(), String> {
-    if cfg.has_channel("stdout") {
-        println!("{}", hermian_core::render(alert, Theme::Plain));
-    }
-    if cfg.has_channel("webhook") {
-        webhook::send(alert, &cfg.webhook)?;
-    }
-    Ok(())
 }
 
 fn append_alert_log(rendered: &str) -> anyhow::Result<()> {
