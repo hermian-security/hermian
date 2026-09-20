@@ -83,9 +83,11 @@ A user should be able to install HERMIAN in under 3 minutes.
 **Target installation flow:**
 
 ```bash
-# Verify the signing key before doing anything
-curl -fsSL https://packages.hermian.security/gpg.pub | gpg --import
-gpg --verify hermian-1.0.0-linux-amd64.sig hermian-1.0.0-linux-amd64.tar.gz
+# Verify the release before doing anything (Sigstore, keyless)
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
+  --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum -c SHA256SUMS --ignore-missing
 
 # Or via system package manager (preferred)
 sudo apt install hermian        # Debian/Ubuntu

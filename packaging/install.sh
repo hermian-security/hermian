@@ -1,15 +1,17 @@
 #!/bin/sh
-# HERMIAN tarball installer - run from inside an extracted, signature-verified
-# release directory.
+# HERMIAN tarball installer - run from inside an extracted, verified release
+# directory.
 #
-# NO 'curl | sudo sh'. Ever. Verify the signature first:
+# NO 'curl | sudo sh'. Ever. Verify the release first (see README):
 #
-#   curl -fsSL https://packages.hermian.security/gpg.pub | gpg --import
-#   gpg --verify hermian-<ver>-linux-amd64.sig hermian-<ver>-linux-amd64.tar.gz
+#   cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
+#     --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#   sha256sum -c SHA256SUMS --ignore-missing
 #
 # Then:
-#   tar xzf hermian-<ver>-linux-amd64.tar.gz
-#   cd hermian-<ver>-linux-amd64
+#   tar xzf hermian-<ver>-linux-<arch>.tar.gz
+#   cd hermian-<ver>-linux-<arch>
 #   sudo sh install.sh
 set -eu
 

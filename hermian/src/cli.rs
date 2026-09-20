@@ -12,7 +12,7 @@ use crate::ui::Style;
     long_about = "HERMIAN is a lightweight defensive security daemon for Linux. It detects \
                   high-confidence signs of compromise with deterministic, contextual rules and \
                   only interrupts you when something genuinely requires attention.",
-    after_help = "Environment:\n  NO_COLOR=1 / HERMIAN_COLOR=always|never   control terminal colour\n\nDocs: https://github.com/hermian-security/hermian"
+    after_help = "Environment:\n  NO_COLOR=1 / HERMIAN_COLOR=always|never   control terminal colour\n\nDocs: https://hermian.me  \u{00B7}  https://github.com/hermian-security/hermian\nSecurity contact: contact@hermian.me"
 )]
 pub struct Cli {
     #[command(subcommand)]

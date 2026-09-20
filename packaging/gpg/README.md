@@ -1,40 +1,36 @@
-# Signing and verifying HERMIAN releases
+# Release signing
 
-`curl | sudo sh` is banned for HERMIAN. Every release artifact is signed with a
-published GPG key. The key fingerprint is published on the project website, on
-GitHub, and in a Sigstore transparency log.
+HERMIAN releases are signed with **Sigstore** (`cosign`), keyless. The
+signing identity is the GitHub Actions workflow
+`https://github.com/hermian-security/hermian/.github/workflows/release.yml`
+and the certificate is issued by `https://token.actions.githubusercontent.com`.
+Every signature is recorded in the public Rekor transparency log.
 
-## Release key
+This means:
 
-```bash
-gpg --quick-generate-key "HERMIAN Release Signing <security@hermian.security>" ed25519 sign 1y
-gpg --armor --export security@hermian.security > gpg.pub
-```
+- there is no long-lived private key that could be stolen or lost;
+- a signature proves the artifact was produced by *that workflow on that
+  repository*, not merely by someone holding a key;
+- verification needs only `cosign`, no key distribution step.
 
-Publish `gpg.pub` and the fingerprint:
-
-```bash
-gpg --fingerprint security@hermian.security
-```
-
-## Signing a release
+## Verify a release
 
 ```bash
-# Build the release artifacts (see Makefile: make release)
-gpg --detach-sign --armor hermian-1.0.0-linux-amd64.tar.gz   # -> .sig
-gpg --detach-sign --armor hermian_1.0.0_amd64.deb
-
-# Publish checksums too
-sha256sum hermian-1.0.0-linux-amd64.tar.gz > SHA256SUMS
-gpg --detach-sign --armor SHA256SUMS
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
+  --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-## Verifying (user side)
+Individual `.deb` and `.tar.gz` files also carry their own `.sigstore`
+bundle and can be verified the same way.
 
-```bash
-curl -fsSL https://packages.hermian.security/gpg.pub | gpg --import
-gpg --fingerprint security@hermian.security   # compare with published fingerprint
-gpg --verify hermian-1.0.0-linux-amd64.sig hermian-1.0.0-linux-amd64.tar.gz
-```
+## GPG
 
-Package managers (apt/dnf/pacman) verify repository signatures automatically.
+A GPG key is **not** used for the beta. If a distribution repository later
+requires one (apt/dnf repos do), it will be generated on an offline machine,
+its fingerprint published at <https://hermian.me> and in this file, and the
+`SHA256SUMS` file will be signed with both methods. Until then, treat any
+"HERMIAN GPG key" you encounter as untrusted.
+
+Security contact: <contact@hermian.me>

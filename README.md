@@ -57,21 +57,33 @@ HERMIAN_EBPF_PREBUILT=/path/to/hermian-ebpf cargo build --release
 The object is kernel-version independent (struct offsets are read from the
 running kernel's BTF at start), so one object serves every host.
 
-## Install from a package
+## Install from a release
+
+Releases are at <https://github.com/hermian-security/hermian/releases>. Every
+artifact is signed with [Sigstore](https://sigstore.dev) (keyless; the
+identity is this repository's release workflow), so there is no GPG key to
+fetch and nothing to trust but GitHub's OIDC issuer. `curl | sudo sh` is
+banned; verify first:
 
 ```bash
-sudo apt install ./hermian_0.1.0_amd64.deb   # postinst runs 'hermian enable'
+# 1. verify the checksum file, then the artifacts against it
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
+  --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum -c SHA256SUMS --ignore-missing
+
+# 2a. Debian / Ubuntu (postinst runs 'hermian enable')
+sudo apt install ./hermian_0.1.0-1_amd64.deb
+
+# 2b. any systemd distro
+tar xzf hermian-0.1.0-linux-amd64.tar.gz && cd hermian-0.1.0-linux-amd64
+sudo sh install.sh
+
 sudo hermian status
 ```
 
-Or from a signed tarball (verify first; `curl | sudo sh` is banned):
-
-```bash
-curl -fsSL https://packages.hermian.security/gpg.pub | gpg --import
-gpg --verify hermian-0.1.0-linux-amd64.sig hermian-0.1.0-linux-amd64.tar.gz
-tar xzf hermian-0.1.0-linux-amd64.tar.gz && cd hermian-0.1.0-linux-amd64
-sudo sh install.sh
-```
+`.rpm` and AUR packages follow once the Fedora/Arch burn-in is complete
+(see `docs/ROADMAP-BURN-IN.md`).
 
 ## What it catches
 

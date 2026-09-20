@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Silent by default. Loud when it matters. Lightweight defensive security daemon for Linux."
+homepage = "https://hermian.me"
+repository = "https://github.com/hermian-security/hermian"
 
 [[bin]]
 name = "hermian"
@@ -31,7 +33,7 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # `cargo deb -p hermian` builds the Debian/Ubuntu package (see docs/RELEASE.md).
 [package.metadata.deb]
 name = "hermian"
-maintainer = "HERMIAN Security <security@hermian.security>"
+maintainer = "HERMIAN Security <contact@hermian.me>"
 copyright = "2025, HERMIAN Security"
 license-file = ["../LICENSE", "0"]
 extended-description = """\
