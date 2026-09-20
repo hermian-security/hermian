@@ -1,193 +1,108 @@
 # HERMIAN
 
-**Silent by default. Loud when it matters.**
+Silent by default. Loud when it matters.
 
-HERMIAN is a lightweight defensive security daemon for Linux. It watches for
-high-confidence signs of compromise using deterministic, contextual rules and
-only interrupts you when something genuinely requires attention.
+HERMIAN is a small security daemon for Linux servers. It watches for a short
+list of things that are hard to explain as normal activity, and sends you one
+message when one of them happens. No dashboard, no rule language, nothing to
+tune.
 
 ```
-install -> enable -> forget -> get notified only when it matters
+install -> enable -> forget -> one message when something is actually wrong
 ```
 
-No YAML rules. No dashboard. No alert fatigue.
+Status: **v0.1.0-beta**. Five detection groups, Telegram/email/webhook
+alerting, a `.deb`, signed releases. Tested end to end on one host so far;
+the burn-in plan for the rest is in [docs/ROADMAP-BURN-IN.md](docs/ROADMAP-BURN-IN.md).
+Full spec: [PROJECT.md](PROJECT.md).
 
-Full product specification: [PROJECT.md](PROJECT.md)
+## Install
 
----
+Requirements on the host: systemd, kernel 5.4 or newer (5.8+ for full eBPF
+coverage; older kernels run on /proc polling and audit and say so in
+`status`).
 
-## Status
-
-Phase 1 (Linux MVP). Five detection groups, session-aware severity, local and
-webhook alerting, a CLI for review and forensics, self-protection, and a signed
-package path for Debian/Ubuntu. Windows and macOS are explicitly post-MVP.
-
-## Quickstart (from source)
-
-Build host requirements:
-
-- Rust 1.79+ (`rustup`)
-- `libpam0g-dev` (or your distro's PAM development package) for the optional PAM module
-
-That is enough: the eBPF object is vendored at
-`hermian-ebpf/prebuilt/hermian-ebpf.o` and used automatically when no BPF
-toolchain is present. To rebuild the eBPF programs from source you also need:
-
-- a nightly toolchain with `rust-src` (`rustup toolchain install nightly -c rust-src`)
-- `bpf-linker` - install the **prebuilt static binary**, not `cargo install`
-  (that needs LLVM 21+ on the system, which no distro ships):
-  ```bash
-  curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
-    | sudo tar --zstd -x -C /usr/local/bin bpf-linker
-  ```
-  Then `HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release` refuses the vendored
-  fallback, and CI checks the vendored object matches the source.
+Releases are at <https://github.com/hermian-security/hermian/releases>.
+Every artifact is signed with Sigstore; the identity is this repository's
+release workflow, so there's no key to fetch and nothing to trust but
+GitHub's OIDC issuer. Verify first, then install:
 
 ```bash
-make build            # builds hermian, hermian-ebpf and the PAM module
-sudo make install     # installs to /usr/local/bin, renders the unit, starts the daemon
-sudo hermian status   # coverage, overhead, notification health
-sudo hermian test     # synthetic attack self-test, prints a sample alert
-```
-
-Target host requirements: systemd, kernel 5.4+ (full eBPF coverage on 5.8+;
-`/proc` + audit fallback below that). Kernel BTF (`/sys/kernel/btf/vmlinux`,
-standard on Ubuntu 20.10+, Debian 11+, RHEL 8.2+) gives exact parent
-resolution; without it the daemon falls back to `/proc`.
-
-**Building on a host with an old LLVM** (e.g. Ubuntu 22.04 ships LLVM 14, but
-`bpf-linker` needs 21+): build the eBPF object once on any machine that has
-the BPF toolchain, then point the daemon build at it:
-
-```bash
-# on the build machine
-cargo build --release -p hermian   # produces target/.../ebpf-target/bpfel-unknown-none/release/hermian-ebpf
-# on the target host, no bpf-linker needed
-HERMIAN_EBPF_PREBUILT=/path/to/hermian-ebpf cargo build --release
-```
-
-The object is kernel-version independent (struct offsets are read from the
-running kernel's BTF at start), so one object serves every host.
-
-## Install from a release
-
-Releases are at <https://github.com/hermian-security/hermian/releases>. Every
-artifact is signed with [Sigstore](https://sigstore.dev) (keyless; the
-identity is this repository's release workflow), so there is no GPG key to
-fetch and nothing to trust but GitHub's OIDC issuer. `curl | sudo sh` is
-banned; verify first:
-
-```bash
-# 1. verify the checksum file, then the artifacts against it
 cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
   --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 sha256sum -c SHA256SUMS --ignore-missing
 
-# 2a. Debian / Ubuntu (postinst runs 'hermian enable')
+# Debian / Ubuntu: the package runs `hermian enable` for you
 sudo apt install ./hermian_0.1.0-1_amd64.deb
 
-# 2b. any systemd distro
+# any other systemd distro
 tar xzf hermian-0.1.0-linux-amd64.tar.gz && cd hermian-0.1.0-linux-amd64
 sudo sh install.sh
 
 sudo hermian status
 ```
 
-`.rpm` and AUR packages follow once the Fedora/Arch burn-in is complete
-(see `docs/ROADMAP-BURN-IN.md`).
+You should see `PROTECTED`, five coverage rows saying `on`, and `Kernel ...
+eBPF`. `.rpm` and AUR come after the Fedora and Arch burn-in.
 
-## What it catches
+There is deliberately no `curl | sudo sh`. Piping an unverified script to
+root is the kind of thing this tool is meant to catch.
 
-| Group | What it catches | Source |
-|---|---|---|
-| **D1** Suspicious process chains | web server or database spawning a shell; shell -> downloader -> exec; unattended exec from `/tmp`, `/dev/shm`, `/var/tmp`; fileless exec (deleted inode, memfd) | eBPF `execve`/`execveat` tracepoints, `/proc`, audit fallback |
-| **D2** SSH and authentication abuse | root SSH login, failed-auth bursts, logins from never-seen sources, SSH config edits, new accounts, sudo/wheel membership changes | PAM module (optional), `auth.log` or `journalctl`, inotify |
-| **D3** Persistence | cron, shell profiles, systemd units, `ld.so.preload`, `ld.so.conf.d`, `authorized_keys` - written with no operator session | inotify + process-tree correlation |
-| **D4** Privilege escalation | setuid/setgid binaries and file capabilities outside system dirs, `ptrace` attach by non-debuggers, unattended `LD_PRELOAD`, sudoers/passwd/shadow tampering | eBPF `ptrace` tracepoint, inotify |
-| **D5** Network in context | outbound connections from a flagged chain, web servers reaching new external destinations, first-time connectors, new listeners from suspicious processes | eBPF `connect` tracepoint, `/proc/net` |
-
-### Severity is contextual
-
-The same event gets a different severity depending on who did it:
-
-| Situation | Severity |
-|---|---|
-| `vim /etc/cron.d/backup` from an SSH session | INFO |
-| The same file written by a daemon with no session anywhere on the host | HIGH |
-| ...and the cron line is `curl ... \| sh` | CRITICAL |
-| `sh /tmp/installer.sh` from your terminal | LOW |
-| The same exec from a process chain D1 already flagged | CRITICAL |
-
-Severity answers one question: *what should the operator do right now?*
-
-- **INFO** logged only
-- **LOW** logged; notified only if `min_severity = "LOW"`
-- **HIGH** notified
-- **CRITICAL** notified immediately; may trigger isolation if opted in
-
-## CLI
+### Building from source
 
 ```bash
-sudo hermian enable                 # install config + unit, start daemon (idempotent)
-sudo hermian enable --no-baseline   # skip the 24h learning period on a fresh host
-sudo hermian enable --with-pam      # hook the passive PAM module into sshd
-
-sudo hermian status                 # coverage, baseline, overhead, delivery health
-sudo hermian status --json
-
-sudo hermian alerts                 # recent alerts, newest first
-sudo hermian alerts -s high -n 50   # only HIGH and above
-sudo hermian alerts -d d3 --json    # persistence alerts as NDJSON
-sudo hermian show HER-2025-0914-001 # one alert in full (or: hermian show 1)
-sudo hermian collect HER-2025-0914-001   # forensic bundle: processes, files, hashes, listeners
-
-sudo hermian test                   # synthetic attack self-test + sample alert
-sudo hermian test --verbose         # print every sample alert
-sudo hermian notify-test            # verify Telegram/email/webhook and send a test alert
-
-sudo hermian isolate                # nftables isolation; management CIDRs stay reachable
-sudo hermian unisolate
-sudo hermian uninstall --yes
+sudo apt install -y build-essential pkg-config libpam0g-dev   # or your distro's equivalent
+cargo build --release
+cargo test
+sudo make install          # /usr/local/bin, then `hermian enable`
 ```
 
-Colour is used only on a TTY; set `NO_COLOR=1` or `HERMIAN_COLOR=never|always`.
+That's all you need. The eBPF programs are vendored as a compiled object
+(`hermian-ebpf/prebuilt/hermian-ebpf.o`) and picked up automatically; the
+object is kernel-independent because struct offsets are read from the running
+kernel's BTF at start.
+
+To rebuild the eBPF programs themselves you also need a nightly toolchain
+with `rust-src` and `bpf-linker`. Install the linker as a prebuilt static
+binary; `cargo install bpf-linker` wants LLVM 21 on the system and no distro
+ships that:
+
+```bash
+rustup toolchain install nightly -c rust-src
+curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+  | sudo tar --zstd -x -C /usr/local/bin bpf-linker
+HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release    # refuses the vendored fallback
+```
+
+CI builds from source on every push and fails if the vendored object is stale.
 
 ## Getting notified
 
-`journald` and the alert log always receive everything. To be *told* about
-HIGH/CRITICAL alerts, enable one or more notifying channels. The daemon
-applies the change on save (or `systemctl reload hermian`) and
-`hermian notify-test` proves the path works before you rely on it.
+`journald` and `/var/log/hermian/alerts.log` get everything. To be told about
+HIGH and CRITICAL alerts, enable a channel in `/etc/hermian/config.toml`. The
+daemon picks up the change on save.
 
-### Telegram
+**Telegram.** Message [@BotFather](https://t.me/BotFather), `/newbot`, copy
+the token. Send your new bot any message (or add it to a group and post
+once), then:
 
-1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, copy the token.
-2. Open a chat with your new bot and send it any message (or add it to a
-   group/channel and post there).
-3. Find the chat id:
-   ```bash
-   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":-\?[0-9]*'
-   ```
-   Personal chats are positive, groups negative, supergroups start with `-100`.
-4. Configure and test:
-   ```toml
-   [notifications]
-   channels = ["journald", "file", "telegram"]
+```bash
+curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | grep -o '"chat":{"id":-\?[0-9]*'
+```
 
-   [notifications.telegram]
-   bot_token = "123456789:AAH..."
-   chat_id = "-1001234567890"
-   silent_below_critical = true   # HIGH arrives muted, CRITICAL makes a sound
-   ```
-   ```bash
-   sudo hermian notify-test            # probes token + chat, sends one test alert
-   ```
+```toml
+[notifications]
+channels = ["journald", "file", "telegram"]
 
-### Email
+[notifications.telegram]
+bot_token = "123456789:AAH..."
+chat_id = "-1001234567890"
+silent_below_critical = true     # HIGH arrives muted, CRITICAL makes a sound
+```
 
-**Via an SMTP account** (Gmail/Workspace need an *app password*; Fastmail,
-Postmark, SES, Mailgun all work the same way):
+**Email**, via an SMTP account (Gmail and Workspace want an app password;
+Fastmail, Postmark, SES, Mailgun all work the same way):
 
 ```toml
 [notifications]
@@ -196,60 +111,81 @@ channels = ["journald", "file", "email"]
 [notifications.email]
 transport = "smtp"
 from = "hermian@example.com"
-to = ["ops@example.com", "you@example.com"]
+to = ["ops@example.com"]
 smtp_host = "smtp.gmail.com"
 smtp_port = 587
-smtp_security = "starttls"       # starttls (587) | tls (465) | none (25, local relay)
+smtp_security = "starttls"       # tls for 465, none for a local relay on 25
 smtp_username = "hermian@example.com"
-smtp_password = "app-password-here"
+smtp_password = "app-password"
 ```
 
-**Via the host's own MTA** (postfix/exim/msmtp already configured):
+Or, if the host already has postfix or msmtp set up, `transport = "sendmail"`
+with just `from` and `to`.
 
-```toml
-[notifications.email]
-transport = "sendmail"
-from = "hermian@example.com"
-to = ["ops@example.com"]
-```
+Then prove it works:
 
 ```bash
-sudo hermian notify-test --channel email --probe-only   # connect + auth only
-sudo hermian notify-test                                # send a test alert
+sudo hermian notify-test                     # probes each channel, sends one test alert
+sudo hermian notify-test --probe-only        # connectivity and credentials only
 ```
 
-Emails are multipart: a plain-text body identical to the terminal rendering
-and an HTML version with the same layout. Subjects are
-`[HERMIAN] CRITICAL D3 | host | title` so mail filters can key on them.
+Slack, Discord, ntfy and generic JSON webhooks are also supported; see the
+`[notifications.webhook]` section in the default config.
 
-Both channels: failed deliveries are retried with backoff and never
-duplicated across channels; `hermian status` shows the last error and
-per-channel delivery counts, and 15 minutes of continuous failure raises a
-local CRITICAL. Secrets live only in the 0600 config file and are redacted
-from error messages.
+Failed deliveries are retried with backoff and never duplicated across
+channels. `hermian status` shows the queue, the last error and deliveries per
+channel. Fifteen minutes of failure logs a CRITICAL locally. Tokens and
+passwords live only in the 0600 config file and are stripped from error
+messages.
 
-## Configuration
+## What it catches
 
-`/etc/hermian/config.toml` (0600, root-owned). The daemon watches it: any change
-is validated, applied, and reported as a CRITICAL self-protection alert so
-tampering is never silent. `systemctl reload hermian` (SIGHUP) also reloads.
+| | Signals | Source |
+|---|---|---|
+| **D1** process chains | web server or database spawning a shell; shell -> curl/wget -> something runs; execution from /tmp, /dev/shm, /var/tmp; execution from a deleted file or a memfd | eBPF exec tracepoints, /proc, audit fallback |
+| **D2** SSH and auth | root logins, failed-auth bursts, logins from sources never seen before, SSH config edits, new accounts, sudo/wheel membership | PAM module (optional), auth.log or journald, inotify |
+| **D3** persistence | cron, shell profiles, systemd units, ld.so.preload, ld.so.conf.d, authorized_keys, changed with nobody at a terminal | inotify plus the process tree |
+| **D4** privilege escalation | setuid files and file capabilities outside system directories, ptrace attach by non-debuggers, unattended LD_PRELOAD, sudoers/passwd/shadow edited outside the proper tools | eBPF ptrace tracepoint, inotify, a periodic sweep |
+| **D5** network in context | connections from a chain D1 already flagged, web servers reaching new external addresses, first-time connectors, new listeners from suspicious processes | eBPF connect tracepoint, /proc/net |
+
+The same event lands at a different severity depending on context. Editing
+`/etc/cron.d/backup` over SSH is INFO. The same file written by a daemon when
+nobody is logged in is HIGH. If the new line is `curl ... | sh`, CRITICAL.
+`sh /tmp/installer.sh` from your terminal is LOW; the same thing from a
+process chain that already tripped D1 is CRITICAL. Severity means "what
+should I do right now": INFO and LOW are logged, HIGH is sent to you,
+CRITICAL is sent immediately and may isolate the host if you opted in.
+
+The full rule list with the exact severities is in PROJECT.md.
+
+## Day to day
+
+```bash
+sudo hermian status                     # coverage, baseline, overhead, delivery health
+sudo hermian alerts                     # recent alerts, newest first
+sudo hermian alerts -s high -n 50       # HIGH and above
+sudo hermian show HER-2025-0914-001     # one alert in full; `hermian show 1` works for today
+sudo hermian collect HER-2025-0914-001  # forensic bundle: processes, files, hashes, listeners
+sudo hermian test                       # nine synthetic attacks through the real engine
+sudo hermian isolate                    # nftables lockdown; management CIDRs stay reachable
+sudo hermian unisolate
+sudo hermian uninstall --yes
+```
+
+`status`, `alerts`, `show` and `test` take `--json`. Colour is only used on a
+terminal; `NO_COLOR=1` or `HERMIAN_COLOR=never|always` override.
+
+### Configuration
+
+`/etc/hermian/config.toml`, root-owned, mode 0600. The daemon watches it;
+any change is validated and applied, and a CRITICAL alert says what changed,
+so nobody can quietly turn a detection off. `systemctl reload hermian` also
+reloads.
+
+Suppressions go in the allowlist and every entry needs a `reason`. The
+config file is your record of every time you decided something was fine:
 
 ```toml
-[notifications]
-channels = ["journald", "file", "telegram", "email"]   # journald + file always get everything
-min_severity = "HIGH"                                  # threshold for notifying channels
-dedup_window_secs = 300
-
-[notifications.webhook]
-url = "https://hooks.slack.com/services/..."
-format = "slack"        # generic | slack | discord | ntfy
-token = ""              # optional bearer token
-
-[response]
-auto_isolate = false    # requires management_cidrs
-management_cidrs = ["203.0.113.0/24"]
-
-[allowlist]
 [[allowlist.process_chains]]
 parent = "deploy-agent"
 child  = "bash"
@@ -257,22 +193,23 @@ user   = "deploy"
 reason = "CI/CD deployment pipeline"
 
 [[allowlist.persistence]]
-path   = "/etc/cron.d/app-*"          # trailing * for prefix match
-reason = "Managed by the app's scheduler"
+path   = "/etc/cron.d/app-*"             # trailing * for prefix match
+reason = "written by the app's scheduler"
 
 [[allowlist.ssh_sources]]
 source = "10.0.0.0/8"
-reason = "Corporate VPN"
+reason = "office VPN"
 ```
 
-Every allowlist entry **requires** a `reason`; the config file is your audit
-trail of suppression decisions.
+The first 24 hours after install are a learning window: SSH sources and
+network peers seen then are treated as known afterwards. `hermian enable
+--no-baseline` skips it on a freshly built host.
 
-## What an alert looks like
+## An alert
 
-Every alert names the rule that fired, shows the evidence, explains why it
-matters, and tells you what to do. This is the exact text written to journald
-and `/var/log/hermian/alerts.log`; on a terminal it is colourised.
+This is the exact text written to journald and the log file. On a terminal it
+gets colour; in email it comes as text plus HTML; on Telegram as a short
+message with this attached.
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -314,55 +251,56 @@ RECOMMENDED ACTION
 hermian show HER-2025-0914-001         hermian collect HER-2025-0914-001
 ```
 
-Identical alerts within the dedup window are folded into one; a single LOW
-summary closes the window. Notifications that fail are retried with backoff;
-after 15 minutes of failure a CRITICAL is logged locally.
+Repeats of the same finding within five minutes are folded into the first
+alert; one LOW summary closes the window.
 
-## Security properties
+## What it does to your system
 
-- Passive by default. `auto_isolate` requires explicit opt-in **and** configured
-  management CIDRs; HERMIAN never performs destructive remediation.
-- Hardened systemd unit: `ProtectSystem=strict`, `NoNewPrivileges`,
-  `MemoryDenyWriteExecute`, `RestrictNamespaces`, minimal capability set;
-  `CAP_NET_ADMIN` only when isolation is configured.
-- Self-protection: binary and config hashes are checked at start and the config
-  is watched at runtime. Any change produces a CRITICAL alert.
-- No network listener. Outbound only, and only to a webhook you configured.
-- Never reads, stores, or transmits credentials. The PAM module is passive
-  (`PAM_IGNORE`) and cannot affect authentication.
-- All state is `0600`/`0700` root-owned under `/var/lib/hermian`,
-  `/var/log/hermian`, `/run/hermian`.
+- Runs as root under a hardened systemd unit: `ProtectSystem=strict`,
+  `NoNewPrivileges`, `RestrictNamespaces`, `RestrictSUIDSGID`, and only the
+  capabilities eBPF, audit and ptrace need. `CAP_NET_ADMIN` is added only if
+  you configure isolation.
+- Reads /proc, /etc, and the auth log. Writes only under `/etc/hermian`,
+  `/var/lib/hermian`, `/var/log/hermian` and `/run/hermian`, all root-owned.
+- Opens no listening socket. Connects out only to the notification endpoints
+  you configured.
+- Never changes the system configuration it watches, never touches
+  credentials. The PAM module is passive and returns `PAM_IGNORE`; it cannot
+  affect whether a login succeeds.
+- Does nothing on its own beyond logging and notifying. Isolation needs two
+  explicit config settings and always leaves your management network
+  reachable.
+- Raises `fs.inotify.max_user_watches` to 524288 if the host's limit is lower
+  (the default is easily exhausted by one file-watching app, which would
+  silently blind the persistence rules).
+- `hermian uninstall` removes all of it.
 
-## Repository layout
+## Repository
 
 ```
-hermian-ebpf/    eBPF programs: execve, execveat, connect, ptrace tracepoints (aya-ebpf)
-hermian-core/    detection engine: events, D1-D5, severity, alerts, allowlist,
-                 baseline, dedup, self-test. Pure Rust, no I/O, tests run anywhere.
-hermian/         daemon + CLI: eBPF loader, /proc, inotify, audit netlink,
-                 auth log / journald, PAM socket, notifier, status, alerts, collect
-hermian-pam/     optional passive PAM module (pam_hermian.so)
-packaging/       systemd unit template, debian/, signed-tarball installer, GPG guide
-tests/           attack simulations + false-positive workloads (tests/run_suite.sh)
-.github/         CI: fmt, clippy -D warnings, tests on Linux/macOS/Windows, eBPF build
+hermian-core/    the engine: events, process tree, D1-D5, severity, dedup, alerts, config.
+                 pure Rust, no I/O, 77 tests that run on any OS
+hermian/         the daemon and CLI: eBPF loader (aya), BTF reader, inotify, /proc,
+                 audit netlink, auth sources, notifier and channels, status, collect
+hermian-ebpf/    the eBPF programs (aya-ebpf) and the vendored compiled object
+hermian-pam/     pam_hermian.so, optional, passive
+packaging/       systemd unit template, sysctl, debian maintainer scripts, tarball installer
+tests/           attack simulations, false-positive workloads, soak tooling
+docs/            burn-in roadmap
+.github/         CI and the signed release workflow
 ```
-
-## Development
 
 ```bash
-cargo test -p hermian-core     # engine tests, run on any OS
-cargo test                     # everything (Linux + bpf-linker)
-make check                     # fmt --check + clippy -D warnings + tests
+cargo test -p hermian-core     # engine tests, any OS
+cargo test                     # everything, Linux
+make check                     # fmt, clippy -D warnings, tests
+sudo tests/run_suite.sh        # attack sims + false-positive workloads on a real host
 ```
 
-## Verification (Phase 2 gate)
+## Reporting a problem
 
-```bash
-sudo tests/run_suite.sh            # attack sims + 72h false-positive soak
-sudo tests/run_suite.sh --quick    # 5-minute smoke version
-sudo tests/run_suite.sh --skip-fp  # attack sims only
-```
+Security issues: see [SECURITY.md](SECURITY.md), or mail contact@hermian.me.
+False positives are bugs too; open an issue with the output of
+`hermian show <ref> --json`.
 
-## License
-
-Apache-2.0 (see LICENSE).
+Apache-2.0.

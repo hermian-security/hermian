@@ -68,9 +68,10 @@ make release                                       # dist/hermian-0.1.0-linux-am
 ```
 
 **Build on the oldest glibc you intend to support.** The `.deb` records the
-build host's glibc as a dependency; a package built on glibc 2.39 refuses to
-install on Ubuntu 22.04 (2.35). Release builds run on `ubuntu-22.04` for
-this reason.
+build host's glibc as a dependency; a package built on Ubuntu 24.04 needed
+glibc 2.39 and refused to install on 22.04. Built on 22.04 the requirement
+is `libc6 >= 2.34`, which covers Debian 12, Ubuntu 22.04+, RHEL 9+. Release
+builds run on `ubuntu-22.04` for this reason.
 
 ### 1.3 Signed releases (GitHub Actions)
 
