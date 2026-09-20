@@ -30,12 +30,20 @@ The gap to production is **breadth and time**, not features.
 
 ### 1.1 Toolchain reality
 
-`bpf-linker` needs LLVM 21+; most distros ship 14-18. Requiring it on
-every build host is how we lost two hours on the test box. The build
-therefore has three tiers, tried in order:
+`cargo install bpf-linker` needs LLVM 21+ on the system; most distros ship
+14-18 and GitHub runners have none. Requiring it on every build host is how
+we lost two hours on the test box and the first CI run. **Always install the
+static prebuilt binary** from aya-rs releases (LLVM bundled, ~100 MB):
 
-1. **From source** - stable toolchain with `bpfel-unknown-none` target, or
-   nightly with `rust-src`, plus `bpf-linker`. Used by developers and CI.
+```bash
+curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+  | sudo tar --zstd -x -C /usr/local/bin bpf-linker
+```
+
+The build has three tiers, tried in order:
+
+1. **From source** - nightly with `rust-src` plus the prebuilt `bpf-linker`.
+   Used by developers and CI.
 2. **Vendored object** - `hermian-ebpf/prebuilt/hermian-ebpf.o` is
    committed. Any host with plain Rust can build the daemon. The object is
    kernel-version independent (struct offsets come from the running kernel's

@@ -26,10 +26,22 @@ package path for Debian/Ubuntu. Windows and macOS are explicitly post-MVP.
 
 Build host requirements:
 
-- Rust 1.79+ (`rustup`) with **either** `rustup target add bpfel-unknown-none`
-  **or** a nightly toolchain with `rust-src`
-- `cargo install bpf-linker`
+- Rust 1.79+ (`rustup`)
 - `libpam0g-dev` (or your distro's PAM development package) for the optional PAM module
+
+That is enough: the eBPF object is vendored at
+`hermian-ebpf/prebuilt/hermian-ebpf.o` and used automatically when no BPF
+toolchain is present. To rebuild the eBPF programs from source you also need:
+
+- a nightly toolchain with `rust-src` (`rustup toolchain install nightly -c rust-src`)
+- `bpf-linker` - install the **prebuilt static binary**, not `cargo install`
+  (that needs LLVM 21+ on the system, which no distro ships):
+  ```bash
+  curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
+    | sudo tar --zstd -x -C /usr/local/bin bpf-linker
+  ```
+  Then `HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release` refuses the vendored
+  fallback, and CI checks the vendored object matches the source.
 
 ```bash
 make build            # builds hermian, hermian-ebpf and the PAM module
