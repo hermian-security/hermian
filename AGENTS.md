@@ -16,10 +16,17 @@ For requested implementation work, go ahead and branch, edit, test, commit, push
 the task branch, and open/update its PR. Don't ask for each routine Git step.
 Analysis-only requests stay read-only.
 
-Get an explicit request before merging, pushing to main, tagging or publishing a
-release, changing access/protection rules, rewriting history, or doing anything
-destructive. Don't amend or force-push by default. Never change Git identity or
-global Git config.
+Get an explicit request before merging, pushing to main, changing
+access/protection rules, rewriting history, or doing anything destructive.
+Don't amend or force-push by default. Never change Git identity or global Git
+config.
+
+After a **user-facing** feat or fix is on `main` (anything that changes the
+installed binary or how people install/run it), cut a new prerelease: bump
+`workspace.package.version`, move Unreleased notes into CHANGELOG, merge that
+prep PR, wait for CI on that `main` commit, then tag `v` + that version and
+push only that tag. Docs/CI/chore-only changes don't get a tag. Don't move
+existing tags.
 
 ## Workflow
 
@@ -29,7 +36,7 @@ global Git config.
    Use a separate worktree if switching would disturb them.
 3. Make the smallest useful fix and add regression coverage. Run relevant safe checks.
 4. Review the full diff and run `git diff --check`. Stage explicit paths and use
-   a Conventional Commit. No version bump or release tag for an ordinary task.
+   a Conventional Commit. Don't mix a version bump into an ordinary feat/fix PR.
 5. Push the named branch (`-u` on first push). Open a PR to main, or update its
    existing PR. Keep incomplete work draft.
 6. Check CI and fix failures caused by the change. Report pending or blocked checks

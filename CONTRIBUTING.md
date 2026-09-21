@@ -139,22 +139,24 @@ Follow Semantic Versioning:
 - Major: incompatible changes after 1.0.
 - Prerelease: increment the beta number for each beta build; never move an old tag.
 
-Do not bump a version for every commit. Record noteworthy user-facing changes in
-CHANGELOG.md under Unreleased. A release preparation PR chooses the next version,
-updates Cargo.toml and Cargo.lock, and moves the relevant changelog entries into
-a dated release section. Use Cargo to update the lockfile; do not run a blanket
-cargo update just to change the workspace version.
+People install GitHub Release artifacts, not `main`. After a user-facing feat
+or fix lands (installed binary, pager policy, install path), ship a new
+prerelease. Docs, CI, and chore-only changes don't get a tag.
+
+Record notes under Unreleased while the PR is open. The release prep PR bumps
+`workspace.package.version` (next `0.1.0-beta.N` during beta), updates
+Cargo.lock to match, and moves those notes into a dated section. Don't mix the
+bump into the feat/fix PR. Don't run a blanket `cargo update` just to change
+the workspace version.
 
 Release procedure:
 
-1. Explicitly approve the intended version and release preparation task.
-2. Merge the tested release preparation PR into main through normal review.
-3. Wait for CI on the resulting main commit and complete applicable disposable-host
-   testing. A green PR build is not a substitute for verifying the release commit.
-4. From a clean checkout of that tested main commit, create an annotated tag and
-   push only that tag after explicit release authorization.
-5. Inspect the Release workflow, download its artifacts, and verify the Sigstore
-   bundles and checksums. Report failure rather than moving the tag.
+1. User-facing change is on `main` with green CI.
+2. Open `release/x.y.z` with the version bump and changelog move.
+3. Merge it through the normal PR checks.
+4. Wait for CI on that `main` commit. A green PR build isn't enough.
+5. Tag `v` + that exact version on that commit and push only that tag.
+6. Watch `release.yml`, then verify Sigstore + SHA256SUMS. Don't move a failed tag.
 
 Example commands, only after the version has been prepared and approved:
 
