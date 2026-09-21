@@ -1,5 +1,7 @@
 # HERMIAN
 
+[![Hermian](docs/logo-text.svg)](https://hermian.me)
+
 A small Linux security daemon. Watches process chains, SSH activity, persistence
 changes, privilege escalation signals, and network activity. Alerts go to your
 logs, Telegram, email, or a webhook. No dashboard or central server needed.
