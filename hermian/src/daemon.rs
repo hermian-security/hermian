@@ -132,7 +132,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     }
     if !integrity.config_ok {
         emit_self(
-            notifier,
+            &notifier,
             self_alert(
                 &mut engine,
                 Severity::Critical,
