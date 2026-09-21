@@ -574,10 +574,11 @@ mod tests {
     // ---- D2 -------------------------------------------------------------
 
     #[test]
-    fn ssh_brute_force_burst_fires_high_once() {
+    fn ssh_failed_burst_is_info_not_high() {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         let ip: IpAddr = "198.51.100.77".parse().unwrap();
+        let mut infos = 0;
         let mut highs = 0;
         for i in 0..8 {
             let alerts = eng.process(Event::Auth(AuthEvent {
@@ -588,12 +589,82 @@ mod tests {
                 service: "sshd".into(),
                 tty: "ssh".into(),
             }));
+            infos += alerts
+                .iter()
+                .filter(|a| a.detection == DetectionId::D2 && a.severity == Severity::Info)
+                .count();
             highs += alerts
                 .iter()
                 .filter(|a| a.detection == DetectionId::D2 && a.severity == Severity::High)
                 .count();
         }
-        assert_eq!(highs, 1);
+        assert_eq!(infos, 1);
+        assert_eq!(highs, 0);
+    }
+
+    #[test]
+    fn ssh_success_after_burst_is_high() {
+        let mut eng = engine_without_baseline();
+        eng.cfg.ssh.off_hours_start = 0;
+        eng.cfg.ssh.off_hours_end = 0;
+        let t = Utc::now();
+        let ip: IpAddr = "198.51.100.77".parse().unwrap();
+        for i in 0..5 {
+            let a = eng.process(Event::Auth(AuthEvent {
+                ts: t + Duration::seconds(i),
+                result: AuthResult::Failure,
+                user: "cw".into(),
+                rhost: Some(ip),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+            }));
+            assert!(!has(&a, DetectionId::D2, Severity::High), "{:?}", a);
+        }
+        let alerts = eng.process(Event::Auth(AuthEvent {
+            ts: t + Duration::seconds(6),
+            result: AuthResult::Success,
+            user: "deploy".into(),
+            rhost: Some(ip),
+            service: "sshd".into(),
+            tty: "ssh".into(),
+        }));
+        assert!(
+            has(&alerts, DetectionId::D2, Severity::High),
+            "{:?}",
+            alerts
+        );
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.title.contains("after a failed-auth burst")),
+            "{:?}",
+            alerts
+        );
+    }
+
+    #[test]
+    fn ssh_success_without_burst_is_not_burst_high() {
+        let mut eng = engine_without_baseline();
+        eng.cfg.ssh.off_hours_start = 0;
+        eng.cfg.ssh.off_hours_end = 0;
+        let alerts = eng.process(Event::Auth(AuthEvent {
+            ts: Utc::now(),
+            result: AuthResult::Success,
+            user: "deploy".into(),
+            rhost: Some("198.51.100.9".parse().unwrap()),
+            service: "sshd".into(),
+            tty: "ssh".into(),
+        }));
+        assert!(
+            !alerts.iter().any(|a| a.title.contains("burst")),
+            "{:?}",
+            alerts
+        );
+        assert!(
+            !has(&alerts, DetectionId::D2, Severity::High),
+            "{:?}",
+            alerts
+        );
     }
 
     #[test]

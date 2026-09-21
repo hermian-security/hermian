@@ -13,6 +13,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- Failed SSH bursts stay INFO. HIGH is a login from that source while the burst
+  window is still open.
+
 - Shorten the main docs and keep the writing plain, with setup steps and safety
   notes still easy to find.
 - Adopt a protected-main, squash-merge PR workflow with documented standing

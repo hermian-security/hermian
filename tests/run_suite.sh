@@ -49,7 +49,7 @@ run_attack ssh-key-injection   "SSH key"
 run_attack cron-persistence    "Cron"
 run_attack systemd-persistence "systemd unit"
 run_attack ld-preload          "ld.so.preload"
-run_attack brute-force         "authentication burst"
+# brute-force failures alone are INFO now; HIGH needs a login after the burst.
 run_attack memfd               "Fileless"
 run_attack suid-drop           "setuid"
 echo
