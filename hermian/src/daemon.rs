@@ -112,7 +112,9 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     // --- Self-protection -------------------------------------------------
     let integrity = selfprotect::verify_at_startup();
     if !integrity.binary_ok {
-        notifier.send(self_alert(
+        emit_self(
+            &notifier,
+            self_alert(
             &mut engine,
             Severity::Critical,
             "HERMIAN binary modified",
@@ -125,22 +127,26 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             ],
             &[("Binary hash", &integrity.binary_hash)],
             "selfprotect|binary",
-        ));
+            ),
+        );
     }
     if !integrity.config_ok {
-        notifier.send(self_alert(
-            &mut engine,
-            Severity::Critical,
-            "HERMIAN configuration modified while stopped",
-            "The configuration file changed while the daemon was not running.",
-            "Configuration changes can disable detections, widen allowlists or redirect alerts.",
-            &[
-                "Review /etc/hermian/config.toml against your last known version.",
-                "Restore it if the change was not yours.",
-            ],
-            &[("Config hash", &integrity.config_hash)],
-            "selfprotect|config",
-        ));
+        emit_self(
+            &notifier,
+            self_alert(
+                &mut engine,
+                Severity::Critical,
+                "HERMIAN configuration modified while stopped",
+                "The configuration file changed while the daemon was not running.",
+                "Configuration changes can disable detections, widen allowlists or redirect alerts.",
+                &[
+                    "Review /etc/hermian/config.toml against your last known version.",
+                    "Restore it if the change was not yours.",
+                ],
+                &[("Config hash", &integrity.config_hash)],
+                "selfprotect|config",
+            ),
+        );
     }
 
     // --- Event sources ---------------------------------------------------
@@ -243,16 +249,19 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     let config_path = paths::config_path();
 
     if initial_notify.last_delivery.is_none() {
-        notifier.send(self_alert(
-            &mut engine,
-            Severity::Info,
-            "HERMIAN is active",
-            "This is the one-time confirmation sent when HERMIAN starts for the first time on this host.",
-            "It proves the alert path works end to end. You will not hear from HERMIAN again unless something needs your attention.",
-            &["Run 'hermian status' at any time to confirm coverage."],
-            &[],
-            "selftest|install",
-        ));
+        emit_self(
+            &notifier,
+            self_alert(
+                &mut engine,
+                Severity::Info,
+                "HERMIAN is active",
+                "This is the one-time confirmation sent when HERMIAN starts for the first time on this host.",
+                "It proves the alert path works end to end. You will not hear from HERMIAN again unless something needs your attention.",
+                &["Run 'hermian status' at any time to confirm coverage."],
+                &[],
+                "selftest|install",
+            ),
+        );
     }
 
     write_status_snapshot(
@@ -471,8 +480,7 @@ async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mps
     }
 }
 
-/// Re-read, validate and apply the configuration; always raises an alert so a
-/// runtime change is never silent.
+/// Re-read, validate and apply the configuration.
 fn reload_config(
     engine: &mut Engine,
     notifier: &notify::Notifier,
@@ -483,23 +491,25 @@ fn reload_config(
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) => {
-            notifier.send(self_alert(
-                engine,
-                Severity::Critical,
-                "HERMIAN configuration unreadable",
-                &format!("The configuration file could not be read: {}.", e),
-                "A missing or unreadable config is either an accident or an attempt to disrupt monitoring. The previous configuration remains active.",
-                &["Check permissions and ownership of /etc/hermian/config.toml.", "Restore it from backup if it was removed."],
-                &[("Trigger", trigger)],
-                "selfprotect|config-unreadable",
-            ));
+            emit_self(
+                notifier,
+                self_alert(
+                    engine,
+                    Severity::Critical,
+                    "HERMIAN configuration unreadable",
+                    &format!("The configuration file could not be read: {}.", e),
+                    "A missing or unreadable config is either an accident or an attempt to disrupt monitoring. The previous configuration remains active.",
+                    &["Check permissions and ownership of /etc/hermian/config.toml.", "Restore it from backup if it was removed."],
+                    &[("Trigger", trigger)],
+                    "selfprotect|config-unreadable",
+                ),
+            );
             return;
         }
     };
     let new_hash = selfprotect::sha256_hex(text.as_bytes());
-    if new_hash == selfprotect::stored_config_hash().unwrap_or_default() && trigger == "file change"
-    {
-        // Touched but unchanged (e.g. editor re-saved identical content).
+    if new_hash == selfprotect::stored_config_hash().unwrap_or_default() {
+        // Touched but unchanged (editor re-save, SIGHUP with no edit).
         return;
     }
     let parsed = Config::parse(&text)
@@ -512,28 +522,43 @@ fn reload_config(
             notifier.reconfigure(new_cfg.notifications.clone());
             *current_cfg = new_cfg;
             let _ = selfprotect::update_config_hash(&new_hash);
-            notifier.send(self_alert(
-                engine,
-                Severity::Critical,
-                "HERMIAN configuration changed and reloaded",
-                "The configuration file changed while the daemon was running. It validated and has been applied.",
-                "Changing a security daemon's configuration at runtime is how an attacker blinds a host. If this was you, no action is needed.",
-                &["Confirm the change was yours.", "Review the active configuration with 'hermian status'."],
-                &[("Trigger", trigger), ("Changes", &summary), ("Config hash", &new_hash)],
-                "selfprotect|config-reload",
-            ));
+            let functional = summary != "no functional change";
+            emit_self(
+                notifier,
+                self_alert(
+                    engine,
+                    if functional {
+                        Severity::Critical
+                    } else {
+                        Severity::Info
+                    },
+                    if functional {
+                        "HERMIAN configuration changed and reloaded"
+                    } else {
+                        "HERMIAN configuration reloaded with no functional change"
+                    },
+                    "The configuration file changed while the daemon was running. It validated and has been applied.",
+                    "Changing a security daemon's configuration at runtime is how an attacker blinds a host. If this was you, no action is needed.",
+                    &["Confirm the change was yours.", "Review the active configuration with 'hermian status'."],
+                    &[("Trigger", trigger), ("Changes", &summary), ("Config hash", &new_hash)],
+                    "selfprotect|config-reload",
+                ),
+            );
         }
         Err(e) => {
-            notifier.send(self_alert(
-                engine,
-                Severity::Critical,
-                "HERMIAN configuration changed but is INVALID",
-                &format!("The configuration file changed but failed validation: {}. The previous configuration remains active.", e),
-                "A broken config could be a failed attempt to disable detections, or a typo. Either way the daemon is running on the last good configuration.",
-                &["Fix /etc/hermian/config.toml.", "Reload with 'systemctl reload hermian' (SIGHUP)."],
-                &[("Trigger", trigger)],
-                "selfprotect|config-invalid",
-            ));
+            emit_self(
+                notifier,
+                self_alert(
+                    engine,
+                    Severity::Low,
+                    "HERMIAN configuration changed but is INVALID",
+                    &format!("The configuration file changed but failed validation: {}. The previous configuration remains active.", e),
+                    "Usually a typo while editing. The daemon keeps the last good configuration.",
+                    &["Fix /etc/hermian/config.toml.", "Reload with 'systemctl reload hermian' (SIGHUP)."],
+                    &[("Trigger", trigger)],
+                    "selfprotect|config-invalid",
+                ),
+            );
         }
     }
 }
@@ -622,6 +647,12 @@ fn describe_changes(old: &Config, new: &Config) -> String {
     }
 }
 
+fn emit_self(notifier: &notify::Notifier, alert: Option<Alert>) {
+    if let Some(alert) = alert {
+        notifier.send(alert);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn self_alert(
     engine: &mut Engine,
@@ -632,7 +663,7 @@ fn self_alert(
     actions: &[&str],
     facts: &[(&str, &str)],
     signature: &str,
-) -> Alert {
+) -> Option<Alert> {
     let mut finding = Finding::new(DetectionId::Self_, severity, title, signature)
         .what(what)
         .why(why)

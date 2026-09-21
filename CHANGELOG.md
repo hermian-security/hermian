@@ -15,6 +15,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 - Failed SSH bursts stay INFO. HIGH is a login from that source while the burst
   window is still open.
+- Invalid config edits and no-op reloads no longer page CRITICAL. A real
+  validated change still does. Self-protection alerts share the dedup window.
 
 - Shorten the main docs and keep the writing plain, with setup steps and safety
   notes still easy to find.

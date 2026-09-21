@@ -278,10 +278,15 @@ impl Engine {
     }
 
     /// Build an alert for an engine-external finding (self-protection, lifecycle).
-    pub fn alert_from(&mut self, finding: Finding, now: DateTime<Utc>) -> Alert {
-        let alert = Alert::from_finding(finding, self.refs.next(now), self.host.clone(), now);
-        self.counters.record_alert(alert.severity);
-        alert
+    /// Goes through the same dedup window as detection findings.
+    pub fn alert_from(&mut self, finding: Finding, now: DateTime<Utc>) -> Option<Alert> {
+        if let Decision::Emit = self.dedup.record(&finding.signature, now, &finding) {
+            let alert = Alert::from_finding(finding, self.refs.next(now), self.host.clone(), now);
+            self.counters.record_alert(alert.severity);
+            Some(alert)
+        } else {
+            None
+        }
     }
 
     fn flag_from_findings(&mut self, findings: &[Finding], now: DateTime<Utc>) {
@@ -1140,6 +1145,24 @@ mod tests {
         let alerts = eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
         assert!(alerts[0].ref_id.ends_with("-042"), "{}", alerts[0].ref_id);
         assert_eq!(eng.counters.alerts_today, 42);
+    }
+
+    #[test]
+    fn self_alert_from_is_deduped() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        let finding = |sev, title: &str| {
+            crate::alert::Finding::new(DetectionId::Self_, sev, title, "selfprotect|config-invalid")
+        };
+        assert!(eng
+            .alert_from(finding(Severity::Low, "invalid"), t)
+            .is_some());
+        assert!(eng
+            .alert_from(finding(Severity::Low, "invalid again"), t)
+            .is_none());
+        assert!(eng
+            .alert_from(finding(Severity::Critical, "now critical"), t)
+            .is_some());
     }
 
     #[test]

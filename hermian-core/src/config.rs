@@ -373,9 +373,9 @@ impl Config {
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# HERMIAN configuration
 #
-# This file is monitored while the daemon runs. Any change triggers validation,
-# a reload, and a CRITICAL self-protection alert so tampering is never silent.
-# Every allowlist entry requires a 'reason' - it is your audit trail.
+# This file is monitored while the daemon runs. A real change that validates
+# reloads and pages CRITICAL. Invalid TOML stays on the last good config and
+# is logged, not paged. Every allowlist entry requires a 'reason'.
 
 [general]
 hostname = ""           # empty = use the system hostname
