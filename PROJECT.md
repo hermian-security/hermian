@@ -43,7 +43,7 @@ are the detailed rule reference, including exemptions and severity choices.
 | Group | Looks for |
 | --- | --- |
 | [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells, download-and-exec chains, transient or deleted executables |
-| [D2: auth](hermian-core/src/detect/d2.rs) | SSH bursts, root/new-source logins, SSH config and account changes |
+| [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
 | [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron, shell profiles, SSH keys, and systemd changes |
 | [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
 | [D5: network](hermian-core/src/detect/d5.rs) | Connections linked to flagged chains, baseline novelty, and new listeners |

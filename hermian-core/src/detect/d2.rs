@@ -20,15 +20,18 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
         return findings;
     }
 
+    let window = ctx.cfg.ssh.failed_burst_window_secs as i64;
+    let threshold = ctx.cfg.ssh.failed_burst_count as usize;
+
     match ev.result {
         AuthResult::Attempt | AuthResult::Failure => {
-            let count = bursts.record(rhost, ev.ts, ctx.cfg.ssh.failed_burst_window_secs as i64);
-            if count == ctx.cfg.ssh.failed_burst_count as usize {
-                // Fire exactly once when the threshold is crossed; dedup handles the rest.
+            let count = bursts.record_failure(rhost, ev.ts, window, &ev.user);
+            if count == threshold {
+                // Internet scanners trip this all day. Log it; don't page.
                 findings.push(
                     Finding::new(
                         DetectionId::D2,
-                        Severity::High,
+                        Severity::Info,
                         "SSH authentication burst",
                         &format!("d2|burst|{}", rhost),
                     )
@@ -40,24 +43,52 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     .fact("Source", rhost.to_string())
                     .fact("Last user", &ev.user)
                     .why(
-                        "A burst of authentication attempts from one source is the signature of \
-                         brute-force or credential-stuffing against SSH.",
-                    )
-                    .actions([
-                        format!(
-                            "Confirm nobody is legitimately failing to log in from {}.",
-                            rhost
-                        ),
-                        "Block the source (fail2ban, nftables) or restrict SSH to known networks."
-                            .to_string(),
-                        "Check whether any attempt from this source eventually succeeded."
-                            .to_string(),
-                    ]),
+                        "Failed-auth bursts are common on any public SSH port. Logged for context; \
+                         a later login from this source is what gets a HIGH alert.",
+                    ),
                 );
             }
         }
         AuthResult::Success => {
-            if ev.user == "root" && !ctx.cfg.ssh.permit_root {
+            let recent = bursts.recent_failures(rhost, ev.ts, window);
+            let after_burst = recent >= threshold;
+            if after_burst {
+                let users = bursts.recent_users(rhost);
+                findings.push(
+                    Finding::new(
+                        DetectionId::D2,
+                        Severity::High,
+                        "SSH login after a failed-auth burst",
+                        &format!("d2|burst-success|{}", rhost),
+                    )
+                    .what(format!(
+                        "User '{}' authenticated from {} after {} failed attempts within {} \
+                         seconds{}.",
+                        ev.user,
+                        rhost,
+                        recent,
+                        ctx.cfg.ssh.failed_burst_window_secs,
+                        if users.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (tried: {})", users.join(", "))
+                        }
+                    ))
+                    .fact("Source", rhost.to_string())
+                    .fact("User", &ev.user)
+                    .fact("Failed attempts", recent.to_string())
+                    .why(
+                        "A login from an address that was just brute-forcing this host is the \
+                         credential-stuffing outcome, not the background noise of failed attempts.",
+                    )
+                    .actions([
+                        "Treat this session as hostile until proven otherwise.",
+                        "Lock or rotate the account that succeeded and any others the source tried.",
+                        "Block the source and review what the session did.",
+                    ]),
+                );
+            }
+            if ev.user == "root" && !ctx.cfg.ssh.permit_root && !after_burst {
                 // A root login is a policy concern, not per se an anomaly. It is
                 // HIGH the first time a source is seen; the same operator logging
                 // in again from the same place is context, not a new incident.
@@ -102,7 +133,10 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     ]),
                 );
             }
-            if ctx.baseline.can_judge_novelty() && !ctx.baseline.ssh_source_is_known(rhost) {
+            if !after_burst
+                && ctx.baseline.can_judge_novelty()
+                && !ctx.baseline.ssh_source_is_known(rhost)
+            {
                 let off_hours = ctx.is_off_hours(ev.ts);
                 let elevated = ev.user == "root" || off_hours;
                 let severity = if elevated {

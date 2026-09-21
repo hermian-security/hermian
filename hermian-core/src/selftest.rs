@@ -141,7 +141,7 @@ fn scenario_bruteforce() -> Vec<Alert> {
     let t = Utc::now();
     let ip: IpAddr = "198.51.100.66".parse().unwrap();
     let mut out = Vec::new();
-    for i in 0..6 {
+    for i in 0..5 {
         out.extend(eng.process(Event::Auth(AuthEvent {
             ts: t + Duration::seconds(i),
             result: AuthResult::Failure,
@@ -151,6 +151,14 @@ fn scenario_bruteforce() -> Vec<Alert> {
             tty: "ssh".into(),
         })));
     }
+    out.extend(eng.process(Event::Auth(AuthEvent {
+        ts: t + Duration::seconds(6),
+        result: AuthResult::Success,
+        user: "root".into(),
+        rhost: Some(ip),
+        service: "sshd".into(),
+        tty: "ssh".into(),
+    })));
     out
 }
 
@@ -231,7 +239,7 @@ const SCENARIOS: &[Scenario] = &[
         run: scenario_fileless_memfd,
     },
     Scenario {
-        name: "SSH brute-force burst",
+        name: "SSH login after a failed-auth burst",
         detection: DetectionId::D2,
         expected: Severity::High,
         run: scenario_bruteforce,

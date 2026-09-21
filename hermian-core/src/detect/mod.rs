@@ -135,23 +135,56 @@ pub fn writer_label(writer: Option<&WriterInfo>) -> String {
 #[derive(Debug, Default)]
 pub struct BurstTracker {
     counts: HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
+    users: HashMap<IpAddr, Vec<String>>,
 }
 
 impl BurstTracker {
     pub fn record(&mut self, ip: IpAddr, now: DateTime<Utc>, window_secs: i64) -> usize {
+        self.record_failure(ip, now, window_secs, "")
+    }
+
+    pub fn record_failure(
+        &mut self,
+        ip: IpAddr,
+        now: DateTime<Utc>,
+        window_secs: i64,
+        user: &str,
+    ) -> usize {
         let q = self.counts.entry(ip).or_default();
         q.push_back(now);
         let cutoff = now - Duration::seconds(window_secs);
         while q.front().map(|t| *t < cutoff).unwrap_or(false) {
             q.pop_front();
         }
+        if !user.is_empty() {
+            let users = self.users.entry(ip).or_default();
+            if users.last().map(String::as_str) != Some(user) {
+                users.push(user.to_string());
+                if users.len() > 8 {
+                    users.remove(0);
+                }
+            }
+        }
         q.len()
+    }
+
+    pub fn recent_failures(&self, ip: IpAddr, now: DateTime<Utc>, window_secs: i64) -> usize {
+        let Some(q) = self.counts.get(&ip) else {
+            return 0;
+        };
+        let cutoff = now - Duration::seconds(window_secs);
+        q.iter().filter(|t| **t >= cutoff).count()
+    }
+
+    pub fn recent_users(&self, ip: IpAddr) -> &[String] {
+        self.users.get(&ip).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Drop sources with no activity since `cutoff`.
     pub fn prune(&mut self, cutoff: DateTime<Utc>) {
         self.counts
             .retain(|_, q| q.back().map(|t| *t >= cutoff).unwrap_or(false));
+        self.users.retain(|ip, _| self.counts.contains_key(ip));
     }
 
     pub fn len(&self) -> usize {
@@ -272,5 +305,6 @@ mod tests {
         assert_eq!(b.record(ip, t + Duration::seconds(120), 60), 2);
         b.prune(t + Duration::seconds(121));
         assert!(b.is_empty());
+        assert_eq!(b.recent_failures(ip, t + Duration::seconds(10), 60), 0);
     }
 }

@@ -386,7 +386,7 @@ duration_hours = 24
 
 [ssh]
 permit_root = false     # true suppresses the "root login over SSH" alert
-failed_burst_count = 5
+failed_burst_count = 5          # failures in the window; INFO until a login follows
 failed_burst_window_secs = 60
 off_hours_start = 22    # UTC; set start == end to disable off-hours weighting
 off_hours_end = 6
