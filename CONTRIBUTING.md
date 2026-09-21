@@ -156,7 +156,7 @@ Release procedure:
 3. Merge it through the normal PR checks.
 4. Wait for CI on that `main` commit. A green PR build isn't enough.
 5. Tag `v` + that exact version on that commit and push only that tag.
-6. Watch `release.yml`, then verify Sigstore + SHA256SUMS. Don't move a failed tag.
+6. Watch `release.yml`, then `sha256sum -c SHA256SUMS`. Don't move a failed tag.
 
 Example commands, only after the version has been prepared and approved:
 

@@ -2,14 +2,8 @@
 # HERMIAN tarball installer - run from inside an extracted, verified release
 # directory.
 #
-# NO 'curl | sudo sh'. Ever. Verify the release first (see README):
-#
-#   cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
-#     --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
-#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# NO 'curl | sudo sh'. Ever. Fetch SHA256SUMS + the tarball, then:
 #   sha256sum -c SHA256SUMS --ignore-missing
-#
-# Then:
 #   tar xzf hermian-<ver>-linux-<arch>.tar.gz
 #   cd hermian-<ver>-linux-<arch>
 #   sudo sh install.sh

@@ -124,14 +124,14 @@ sysctl fs.inotify.max_user_watches        # hermian enable raises this to 524288
 ### 2.2 Install (`.deb`)
 
 ```bash
-# verify
-cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp 'https://github.com/<org>/hermian/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+VER=v0.1.0-beta.2
+ARCH=$(dpkg --print-architecture)
+cd /tmp
+curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"
+DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
+curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$DEB"
 sha256sum -c SHA256SUMS --ignore-missing
-
-# install; postinst runs `hermian enable`
-sudo apt install ./hermian_0.1.0-1_amd64.deb
+sudo apt install "./$DEB"
 sudo hermian status
 ```
 
@@ -256,7 +256,7 @@ All of the following, with evidence linked from the release notes:
 - [ ] Attack matrix 13/13 on every host, < 5 s each.
 - [ ] CPU avg < 1 %, p99 < 5 %, RSS < 80 MB on every host.
 - [ ] `docs/fp-log.md` published; every entry closed.
-- [ ] Release workflow ran green on a tag; artifacts verified with `cosign` on a clean machine.
+- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS` on a clean machine.
 - [ ] `hermian uninstall` leaves nothing on every distro.
 - [ ] Two hosts the maintainer depends on have run the release build for 30 days.
 

@@ -6,6 +6,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- Install docs use curl + `sha256sum` on a pinned tag. `cosign` is optional.
+
 ## 0.1.0-beta.2 - 2026-09-21
 
 ### Changed

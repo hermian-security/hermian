@@ -152,23 +152,21 @@ jobs:
           generate_release_notes: true
           files: dist/*
           body: |
-            ## Verify before installing
+            ## Install
 
-            Every artifact is signed with Sigstore (keyless, identity bound to this
-            repository's release workflow). Verify the checksum file, then the
-            checksums:
+            Use `/tmp` (needs to be writable). Pin this tag.
 
             ```bash
-            cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
-              --certificate-identity-regexp 'https://github.com/${{ github.repository }}/' \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            VER=${{ github.ref_name }}
+            ARCH=$(dpkg --print-architecture)
+            cd /tmp
+            curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/SHA256SUMS"
+            DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
+            curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/$DEB"
             sha256sum -c SHA256SUMS --ignore-missing
+            sudo apt install "./$DEB"
+            sudo hermian status
             ```
 
-            Then install:
-
-            ```bash
-            sudo apt install ./hermian_*_amd64.deb      # Debian/Ubuntu
-            # or
-            tar xzf hermian-*-linux-amd64.tar.gz && cd hermian-*-linux-amd64 && sudo sh install.sh
-            ```
+            Other systemd distros: fetch the tarball named in SHA256SUMS, check
+            it, extract, `sudo sh install.sh`.
