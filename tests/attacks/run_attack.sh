@@ -3,7 +3,14 @@
 # appears at HIGH or CRITICAL.
 #
 # Usage: run_attack.sh <scenario> <title-pattern>
+# Requires a fresh matching JSON alert within 30 seconds after the simulation.
+# Deduplicated repeats do not pass: wait out the dedup window before rerunning.
 set -eu
+
+if [ "$#" -ne 2 ] || [ -z "$2" ]; then
+    echo "usage: $0 <scenario> <title-pattern>" >&2
+    exit 2
+fi
 
 SCENARIO="$1"
 PATTERN="$2"
@@ -15,12 +22,12 @@ detached() {
     setsid sh -c "$1" </dev/null >/dev/null 2>&1 &
 }
 
-START_EPOCH=$(date +%s)
+START=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')
 
 case "$SCENARIO" in
     webshell)
         # nginx (fake comm) -> bash -> curl -> sh /tmp/x
-        detached "exec -a nginx python3 '$DIR/../helpers/fake_comm.py' nginx 30 -- \
+        detached "exec python3 '$DIR/../helpers/fake_comm.py' nginx 30 -- \
             bash -c 'curl -s http://127.0.0.1:1/ -o /tmp/.x.sh 2>/dev/null || echo \"#!/bin/sh\nsleep 1\" > /tmp/.x.sh; chmod +x /tmp/.x.sh; sh /tmp/.x.sh'"
         ;;
     ssh-key-injection)
@@ -56,22 +63,12 @@ case "$SCENARIO" in
         ;;
 esac
 
-# Watchers debounce for ~0.5s and the engine ticks are immediate; give it a moment.
-sleep 4
-
-# Look for a HIGH/CRITICAL alert whose title matches PATTERN in the JSON store
-# (authoritative), falling back to the rendered log.
-if hermian alerts -n 50 -s high --json 2>/dev/null \
-    | awk -v s="$START_EPOCH" -v p="$PATTERN" '
-        index($0, p) { print; found=1 }
-        END { exit found ? 0 : 1 }' >/dev/null; then
-    echo "PASS  $SCENARIO -> alert matching '$PATTERN'"
+# Poll the authoritative JSON store; the setuid sweep can take 20 seconds.
+# Never fall back to historical text logs or hide a failed alert query.
+if python3 "$DIR/../helpers/wait_for_alert.py" "$START" "$PATTERN"; then
+    echo "PASS  $SCENARIO -> fresh HIGH/CRITICAL alert matching '$PATTERN'"
     exit 0
 fi
-if grep -q "$PATTERN" /var/log/hermian/alerts.log 2>/dev/null; then
-    echo "PASS  $SCENARIO -> alert matching '$PATTERN' (alerts.log)"
-    exit 0
-fi
-echo "FAIL  $SCENARIO -> no HIGH/CRITICAL alert matching '$PATTERN'" >&2
+echo "FAIL  $SCENARIO -> fresh HIGH/CRITICAL alert matching '$PATTERN' not verified" >&2
 hermian alerts -n 5 2>/dev/null || true
 exit 1
