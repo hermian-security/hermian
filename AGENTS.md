@@ -1,61 +1,58 @@
-# Repository Working Agreement
+# Working together
 
-Read CONTRIBUTING.md before making changes. These are the owner's standing
-preferences for implementation tasks, not authorization to change unrelated work.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before editing. Keep changes small and
+leave unrelated work alone.
 
-## Standing Authorization
+## Tone
 
-For a requested implementation task, proceed without repeatedly asking permission
-to create a task branch, make focused edits, run safe checks, commit the verified
-changes, push the task branch to origin, and open or update its pull request.
-Analysis-only requests do not authorize edits or publication.
+Write like a teammate, not a brochure. Keep docs, PRs, commit messages, and updates
+short and relaxed. Contractions and familiar abbreviations are fine; skip hype,
+repetition, and forced slang. Keep Conventional Commit prefixes. This is a prose
+preference, not a change to code style. Don't cut warnings just to save words.
 
-Always require an explicit request before merging a PR, pushing to main, creating
-or pushing release tags, publishing a release, changing repository access or
-protection rules, rewriting history, or running destructive operations. The
-initial protection setup was approved separately; it is not standing permission
-to weaken those protections. Do not amend commits or force-push by default.
+## Permission
 
-## Task Workflow
+For requested implementation work, go ahead and branch, edit, test, commit, push
+the task branch, and open/update its PR. Don't ask for each routine Git step.
+Analysis-only requests stay read-only.
 
-1. Inspect git status, staged changes, the current branch, and remote tracking.
-2. Preserve all pre-existing changes. Never commit, revert, stash, or delete
-   unrelated files. Stage explicit paths, not the entire working tree.
-3. Fetch origin. Start a short-lived task branch from origin/main. Continue the
-   existing branch when the request extends the same task. Use a separate
-   worktree if unrelated work would otherwise need to be moved or overwritten.
-4. Use the smallest correct change and add regression coverage for bug fixes.
-5. Run relevant safe checks. Do not run the root attack or false-positive suites
-   on a developer's machine: they modify authentication and persistence files.
-6. Review the full diff, run git diff --check, and commit with a Conventional
-   Commit message. Do not update versions or tags for an ordinary task.
-7. Push the named task branch, setting its upstream on the first push. Open a PR
-   against main; reuse an existing PR for the same branch instead of duplicating it.
-8. Inspect GitHub checks. Fix failures caused by the change. If checks are pending,
-   unavailable, or blocked, report that accurately; never bypass them or claim
-   they passed. Keep incomplete or dependent work in a draft PR.
-9. Report the branch, commit, PR URL, checks, remaining blockers, and any preserved
-   unrelated changes. Stop before merge or release unless explicitly requested.
+Get an explicit request before merging, pushing to main, tagging or publishing a
+release, changing access/protection rules, rewriting history, or doing anything
+destructive. Don't amend or force-push by default. Never change Git identity or
+global Git config.
 
-If a task genuinely depends on an unmerged PR, branch from that task branch and
-open a draft PR against it. State the dependency prominently. After the dependency
-is merged, retarget the draft to main, reconcile with main without rewriting
-published history, review its remaining diff, and rerun CI before marking it ready.
-Never merge a dependent PR into its temporary task-branch base.
+## Workflow
 
-Ask questions only when requirements are ambiguous, work conflicts, a secret could
-be exposed, or an operation needs authorization outside the boundaries above.
+1. Check status, staged changes, branch, and upstream. Fetch origin; branch from
+   origin/main for a new task, or continue the same task's branch.
+2. Preserve existing work. Don't commit, revert, stash, or delete unrelated files.
+   Use a separate worktree if switching would disturb them.
+3. Make the smallest useful fix and add regression coverage. Run relevant safe checks.
+4. Review the full diff and run `git diff --check`. Stage explicit paths and use
+   a Conventional Commit. No version bump or release tag for an ordinary task.
+5. Push the named branch (`-u` on first push). Open a PR to main, or update its
+   existing PR. Keep incomplete work draft.
+6. Check CI and fix failures caused by the change. Report pending or blocked checks
+   honestly; don't bypass them. Include branch, commit, PR link, checks, blockers,
+   and any preserved local changes in the handoff. Stop before merge or release.
 
-## Verification
+For dependent work, name the prerequisite, branch from it, and open a draft PR against it.
+Once it's merged, retarget to main, reconcile without rewriting published history,
+review the remaining diff, and rerun CI before marking ready. Never merge into
+the temporary task-branch base.
 
-- Portable Rust: cargo test -p hermian-core --locked.
-- Core lint: cargo clippy -p hermian-core --all-targets --locked -- -D warnings.
-- Formatting: cargo fmt --all -- --check.
-- Harness: python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v.
-- Shell changes: syntax-check changed scripts with sh -n.
-- Linux daemon/eBPF changes: use the Linux CI job and relevant disposable-host
-  tests. A passing synthetic engine test does not prove live collector coverage.
+Ask when requirements are unclear, work conflicts, secrets could leak, or an
+operation falls outside this permission. Otherwise, keep going.
 
-Use Python instead of python3 on Windows if necessary. Do not commit secrets,
-generated build artifacts, or local experiment files. Never modify Git identity or
-global Git configuration as part of a task.
+## Checks
+
+- Core: `cargo test -p hermian-core --locked`
+- Lint: `cargo clippy -p hermian-core --all-targets --locked -- -D warnings`
+- Format: `cargo fmt --all -- --check`
+- Harness: `python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v`
+- Shell edits: `sh -n` on changed scripts. Use `python` on Windows if needed.
+
+Linux daemon/eBPF changes need Linux CI and relevant disposable-host tests.
+Synthetic engine tests don't prove live coverage. Never run the root attack or
+false-positive suites on a dev machine: they modify auth and persistence files.
+Don't commit secrets, generated build output, or local experiments.
