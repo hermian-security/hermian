@@ -5,6 +5,13 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -18,6 +25,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.8'
+      - name: Lint workflow definitions
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -shellcheck= -pyflakes= .github/workflows/ci.yml .github/workflows/release.yml
       - run: python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v
       - run: sh -n tests/attacks/run_attack.sh
       - run: sh -n tests/run_suite.sh

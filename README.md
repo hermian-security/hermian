@@ -299,6 +299,9 @@ sudo tests/run_suite.sh        # attack sims + false-positive workloads on a rea
 
 ## Reporting a problem
 
+Development workflow, pull requests, and versioning: [CONTRIBUTING.md](CONTRIBUTING.md).
+Noteworthy upcoming changes: [CHANGELOG.md](CHANGELOG.md).
+
 Security issues: see [SECURITY.md](SECURITY.md), or mail contact@hermian.me.
 False positives are bugs too; open an issue with the output of
 `hermian show <ref> --json`.
