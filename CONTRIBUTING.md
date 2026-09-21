@@ -152,7 +152,8 @@ the workspace version.
 Release procedure:
 
 1. User-facing change is on `main` with green CI.
-2. Open `release/x.y.z` with the version bump and changelog move.
+2. Open `release/x.y.z` with the version bump, changelog move, and README
+   `VER=` (plus the same pin in `docs/ROADMAP-BURN-IN.md` if it still has one).
 3. Merge it through the normal PR checks.
 4. Wait for CI on that `main` commit. A green PR build isn't enough.
 5. Tag `v` + that exact version on that commit and push only that tag.

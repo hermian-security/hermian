@@ -108,6 +108,13 @@ jobs:
           HERMIAN_EBPF_PREBUILT: ${{ github.workspace }}/hermian-ebpf.o
         run: |
           cargo deb -p hermian --no-build --target ${{ matrix.target }} -o dist/
+          # GitHub Releases can't serve '~' in asset names (cargo-deb uses it
+          # for prereleases). Rename so SHA256SUMS matches the download URL.
+          for f in dist/*.deb; do
+            [ -f "$f" ] || continue
+            g=${f//\~/.}
+            [ "$f" = "$g" ] || mv "$f" "$g"
+          done
           ls -la dist
       - name: Package tarball
         run: |
@@ -162,9 +169,11 @@ jobs:
             cd /tmp
             curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/SHA256SUMS"
             DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
-            curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/$DEB"
+            FILE=$(printf '%s' "$DEB" | tr '~' '.')
+            curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/$FILE"
+            [ -e "$DEB" ] || cp "$FILE" "$DEB"
             sha256sum -c SHA256SUMS --ignore-missing
-            sudo apt install "./$DEB"
+            sudo apt install "./$FILE"
             sudo hermian status
             ```
 

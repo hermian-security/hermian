@@ -1,5 +1,7 @@
 # HERMIAN
 
+[![Hermian](docs/logo-text.svg)](https://hermian.me)
+
 A small Linux security daemon. Watches process chains, SSH activity, persistence
 changes, privilege escalation signals, and network activity. Alerts go to your
 logs, Telegram, email, or a webhook. No dashboard or central server needed.
@@ -15,14 +17,16 @@ reduced coverage. Builds target amd64 and arm64.
 Needs a writable directory (`/tmp`, not `/opt`). Pin the tag; don't use `latest`.
 
 ```bash
-VER=v0.1.0-beta.2
+VER=v0.1.0-beta.3
 ARCH=$(dpkg --print-architecture)
 cd /tmp
 curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"
 DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
-curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$DEB"
+FILE=$(printf '%s' "$DEB" | tr '~' '.')
+curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$FILE"
+[ -e "$DEB" ] || cp "$FILE" "$DEB"
 sha256sum -c SHA256SUMS --ignore-missing
-sudo apt install "./$DEB"
+sudo apt install "./$FILE"
 sudo hermian status
 ```
 
