@@ -13,6 +13,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- Invalid config edits and no-op reloads no longer page CRITICAL. A real
+  validated change still does. Self-protection alerts share the dedup window.
+
 - Shorten the main docs and keep the writing plain, with setup steps and safety
   notes still easy to find.
 - Adopt a protected-main, squash-merge PR workflow with documented standing

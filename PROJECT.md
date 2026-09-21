@@ -127,10 +127,12 @@ The unit uses `ProtectSystem=strict`, `NoNewPrivileges`, and a capability list
 for collection. `PrivateTmp` stays off so monitoring can see the host's `/tmp`.
 See [the unit template](packaging/systemd/hermian.service) for the full settings.
 
-Config edits are validated and raise a CRITICAL alert. Invalid edits leave the
-previous config active. Startup hash checks flag mismatches, but local hashes
-aren't protection against someone who already controls root. Nothing auto-updates.
-A stopped daemon can't report, and there's no independent tamper monitor.
+A validated config change that actually alters detections, channels, or the
+allowlist pages CRITICAL. Invalid TOML keeps the last good config and logs LOW.
+Startup hash checks still flag binary/config changes made while the daemon was
+stopped. Local hashes aren't protection against someone who already controls
+root. Nothing auto-updates. A stopped daemon can't report, and there's no
+independent tamper monitor.
 
 PAM integration is opt-in via `hermian enable --with-pam`. The module sends auth
 metadata, doesn't read passwords, and returns `PAM_IGNORE`.
