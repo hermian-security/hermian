@@ -13,6 +13,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- Shorten the main docs and keep the writing plain, with setup steps and safety
+  notes still easy to find.
 - Adopt a protected-main, squash-merge PR workflow with documented standing
   authorization for routine AI-assisted branch, commit, push, and PR operations.
 - Reject future release tags that do not match the workspace package version or
