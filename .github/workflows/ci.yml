@@ -10,6 +10,18 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  harness:
+    name: validation harness (non-root)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - run: python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v
+      - run: sh -n tests/attacks/run_attack.sh
+      - run: sh -n tests/run_suite.sh
+
   core:
     name: core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -44,7 +44,7 @@ echo "--- Attack simulations (expect HIGH/CRITICAL alerts) ---"
 run_attack() {
     "$DIR/attacks/run_attack.sh" "$1" "$2" || FAILS=$((FAILS + 1))
 }
-run_attack webshell            "D1"
+run_attack webshell            "Web server"
 run_attack ssh-key-injection   "SSH key"
 run_attack cron-persistence    "Cron"
 run_attack systemd-persistence "systemd unit"
