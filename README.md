@@ -12,22 +12,23 @@ more field testing. See [project notes](PROJECT.md) for how it works and its lim
 You'll need Linux, systemd, and kernel 5.4+. eBPF needs 5.8+; older kernels use
 reduced coverage. Builds target amd64 and arm64.
 
-Download the `.deb` for your architecture, `SHA256SUMS`, and
-`SHA256SUMS.sigstore` from [Releases](https://github.com/hermian-security/hermian/releases)
-into a fresh directory. With [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
-installed, verify before installing:
+Needs a writable directory (`/tmp`, not `/opt`). Pin the tag; don't use `latest`.
 
 ```bash
-cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp '^https://github.com/hermian-security/hermian/' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+VER=v0.1.0-beta.2
+ARCH=$(dpkg --print-architecture)
+cd /tmp
+curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"
+DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
+curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$DEB"
 sha256sum -c SHA256SUMS --ignore-missing
-sudo apt install ./hermian_*.deb
+sudo apt install "./$DEB"
 sudo hermian status
 ```
 
-The package starts the daemon for you. On other systemd distros, verify the
-tarball the same way, extract it, and run `sudo sh install.sh` from that directory.
+The package starts the daemon. On other systemd distros, fetch the tarball the
+same way, check `SHA256SUMS`, extract, and run `sudo sh install.sh` from that
+directory.
 
 HERMIAN runs as root. Setup creates its config, state, logs, and systemd unit,
 and raises inotify limits if needed. Monitoring logs and notifies by default;
