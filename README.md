@@ -20,9 +20,11 @@ ARCH=$(dpkg --print-architecture)
 cd /tmp
 curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"
 DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
-curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$DEB"
+FILE=$(printf '%s' "$DEB" | tr '~' '.')
+curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$FILE"
+[ -e "$DEB" ] || cp "$FILE" "$DEB"
 sha256sum -c SHA256SUMS --ignore-missing
-sudo apt install "./$DEB"
+sudo apt install "./$FILE"
 sudo hermian status
 ```
 

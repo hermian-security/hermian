@@ -23,7 +23,8 @@ config.
 
 After a **user-facing** feat or fix is on `main` (anything that changes the
 installed binary or how people install/run it), cut a new prerelease: bump
-`workspace.package.version`, move Unreleased notes into CHANGELOG, merge that
+`workspace.package.version`, move Unreleased notes into CHANGELOG, set README
+(and any other pinned install snippet) `VER=` to `v` + that version, merge that
 prep PR, wait for CI on that `main` commit, then tag `v` + that version and
 push only that tag. Docs/CI/chore-only changes don't get a tag. Don't move
 existing tags.
