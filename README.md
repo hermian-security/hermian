@@ -17,7 +17,7 @@ reduced coverage. Builds target amd64 and arm64.
 Needs a writable directory (`/tmp`, not `/opt`). Pin the tag; don't use `latest`.
 
 ```bash
-VER=v0.1.0-beta.2
+VER=v0.1.0-beta.3
 ARCH=$(dpkg --print-architecture)
 cd /tmp
 curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"

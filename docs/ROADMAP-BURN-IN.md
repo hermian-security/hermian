@@ -124,7 +124,7 @@ sysctl fs.inotify.max_user_watches        # hermian enable raises this to 524288
 ### 2.2 Install (`.deb`)
 
 ```bash
-VER=v0.1.0-beta.2
+VER=v0.1.0-beta.3
 ARCH=$(dpkg --print-architecture)
 cd /tmp
 curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"
