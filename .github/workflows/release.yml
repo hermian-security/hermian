@@ -5,15 +5,45 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write   # Sigstore keyless signing
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Match tag to workspace version
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["workspace"]["package"]["version"]
+          expected = "v" + version
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              raise SystemExit(f"Release tag {actual!r} must match workspace version {expected!r}")
+          PY
+      - name: Require a commit on main
+        run: git merge-base --is-ancestor HEAD origin/main
+
   ebpf:
     name: Build eBPF object from source
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +128,9 @@ jobs:
     name: Sign and publish
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write   # Sigstore keyless signing, only for the publishing job
     steps:
       - uses: actions/download-artifact@v4
         with:
