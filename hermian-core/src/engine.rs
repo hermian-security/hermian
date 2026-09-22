@@ -72,8 +72,9 @@ fn day_key(now: DateTime<Utc>) -> String {
 }
 
 impl Engine {
-    pub fn new(cfg: Config, allowlist: Allowlist, baseline: Baseline, host: String) -> Self {
+    pub fn new(cfg: Config, allowlist: Allowlist, mut baseline: Baseline, host: String) -> Self {
         let now = Utc::now();
+        baseline.migrate_connectors(now);
         let dedup_window = cfg.notifications.dedup_window_secs;
         let counters = Counters {
             day: day_key(now),
@@ -167,14 +168,9 @@ impl Engine {
                     findings.extend(detect::d5::evaluate_connect(&e, &self.ctx(now)));
                 }
                 self.baseline.observe_dest(e.daddr, now);
-                let root_exe = self
-                    .tree
-                    .chain_of(e.pid)
-                    .first()
-                    .map(|p| p.exe.clone())
-                    .unwrap_or_else(|| e.comm.clone());
+                let exe = detect::d5::connector_exe(&self.tree, e.pid, &e.comm);
                 self.baseline
-                    .observe_connector(&detect::d5::connector_key(&root_exe, e.uid), now);
+                    .observe_connector(&detect::d5::connector_key(&exe, e.uid), now);
             }
             Event::Ptrace(e) => {
                 if self.cfg.detections.d4_priv_esc {
@@ -1104,10 +1100,13 @@ mod tests {
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
         let t = Utc::now();
-        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        // Realistic tree: PID 1 is present, as the daemon seeds it from /proc.
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 0, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 101, 100, 33, "nginx", "/usr/sbin/nginx"));
         let alerts = eng.process(Event::Connect(ConnectEvent {
             ts: t,
-            pid: 100,
+            pid: 101,
             uid: 33,
             daddr: "198.51.100.99".parse().unwrap(),
             dport: 8443,
@@ -1119,6 +1118,49 @@ mod tests {
             "{:?}",
             alerts
         );
+    }
+
+    #[test]
+    fn first_connect_is_keyed_on_the_connecting_program() {
+        let t = Utc::now();
+        let mut baseline = Baseline::new(true, 24, t);
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline.clone(),
+            "h".into(),
+        );
+        let connect = |pid: u32, comm: &str, ts| {
+            Event::Connect(ConnectEvent {
+                ts,
+                pid,
+                uid: 0,
+                daddr: "10.0.0.5".parse().unwrap(),
+                dport: 5432,
+                comm: comm.into(),
+                container: false,
+            })
+        };
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 200, 1, 0, "backup", "/usr/local/bin/backup"));
+        eng.process(connect(200, "backup", t));
+        baseline = eng.baseline.clone();
+        baseline.complete = true;
+        eng.baseline = baseline;
+        // A different program under the same PID 1 root is still new.
+        eng.process(exec(t, 300, 1, 0, "implant", "/usr/local/bin/implant"));
+        let later = t + Duration::hours(1);
+        let alerts = eng.process(connect(300, "implant", later));
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.title == "First outbound connection from a program"),
+            "{:?}",
+            alerts
+        );
+        // The learned one stays quiet.
+        let again = eng.process(connect(200, "backup", later));
+        assert!(again.is_empty(), "{:?}", again);
     }
 
     #[test]

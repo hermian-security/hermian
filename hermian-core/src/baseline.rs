@@ -18,7 +18,19 @@ pub struct Baseline {
     /// learning window: it answers "has this happened before", not "is normal".
     #[serde(default)]
     pub root_sources: HashSet<IpAddr>,
+    /// How `known_connectors` keys were built. Baselines written before the
+    /// scheme existed (0) keyed on the chain's root, which was nearly always
+    /// systemd, so they're relearned rather than trusted.
+    #[serde(default)]
+    pub connector_scheme: u8,
+    /// While set, connectors are being relearned after a scheme change and
+    /// connector novelty isn't judged.
+    #[serde(default)]
+    pub connectors_relearn_until: Option<DateTime<Utc>>,
 }
+
+/// Current `known_connectors` key scheme: the connecting process's own exe.
+pub const CONNECTOR_SCHEME: u8 = 1;
 
 impl Default for Baseline {
     fn default() -> Self {
@@ -31,6 +43,8 @@ impl Default for Baseline {
             known_dests: HashSet::new(),
             known_connectors: HashSet::new(),
             root_sources: HashSet::new(),
+            connector_scheme: 0,
+            connectors_relearn_until: None,
         }
     }
 }
@@ -46,7 +60,30 @@ impl Baseline {
             known_dests: HashSet::new(),
             known_connectors: HashSet::new(),
             root_sources: HashSet::new(),
+            connector_scheme: CONNECTOR_SCHEME,
+            connectors_relearn_until: None,
         }
+    }
+
+    /// Drop connector keys built with an older scheme. A finished baseline
+    /// relearns connectors for another `duration_hours` instead of flagging
+    /// every program as new.
+    pub fn migrate_connectors(&mut self, now: DateTime<Utc>) {
+        if self.connector_scheme >= CONNECTOR_SCHEME {
+            return;
+        }
+        self.known_connectors.clear();
+        self.connector_scheme = CONNECTOR_SCHEME;
+        if self.enabled && self.complete {
+            self.connectors_relearn_until =
+                Some(now + Duration::hours(self.duration_hours.min(24 * 365) as i64));
+        }
+    }
+
+    fn relearning_connectors(&self, now: DateTime<Utc>) -> bool {
+        self.connectors_relearn_until
+            .map(|until| now < until)
+            .unwrap_or(false)
     }
 
     /// Record a successful root login; returns true if the source was new.
@@ -110,9 +147,14 @@ impl Baseline {
 
     pub fn observe_connector(&mut self, key: &str, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete {
+        if !self.complete || self.relearning_connectors(now) {
             self.known_connectors.insert(key.to_string());
         }
+    }
+
+    /// Whether connector novelty can be judged at `now`.
+    pub fn can_judge_connectors(&self, now: DateTime<Utc>) -> bool {
+        self.can_judge_novelty() && !self.relearning_connectors(now)
     }
 
     pub fn ssh_source_is_known(&self, ip: IpAddr) -> bool {
@@ -157,5 +199,30 @@ mod tests {
         assert!(b.is_complete());
         let ip2: IpAddr = "192.0.2.11".parse().unwrap();
         assert!(!b.ssh_source_is_known(ip2));
+    }
+
+    #[test]
+    fn legacy_connector_keys_are_relearned() {
+        let t0 = now();
+        // A pre-scheme baseline.json: finished, keyed on "systemd|uid".
+        let mut b: Baseline = serde_json::from_str(
+            r#"{"enabled":true,"complete":true,"duration_hours":24,
+                "known_connectors":["/usr/lib/systemd/systemd|0"]}"#,
+        )
+        .unwrap();
+        assert_eq!(b.connector_scheme, 0);
+        b.migrate_connectors(t0);
+        assert_eq!(b.connector_scheme, CONNECTOR_SCHEME);
+        assert!(b.known_connectors.is_empty());
+        assert!(!b.can_judge_connectors(t0));
+        b.observe_connector("/usr/sbin/nginx|33", t0);
+        let later = t0 + Duration::hours(25);
+        assert!(b.can_judge_connectors(later));
+        assert!(b.connector_is_known("/usr/sbin/nginx|33"));
+        b.observe_connector("/tmp/x|33", later);
+        assert!(!b.connector_is_known("/tmp/x|33"));
+        // Idempotent for current-scheme baselines.
+        b.migrate_connectors(later);
+        assert!(b.connector_is_known("/usr/sbin/nginx|33"));
     }
 }
