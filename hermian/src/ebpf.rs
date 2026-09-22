@@ -286,4 +286,45 @@ mod tests {
             drop(runtime);
         });
     }
+
+    /// Failed execs leave their intent behind. With a plain hash map, 4096 of
+    /// them filled it and every later exec lost argv0/LD_PRELOAD.
+    #[test]
+    #[ignore]
+    fn ebpf_intents_survive_a_failed_exec_flood() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(65536);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            for _ in 0..5000 {
+                let _ = std::process::Command::new("/nonexistent/hermian-flood").status();
+            }
+            let child = std::process::Command::new("/bin/true")
+                .env_clear()
+                .env("LD_PRELOAD", "")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let _ = child.wait_with_output();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("no exec event for the test child")
+                    .unwrap();
+                if let RawEvent::Exec(e) = ev {
+                    if e.pid == pid {
+                        assert_eq!(e.ld_preload, 1, "intent lost after the flood");
+                        assert_eq!(to_str(&e.argv0), "/bin/true");
+                        break;
+                    }
+                }
+            }
+            drop(runtime);
+        });
+    }
 }
