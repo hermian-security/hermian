@@ -236,3 +236,54 @@ fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loads the embedded object into the running kernel, so the verifier
+    /// checks every program. Needs root; CI runs it with sudo:
+    ///   sudo <test-binary> --ignored ebpf_object_loads
+    #[test]
+    #[ignore]
+    fn ebpf_object_loads_and_sees_ld_preload() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(4096);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            assert!(runtime.attached.contains(&"sched_process_exec"));
+            assert!(runtime.attached.contains(&"sys_enter_execve"));
+
+            // Filler variables sort before LD_PRELOAD (Command keeps env
+            // sorted), pushing it past the old 12-entry scan.
+            let mut cmd = std::process::Command::new("/bin/true");
+            cmd.env_clear();
+            for i in 0..20 {
+                cmd.env(format!("HERMIAN_FILLER_{:02}", i), "x");
+            }
+            cmd.env("LD_PRELOAD", "");
+            let child = cmd.spawn().unwrap();
+            let pid = child.id();
+            let _ = child.wait_with_output();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("no exec event for the test child")
+                    .unwrap();
+                if let RawEvent::Exec(e) = ev {
+                    if e.pid == pid {
+                        assert_eq!(e.ld_preload, 1, "LD_PRELOAD not seen");
+                        break;
+                    }
+                }
+            }
+            drop(runtime);
+        });
+    }
+}

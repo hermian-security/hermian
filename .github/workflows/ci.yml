@@ -87,6 +87,14 @@ jobs:
         run: |
           ./target/release/hermian --version
           HERMIAN_COLOR=never ./target/release/hermian test
+      # Unit tests can't load eBPF; this puts the object through the runner
+      # kernel's verifier and checks the LD_PRELOAD scan end to end.
+      - name: Load the eBPF object (verifier + live exec event)
+        run: |
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release -p hermian --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
+          test -n "$BIN"
+          sudo "$BIN" --ignored --exact ebpf::tests::ebpf_object_loads_and_sees_ld_preload
       - uses: actions/upload-artifact@v4
         with:
           name: hermian-linux-amd64
