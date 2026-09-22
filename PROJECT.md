@@ -143,8 +143,12 @@ Monitoring logs and notifies by default; it doesn't kill or quarantine processes
 `hermian isolate` adds nftables rules. `hermian unisolate` removes them.
 
 Isolation requires `response.management_cidrs`. Automatic isolation also needs
-`response.auto_isolate = true`. The rules keep loopback, established flows, DNS,
-and management CIDRs, so this isn't a complete network cutoff. Check your CIDRs
+`response.auto_isolate = true` and `CAP_NET_ADMIN`, which `hermian enable`
+grants only when isolation is configured; re-run it after turning isolation on.
+The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
+neighbour discovery, DNS to the resolvers in resolv.conf, and TCP to the
+notification endpoints resolved at isolation time. It isn't a complete
+network cutoff. Check your CIDRs
 and recovery access on a test host first; don't assume remote access is guaranteed.
 
 `hermian uninstall` tries to lift isolation, then removes the unit, config, state,
