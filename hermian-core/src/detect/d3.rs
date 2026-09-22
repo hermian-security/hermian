@@ -37,6 +37,9 @@ pub fn evaluate(ev: &FileEvent, ctx: &Ctx) -> Vec<Finding> {
 /// persistence surface on the system.
 fn writer_is_installer(ev: &FileEvent, ctx: &Ctx) -> bool {
     let Some(w) = &ev.writer else { return false };
+    if !ctx.tool_exemption_applies(w.pid) {
+        return false;
+    }
     if matches!(
         role_of(&w.comm, &w.exe),
         Role::PackageManager | Role::ConfigManager
@@ -257,8 +260,9 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     }
     // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
     if let Some(w) = &ev.writer {
-        if is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
-            || is_user_mgmt_tool(&w.comm, &w.exe)
+        if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
+            || is_user_mgmt_tool(&w.comm, &w.exe))
+            && ctx.tool_exemption_applies(w.pid)
         {
             return None;
         }

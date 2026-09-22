@@ -232,16 +232,17 @@ fn sudoers(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         return None;
     }
     if let Some(w) = &ev.writer {
-        if is_system_tool(&w.comm, &w.exe, &["visudo"])
+        if (is_system_tool(&w.comm, &w.exe, &["visudo"])
             || is_user_mgmt_tool(&w.comm, &w.exe)
-            || is_installer_chain(w.pid, ctx)
+            || is_installer_chain(w.pid, ctx))
+            && ctx.tool_exemption_applies(w.pid)
         {
             return None;
         }
     } else if ctx
         .tree
         .recent_process(ctx.now, chrono::Duration::seconds(8), |p| {
-            is_system_tool(&p.comm, &p.exe, &["visudo"])
+            is_system_tool(&p.comm, &p.exe, &["visudo"]) && ctx.tool_exemption_applies(p.pid)
         })
         .is_some()
     {
@@ -318,11 +319,12 @@ fn is_installer_chain(pid: u32, ctx: &Ctx) -> bool {
 fn recent_account_tool(ctx: &Ctx) -> bool {
     ctx.tree
         .recent_process(ctx.now, chrono::Duration::seconds(8), |p| {
-            is_user_mgmt_tool(&p.comm, &p.exe)
+            (is_user_mgmt_tool(&p.comm, &p.exe)
                 || matches!(
                     role_of(&p.comm, &p.exe),
                     Role::PackageManager | Role::ConfigManager
-                )
+                ))
+                && ctx.tool_exemption_applies(p.pid)
         })
         .is_some()
 }
@@ -335,7 +337,9 @@ fn account_files(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     }
     // Lock files and backups the tools leave behind.
     if let Some(w) = &ev.writer {
-        if is_user_mgmt_tool(&w.comm, &w.exe) || is_installer_chain(w.pid, ctx) {
+        if (is_user_mgmt_tool(&w.comm, &w.exe) || is_installer_chain(w.pid, ctx))
+            && ctx.tool_exemption_applies(w.pid)
+        {
             return None;
         }
     } else if recent_account_tool(ctx) {
