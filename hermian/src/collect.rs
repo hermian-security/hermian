@@ -10,6 +10,23 @@ use crate::cli::CollectArgs;
 use crate::ui::Style;
 use crate::{alerts, config, paths, procsrc};
 
+/// Files at or above this size are hashed but not copied into the bundle.
+const MAX_COPY: u64 = 4 * 1024 * 1024;
+
+fn sha256_reader(r: &mut impl std::io::Read) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 pub fn run(args: &CollectArgs) -> Result<()> {
     config::require_root()?;
     let alert = alerts::load_alert(&args.ref_id)?;
@@ -143,13 +160,29 @@ pub fn run(args: &CollectArgs) -> Result<()> {
     }
     for p in &paths_seen {
         let clean = p.trim_end_matches(" (deleted)");
-        match fs::metadata(clean) {
-            Ok(m) => {
+        // Paths come from alert facts, which can name attacker-controlled
+        // files: never follow a symlink or open a FIFO/device as root.
+        if let Ok(link) = fs::symlink_metadata(clean) {
+            if !link.is_file() {
+                let what = if link.file_type().is_symlink() {
+                    format!(
+                        "symlink -> {}",
+                        fs::read_link(clean)
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_default()
+                    )
+                } else {
+                    "not a regular file".to_string()
+                };
+                report.push_str(&format!("  {}  ({}; not read)\n", clean, what));
+                continue;
+            }
+        }
+        match procsrc::open_regular(clean) {
+            Some((mut f, m)) => {
+                use std::io::{Read, Seek};
                 use std::os::unix::fs::MetadataExt;
-                let hash = fs::read(clean)
-                    .ok()
-                    .map(|b| crate::selfprotect::sha256_hex(&b))
-                    .unwrap_or_default();
+                let hash = sha256_reader(&mut f).unwrap_or_default();
                 report.push_str(&format!(
                     "  {}\n    mode {:o} uid {} gid {} size {} mtime {}\n    sha256 {}\n",
                     clean,
@@ -161,11 +194,18 @@ pub fn run(args: &CollectArgs) -> Result<()> {
                     hash
                 ));
                 let copy_to = bundle_dir.join(clean.trim_start_matches('/').replace('/', "__"));
-                if m.len() < 4 * 1024 * 1024 {
-                    let _ = fs::copy(clean, &copy_to);
+                if m.len() < MAX_COPY && f.rewind().is_ok() {
+                    let mut buf = Vec::new();
+                    if f.take(MAX_COPY).read_to_end(&mut buf).is_ok() {
+                        let _ = config::write_secure_bytes(&copy_to, &buf);
+                    }
                 }
             }
-            Err(_) => report.push_str(&format!("  {}  (no longer present)\n", clean)),
+            None if fs::symlink_metadata(clean).is_ok() => report.push_str(&format!(
+                "  {}  (reached via a symlinked directory or unreadable; not read)\n",
+                clean
+            )),
+            None => report.push_str(&format!("  {}  (no longer present)\n", clean)),
         }
     }
     report.push('\n');
