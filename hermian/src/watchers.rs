@@ -197,6 +197,70 @@ impl Watches {
     }
 }
 
+/// Enough of a file's metadata to tell that it changed: inode, mtime, size.
+type Fingerprint = (u64, i64, i64, u64);
+
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
+}
+
+/// Fingerprints of every interesting file under the current watches. Kept up
+/// to date as events are emitted, so after an inotify queue overflow the
+/// lost changes can be found by comparing against a fresh one.
+fn snapshot(w: &Watches) -> HashMap<String, Fingerprint> {
+    let mut out = HashMap::new();
+    let mut consider = |p: &Path| {
+        let s = p.to_string_lossy().into_owned();
+        if p == w.config_path || is_interesting(&s) {
+            if let Some(fp) = fingerprint(p) {
+                out.insert(s, fp);
+            }
+        }
+    };
+    for p in w.paths.values() {
+        let is_dir = std::fs::symlink_metadata(p)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            consider(p);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(p) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.file_type().map(|t| !t.is_dir()).unwrap_or(false) {
+                consider(&e.path());
+            }
+        }
+    }
+    out
+}
+
+/// What changed between two snapshots.
+fn snapshot_changes(
+    old: &HashMap<String, Fingerprint>,
+    new: &HashMap<String, Fingerprint>,
+) -> Vec<(String, FileKind)> {
+    let mut out: Vec<(String, FileKind)> = new
+        .iter()
+        .filter_map(|(p, fp)| match old.get(p) {
+            None => Some((p.clone(), FileKind::Created)),
+            Some(prev) if prev != fp => Some((p.clone(), FileKind::Modified)),
+            _ => None,
+        })
+        .collect();
+    out.extend(
+        old.keys()
+            .filter(|p| !new.contains_key(*p))
+            .map(|p| (p.clone(), FileKind::Removed)),
+    );
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn systemd_target_dirs() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir("/etc/systemd/system") else {
         return Vec::new();
@@ -275,16 +339,20 @@ fn watcher_loop(
     let mut buffer = [0u8; 16384];
     let mut last_rescan = Instant::now();
     let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut known = snapshot(&w);
+    let mut overflows: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
+        let mut overflowed = false;
         // Non-blocking read; inotify's fd is nonblocking by default in this crate.
         match w.inotify.read_events(&mut buffer) {
             Ok(events) => {
                 for event in events {
                     if event.mask.contains(EventMask::Q_OVERFLOW) {
+                        overflowed = true;
                         continue;
                     }
                     if event.mask.contains(EventMask::IGNORED) {
@@ -341,6 +409,38 @@ fn watcher_loop(
             Err(_) => std::thread::sleep(Duration::from_millis(150)),
         }
 
+        // The kernel dropped events. Find what changed since the last
+        // snapshot and queue those, rather than silently missing them.
+        if overflowed {
+            overflows += 1;
+            let fresh = snapshot(&w);
+            let changes = snapshot_changes(&known, &fresh);
+            let now = Instant::now();
+            for (path, kind) in &changes {
+                let is_config = Path::new(path) == config_path;
+                let writer = if *kind == FileKind::Removed {
+                    None
+                } else {
+                    lookup_writer(path)
+                };
+                pending.entry(path.clone()).or_insert(Pending {
+                    first: now,
+                    last: now,
+                    kind: *kind,
+                    writer,
+                    is_config,
+                });
+            }
+            known = fresh;
+            w.last_error = format!(
+                "inotify queue overflowed {} time(s); rescanned, {} change(s) recovered",
+                overflows,
+                changes.len()
+            );
+            eprintln!("hermian: {}", w.last_error);
+            w.publish();
+        }
+
         // Flush settled bursts.
         let now = Instant::now();
         let ready: Vec<String> = pending
@@ -350,6 +450,10 @@ fn watcher_loop(
             .collect();
         for key in ready {
             if let Some(p) = pending.remove(&key) {
+                match fingerprint(Path::new(&key)) {
+                    Some(fp) => known.insert(key.clone(), fp),
+                    None => known.remove(&key),
+                };
                 let ev = build_file_event(&key, p);
                 if tx.blocking_send(Event::File(ev)).is_err() {
                     return;
@@ -360,6 +464,10 @@ fn watcher_loop(
         if last_rescan.elapsed() > Duration::from_secs(60) {
             w.refresh();
             w.publish();
+            // Pick up newly watched files without reporting them as changes.
+            for (path, fp) in snapshot(&w) {
+                known.entry(path).or_insert(fp);
+            }
             last_rescan = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(60));
@@ -576,6 +684,41 @@ mod tests {
         assert!(!is_wanted_dir("/home/mallory/project/.ssh"));
         assert!(!is_wanted_dir("/etc/nginx"));
         assert!(!is_wanted_dir("/tmp/.ssh"));
+    }
+
+    #[test]
+    fn overflow_rescan_finds_lost_changes() {
+        let fp = |ino, size| (ino, 1_700_000_000, 0, size);
+        let mut old = HashMap::new();
+        old.insert("/etc/cron.d/keep".to_string(), fp(1, 10));
+        old.insert("/etc/cron.d/edited".to_string(), fp(2, 10));
+        old.insert("/etc/cron.d/gone".to_string(), fp(3, 10));
+        let mut new = old.clone();
+        new.insert("/etc/cron.d/edited".to_string(), fp(2, 99));
+        new.remove("/etc/cron.d/gone");
+        new.insert("/root/.ssh/authorized_keys".to_string(), fp(4, 80));
+        let changes = snapshot_changes(&old, &new);
+        assert_eq!(
+            changes,
+            vec![
+                ("/etc/cron.d/edited".to_string(), FileKind::Modified),
+                ("/etc/cron.d/gone".to_string(), FileKind::Removed),
+                ("/root/.ssh/authorized_keys".to_string(), FileKind::Created),
+            ]
+        );
+        assert!(snapshot_changes(&new, &new).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_changes_on_rewrite() {
+        let dir = std::env::temp_dir().join(format!("hermian-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x");
+        std::fs::write(&f, "a").unwrap();
+        let before = fingerprint(&f).unwrap();
+        std::fs::write(&f, "abc").unwrap();
+        assert_ne!(before, fingerprint(&f).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
