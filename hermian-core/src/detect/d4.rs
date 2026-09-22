@@ -6,7 +6,7 @@ use crate::events::{
     is_container_overlay_path, is_editor_artifact, DetectionId, ExecEvent, FileEvent, FileKind,
     PtraceEvent, Severity,
 };
-use crate::proctree::{is_container_runtime, is_user_mgmt_tool, role_of, Role};
+use crate::proctree::{is_container_runtime, is_system_tool, is_user_mgmt_tool, role_of, Role};
 
 const PTRACE_TRACEME: u64 = 0;
 const PTRACE_ATTACH: u64 = 16;
@@ -21,8 +21,10 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
     if ev.request == PTRACE_TRACEME || ev.target_pid == ev.pid {
         return Vec::new();
     }
-    if role_of(&ev.comm, "") == Role::Debugger
-        || is_container_runtime(&ev.comm)
+    // The exe comes from the tree: a binary merely named gdb isn't a debugger.
+    let exe = ctx.tree.get(ev.pid).map(|p| p.exe.as_str()).unwrap_or("");
+    if role_of(&ev.comm, exe) == Role::Debugger
+        || is_container_runtime(&ev.comm, exe)
         || ctx.allowlist.debugger_allowed(&ev.comm)
     {
         return Vec::new();
@@ -230,13 +232,16 @@ fn sudoers(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         return None;
     }
     if let Some(w) = &ev.writer {
-        if w.comm == "visudo" || is_user_mgmt_tool(&w.comm) || is_installer_chain(w.pid, ctx) {
+        if is_system_tool(&w.comm, &w.exe, &["visudo"])
+            || is_user_mgmt_tool(&w.comm, &w.exe)
+            || is_installer_chain(w.pid, ctx)
+        {
             return None;
         }
     } else if ctx
         .tree
         .recent_process(ctx.now, chrono::Duration::seconds(8), |p| {
-            p.comm == "visudo"
+            is_system_tool(&p.comm, &p.exe, &["visudo"])
         })
         .is_some()
     {
@@ -313,7 +318,7 @@ fn is_installer_chain(pid: u32, ctx: &Ctx) -> bool {
 fn recent_account_tool(ctx: &Ctx) -> bool {
     ctx.tree
         .recent_process(ctx.now, chrono::Duration::seconds(8), |p| {
-            is_user_mgmt_tool(&p.comm)
+            is_user_mgmt_tool(&p.comm, &p.exe)
                 || matches!(
                     role_of(&p.comm, &p.exe),
                     Role::PackageManager | Role::ConfigManager
@@ -330,7 +335,7 @@ fn account_files(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     }
     // Lock files and backups the tools leave behind.
     if let Some(w) = &ev.writer {
-        if is_user_mgmt_tool(&w.comm) || is_installer_chain(w.pid, ctx) {
+        if is_user_mgmt_tool(&w.comm, &w.exe) || is_installer_chain(w.pid, ctx) {
             return None;
         }
     } else if recent_account_tool(ctx) {
