@@ -103,7 +103,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             failures: s.failures,
             pending: 0,
             last_error: String::new(),
-            per_channel: Default::default(),
+            ..Default::default()
         })
         .unwrap_or_default();
     let notifier =

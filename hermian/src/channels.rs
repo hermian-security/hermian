@@ -8,6 +8,8 @@ use std::time::Duration;
 use hermian_core::config::{EmailCfg, TelegramCfg};
 use hermian_core::{render, Alert, Severity, Theme};
 
+use crate::notify::SendError;
+
 // ---------------------------------------------------------------------------
 // Telegram
 // ---------------------------------------------------------------------------
@@ -47,18 +49,33 @@ pub mod telegram {
 
     /// Build the HTML message body: a bold headline, the human summary, and
     /// the full plain-theme alert in a monospace block.
+    /// Cut `s` to at most `max` chars, marking the cut. Applied before
+    /// escaping so an HTML entity is never split.
+    fn clip(s: &str, max: usize) -> String {
+        if s.chars().count() <= max {
+            return s.to_string();
+        }
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('\u{2026}');
+        out
+    }
+
     pub fn body(alert: &Alert) -> String {
-        let mut out = String::new();
-        out.push_str(&format!(
+        // Every piece is complete HTML, so skipping one never leaves an open
+        // tag; the footer is always kept. Facts can quote attacker-controlled
+        // file content, so without a budget one long line could push the
+        // message past Telegram's limit and get it rejected on every retry.
+        let footer = format!("\n<code>hermian show {}</code>", esc(&alert.ref_id));
+        let mut out = format!(
             "{} <b>HERMIAN {}</b> \u{00B7} <code>{}</code>\n<b>{}</b>\n",
             glyph(alert.severity),
             alert.severity.as_str(),
-            esc(&alert.host),
-            esc(&alert.title)
-        ));
+            esc(&clip(&alert.host, 80)),
+            esc(&clip(&alert.title, 200))
+        );
+        let mut pieces = Vec::new();
         if !alert.what.is_empty() {
-            out.push_str(&esc(&alert.what));
-            out.push('\n');
+            pieces.push(format!("{}\n", esc(&clip(&alert.what, 1200))));
         }
         if !alert.chain.is_empty() {
             let chain: Vec<String> = alert
@@ -66,22 +83,28 @@ pub mod telegram {
                 .iter()
                 .map(|n| format!("{}({})", n.comm, n.pid))
                 .collect();
-            out.push_str(&format!(
+            pieces.push(format!(
                 "<i>chain:</i> <code>{}</code>\n",
-                esc(&chain.join(" \u{2192} "))
+                esc(&clip(&chain.join(" \u{2192} "), 600))
             ));
         }
         for f in &alert.facts {
-            out.push_str(&format!(
+            pieces.push(format!(
                 "<i>{}:</i> <code>{}</code>\n",
-                esc(&f.label),
-                esc(&f.value)
+                esc(&clip(&f.label, 60)),
+                esc(&clip(&f.value, 400))
             ));
         }
         if let Some(a) = alert.actions.first() {
-            out.push_str(&format!("\n<b>Next:</b> {}\n", esc(a)));
+            pieces.push(format!("\n<b>Next:</b> {}\n", esc(&clip(a, 400))));
         }
-        out.push_str(&format!("\n<code>hermian show {}</code>", alert.ref_id));
+        let footer_len = footer.chars().count();
+        for p in pieces {
+            if out.chars().count() + p.chars().count() + footer_len <= MAX_TEXT {
+                out.push_str(&p);
+            }
+        }
+        out.push_str(&footer);
         // Full rendering as an expandable-ish block, if it fits.
         let full = render(alert, Theme::Plain);
         let budget = MAX_TEXT.saturating_sub(out.chars().count() + 20);
@@ -93,7 +116,7 @@ pub mod telegram {
         out
     }
 
-    pub fn send(alert: &Alert, cfg: &TelegramCfg) -> Result<(), String> {
+    pub fn send(alert: &Alert, cfg: &TelegramCfg) -> Result<(), SendError> {
         let url = format!("{}/bot{}/sendMessage", api_base(), cfg.bot_token);
         let mut payload = serde_json::json!({
             "chat_id": cfg.chat_id,
@@ -118,11 +141,15 @@ pub mod telegram {
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                     .and_then(|v| v["description"].as_str().map(str::to_string))
                     .unwrap_or_default();
-                Err(format!("telegram HTTP {} {}", code, detail)
-                    .trim()
-                    .to_string())
+                Err(SendError::http(
+                    code,
+                    format!("telegram HTTP {} {}", code, detail).trim(),
+                ))
             }
-            Err(e) => Err(format!("telegram request failed: {}", redact(cfg, e))),
+            Err(e) => Err(SendError::transient(format!(
+                "telegram request failed: {}",
+                redact(cfg, e)
+            ))),
         }
     }
 
@@ -352,17 +379,26 @@ pub mod email {
         Ok(t.build())
     }
 
-    pub fn send(alert: &Alert, cfg: &EmailCfg) -> Result<(), String> {
-        let msg = build(alert, cfg)?;
+    pub fn send(alert: &Alert, cfg: &EmailCfg) -> Result<(), SendError> {
+        // A message we can't build (bad address) won't build on retry either.
+        let msg = build(alert, cfg).map_err(SendError::permanent)?;
         match cfg.transport.as_str() {
             "sendmail" => SendmailTransport::new_with_command(&cfg.sendmail_path)
                 .send(&msg)
                 .map(|_| ())
-                .map_err(|e| format!("sendmail failed: {}", e)),
-            _ => smtp(cfg)?
+                .map_err(|e| SendError::transient(format!("sendmail failed: {}", e))),
+            _ => smtp(cfg)
+                .map_err(SendError::transient)?
                 .send(&msg)
                 .map(|_| ())
-                .map_err(|e| format!("smtp failed: {}", e)),
+                .map_err(|e| {
+                    let text = format!("smtp failed: {}", e);
+                    if e.is_permanent() {
+                        SendError::permanent(text)
+                    } else {
+                        SendError::transient(text)
+                    }
+                }),
         }
     }
 
@@ -425,6 +461,22 @@ mod tests {
         assert!(!b.contains("<modified>"));
         assert!(b.chars().count() <= 4096);
         assert!(b.contains("<pre>"));
+    }
+
+    #[test]
+    fn telegram_body_stays_under_the_limit_with_huge_facts() {
+        let mut f = Finding::new(DetectionId::D3, Severity::High, "Cron job added", "x")
+            .what("w".repeat(5000));
+        for i in 0..30 {
+            f = f.fact(format!("Line {}", i), "<&>".repeat(2000));
+        }
+        let a = Alert::from_finding(f, "HER-1".into(), "web-01".into(), chrono::Utc::now());
+        let b = telegram::body(&a);
+        assert!(b.chars().count() <= 4096, "{}", b.chars().count());
+        assert!(b.ends_with("<code>hermian show HER-1</code>"));
+        // Never a dangling entity or tag.
+        assert_eq!(b.matches("<code>").count(), b.matches("</code>").count());
+        assert!(!b.contains("&am\n") && !b.contains("&l\n"));
     }
 
     #[test]
