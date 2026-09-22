@@ -80,7 +80,7 @@ exception. See the examples in `/etc/hermian/config.toml`.
 | Process metadata | `/proc` at startup and while handling events |
 | TCP listeners | `/proc/net/tcp*`, polled every 5 s |
 | Setuid/setgid files | Sweep every 20 s, depth-limited to four levels |
-| SSH auth | `auth.log` / `secure`, or journald; PAM telemetry is optional |
+| SSH auth | journald (root `sshd` entries only) when running, else `auth.log` / `secure`; PAM telemetry is optional |
 
 eBPF needs kernel 5.8+ and the required permissions. If it can't load, execution
 falls back to one-second `/proc` polling and audit when available. HERMIAN leaves
