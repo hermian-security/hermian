@@ -160,58 +160,156 @@ const CONTAINER_RUNTIMES: &[&str] = &[
     "systemd-nspawn",
 ];
 
+/// Tools that are scripts, so their exe is the interpreter and only comm
+/// names them. (Debian's adduser is Perl; dnf, ansible and friends are Python.)
+const SCRIPT_TOOLS: &[&str] = &[
+    "adduser",
+    "deluser",
+    "addgroup",
+    "delgroup",
+    "unattended-upgrade",
+    "yum",
+    "dnf",
+    "ansible",
+    "ansible-playbook",
+    "salt-minion",
+    "salt-call",
+    "cloud-init",
+    "puppet",
+    "chef-client",
+    "chef-solo",
+];
+
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "sh", "bash", "dash",
+];
+
+const CRON_DAEMONS: &[&str] = &["cron", "crond", "anacron", "atd"];
+const INIT: &[&str] = &["systemd", "init"];
+const KERNEL_THREADS: &[&str] = &["kthreadd", "rcu_sched", "migration"];
+
+/// Root-owned install locations. Only a binary installed here can claim a
+/// role that exempts it from detection.
+const TRUSTED_EXE_DIRS: &[&str] = &[
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/bin/",
+    "/sbin/",
+    "/usr/lib/",
+    "/usr/lib64/",
+    "/usr/libexec/",
+    "/lib/",
+    "/lib64/",
+    "/usr/local/bin/",
+    "/usr/local/sbin/",
+    "/usr/local/lib/",
+    "/opt/",
+    "/snap/",
+    "/nix/store/",
+];
+
+/// Whether `exe` is an intact binary in a root-owned install location.
+pub fn is_trusted_exe(exe: &str) -> bool {
+    !exe.ends_with(" (deleted)")
+        && !exe.contains("/../")
+        && !exe.contains("/./")
+        && !exe.contains("//")
+        && TRUSTED_EXE_DIRS.iter().any(|d| exe.starts_with(d))
+}
+
+fn exe_basename(exe: &str) -> &str {
+    exe.trim_end_matches(" (deleted)")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// Is this process one of the tools in `names`, judged in a way a local user
+/// can't fake?
+///
+/// `comm` is just the binary's file name (or whatever `prctl` set), so a copy
+/// of anything at `/tmp/dpkg` has comm "dpkg". When the exe is known it must
+/// sit in a root-owned directory and either be named like the tool or be a
+/// script interpreter running a known script tool. With no exe (the process
+/// vanished before /proc was read) we fall back to comm.
+pub fn is_system_tool(comm: &str, exe: &str, names: &[&str]) -> bool {
+    let c = comm.trim();
+    if exe.is_empty() {
+        return comm_matches(c, names);
+    }
+    if !is_trusted_exe(exe) {
+        return false;
+    }
+    let base = exe_basename(exe);
+    if comm_matches(base, names) {
+        return true;
+    }
+    comm_matches(base, SCRIPT_INTERPRETERS)
+        && comm_matches(c, names)
+        && comm_matches(c, SCRIPT_TOOLS)
+}
+
 pub fn role_of(comm: &str, exe: &str) -> Role {
     let c = comm.trim();
-    if comm_matches(c, WEB_SERVERS) || exe_contains(exe, &["php-fpm"]) {
+    let base = exe_basename(exe);
+    // Roles that add suspicion match comm *or* exe name: renaming a copied
+    // shell mustn't hide it.
+    let named = |set: &[&str]| comm_matches(c, set) || comm_matches(base, set);
+    // Roles that exempt a process from detection need a trusted exe.
+    let tool = |set: &[&str]| is_system_tool(c, exe, set);
+    if named(WEB_SERVERS) || exe_contains(exe, &["php-fpm"]) {
         return Role::WebServer;
     }
-    if comm_matches(c, DATABASES) {
+    if named(DATABASES) {
         return Role::Database;
     }
-    if c == "sshd" || c == "sshd-session" {
+    if tool(&["sshd", "sshd-session"]) {
         return Role::Sshd;
     }
-    if comm_matches(c, SHELLS) {
-        return Role::Shell;
-    }
-    if comm_matches(c, DOWNLOADERS) {
-        return Role::Downloader;
-    }
-    if comm_matches(c, INTERPRETERS) || exe_contains(exe, &["/php"]) {
-        return Role::Interpreter;
-    }
-    if comm_matches(c, PACKAGE_MANAGERS) {
+    // Tools before shells/interpreters: dnf or adduser's exe *is* python/perl.
+    if tool(PACKAGE_MANAGERS) {
         return Role::PackageManager;
     }
-    if comm_matches(c, CONFIG_MANAGERS) {
+    if tool(CONFIG_MANAGERS) {
         return Role::ConfigManager;
     }
-    if comm_matches(c, DEBUGGERS) {
+    if tool(DEBUGGERS) {
         return Role::Debugger;
     }
-    if comm_matches(c, USER_MGMT) {
+    if tool(USER_MGMT) {
         return Role::UserMgmt;
     }
-    if matches!(c, "cron" | "crond" | "anacron" | "atd") {
+    if tool(CRON_DAEMONS) {
         return Role::Cron;
     }
-    if matches!(
-        c,
-        "systemd" | "init" | "kthreadd" | "rcu_sched" | "migration"
-    ) {
+    // Kernel threads have no exe at all.
+    if tool(INIT) || (exe.is_empty() && comm_matches(c, KERNEL_THREADS)) {
         return Role::System;
+    }
+    if named(SHELLS) {
+        return Role::Shell;
+    }
+    if named(DOWNLOADERS) {
+        return Role::Downloader;
+    }
+    if named(INTERPRETERS) || exe_contains(exe, &["/php"]) {
+        return Role::Interpreter;
     }
     Role::Unknown
 }
 
 /// Match `comm` against a set, tolerating versioned or annotated names such as
-/// `python3.11`, `nginx: worker`, `php-fpm8.2`.
+/// `python3.11`, `nginx: worker`, `php-fpm8.2`, and the kernel's 15-char comm
+/// truncation (`unattended-upgr`).
 fn comm_matches(c: &str, set: &[&str]) -> bool {
     if c.is_empty() {
         return false;
     }
     set.iter().any(|k| {
         if *k == c {
+            return true;
+        }
+        if c.len() == 15 && k.len() > 15 && k.starts_with(c) {
             return true;
         }
         match c.strip_prefix(k) {
@@ -228,16 +326,16 @@ fn exe_contains(exe: &str, needles: &[&str]) -> bool {
     !exe.is_empty() && needles.iter().any(|n| exe.contains(n))
 }
 
-pub fn is_session_daemon(comm: &str) -> bool {
-    comm_matches(comm, SESSION_DAEMONS)
+pub fn is_session_daemon(comm: &str, exe: &str) -> bool {
+    is_system_tool(comm, exe, SESSION_DAEMONS)
 }
 
-pub fn is_container_runtime(comm: &str) -> bool {
-    comm_matches(comm, CONTAINER_RUNTIMES)
+pub fn is_container_runtime(comm: &str, exe: &str) -> bool {
+    is_system_tool(comm, exe, CONTAINER_RUNTIMES)
 }
 
-pub fn is_user_mgmt_tool(comm: &str) -> bool {
-    comm_matches(comm, USER_MGMT)
+pub fn is_user_mgmt_tool(comm: &str, exe: &str) -> bool {
+    is_system_tool(comm, exe, USER_MGMT)
 }
 
 /// How long an exited process stays in the tree: long enough to attribute a
@@ -441,13 +539,13 @@ impl ProcessTree {
             return true;
         }
         if let Some(p) = self.procs.get(&pid) {
-            if is_session_daemon(&p.comm) {
+            if is_session_daemon(&p.comm, &p.exe) {
                 return true;
             }
         }
         self.ancestors_of(pid)
             .iter()
-            .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm))
+            .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm, &p.exe))
     }
 
     /// True if any known process on the host is part of an interactive session.
@@ -471,9 +569,9 @@ impl ProcessTree {
                     .procs
                     .get(&child.ppid)
                     .map(|parent| {
-                        is_session_daemon(&parent.comm)
+                        is_session_daemon(&parent.comm, &parent.exe)
                             && parent.comm != "systemd-logind"
-                            && !is_session_daemon(&child.comm)
+                            && !is_session_daemon(&child.comm, &child.exe)
                     })
                     .unwrap_or(false)
         })
@@ -562,6 +660,52 @@ mod tests {
         // No false prefix matches.
         assert_eq!(role_of("shred", ""), Role::Unknown);
         assert_eq!(role_of("nodemon", ""), Role::Unknown);
+    }
+
+    #[test]
+    fn exempt_roles_need_a_trusted_exe() {
+        // A copy at /tmp/dpkg has comm "dpkg" but isn't a package manager.
+        assert_eq!(role_of("dpkg", "/tmp/dpkg"), Role::Unknown);
+        assert_eq!(role_of("dpkg", "/usr/bin/dpkg"), Role::PackageManager);
+        assert_eq!(role_of("gdb", "/dev/shm/gdb"), Role::Unknown);
+        assert_eq!(role_of("gdb", "/usr/bin/gdb"), Role::Debugger);
+        assert_eq!(role_of("usermod", "/home/x/usermod"), Role::Unknown);
+        assert_eq!(role_of("sshd", "/var/tmp/sshd"), Role::Unknown);
+        assert_eq!(role_of("systemd", "/tmp/systemd"), Role::Unknown);
+        // Deleted or path-trick binaries aren't trusted either.
+        assert_eq!(role_of("dpkg", "/usr/bin/dpkg (deleted)"), Role::Unknown);
+        assert_eq!(role_of("dpkg", "/usr/bin/../../tmp/dpkg"), Role::Unknown);
+        // Script tools: exe is the interpreter.
+        assert_eq!(role_of("dnf", "/usr/bin/python3.9"), Role::PackageManager);
+        assert_eq!(
+            role_of("unattended-upgr", "/usr/bin/python3.12"),
+            Role::PackageManager
+        );
+        assert_eq!(role_of("adduser", "/usr/bin/perl"), Role::UserMgmt);
+        // ...but only known script tools.
+        assert_eq!(role_of("dpkg", "/usr/bin/python3"), Role::Interpreter);
+        // Kernel threads have no exe.
+        assert_eq!(role_of("kthreadd", ""), Role::System);
+        assert_eq!(role_of("kthreadd", "/tmp/kthreadd"), Role::Unknown);
+    }
+
+    #[test]
+    fn renamed_shells_keep_their_role() {
+        assert_eq!(role_of("x", "/var/www/uploads/bash"), Role::Shell);
+        assert_eq!(role_of("kworker", "/tmp/curl"), Role::Downloader);
+    }
+
+    #[test]
+    fn fake_session_daemon_is_not_interactive() {
+        let mut t = ProcessTree::new();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(400, 1, "cron"));
+        let mut fake = info(401, 400, "tmux");
+        fake.exe = "/tmp/tmux".into();
+        t.upsert(fake);
+        t.upsert(info(402, 401, "bash"));
+        assert!(!t.has_interactive_session(402, 0));
+        assert!(!t.any_interactive_session());
     }
 
     #[test]
