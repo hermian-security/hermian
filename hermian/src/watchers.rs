@@ -470,7 +470,7 @@ fn content_for(path: &str, is_config: bool) -> Option<String> {
         || name.starts_with(".z")
         || name == ".profile";
     if tracked {
-        procsrc::read_file(path)
+        procsrc::read_regular_file(path)
     } else {
         None
     }
