@@ -2,11 +2,14 @@
 //!
 //! Every alert is persisted as JSON and written to the always-on channels
 //! (journald, file). Notifying channels (stdout, webhook) only receive alerts
-//! at or above `notifications.min_severity`. Failed deliveries are retried with
-//! backoff; if delivery keeps failing for 15 minutes a CRITICAL is logged
-//! locally so the operator learns the alert path is broken.
+//! at or above `notifications.min_severity`. Each notifying channel has its own
+//! queue and backoff, so one broken channel doesn't hold up the others. Alerts
+//! a channel will never accept (HTTP 400/413, SMTP 5xx) are dropped for that
+//! channel; other failures are retried. If a channel keeps failing for 15
+//! minutes a CRITICAL is logged locally so the operator learns the alert path
+//! is broken.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex, Once};
@@ -32,7 +35,13 @@ pub struct NotifyState {
     pub last_error: String,
     /// Successful deliveries per channel since the daemon started.
     #[serde(default)]
-    pub per_channel: std::collections::BTreeMap<String, u64>,
+    pub per_channel: BTreeMap<String, u64>,
+    /// Alerts each notifying channel still owes.
+    #[serde(default)]
+    pub pending_by_channel: BTreeMap<String, usize>,
+    /// Alerts a channel gave up on: queue overflow or a permanent rejection.
+    #[serde(default)]
+    pub dropped_by_channel: BTreeMap<String, u64>,
 }
 
 pub struct Notifier {
@@ -101,135 +110,307 @@ impl Notifier {
     }
 }
 
-/// Alerts waiting for a notifying channel to accept them.
+/// Alerts waiting for one notifying channel to accept them.
 const MAX_PENDING: usize = 500;
 
 /// Channels that deliver to a human (gated by `min_severity`, retried).
 pub const NOTIFYING_CHANNELS: &[&str] = &["telegram", "email", "webhook", "stdout"];
 
-/// An alert plus the channels that have not yet accepted it, so a failure on
-/// one channel never causes a duplicate on another.
-struct Pending {
-    alert: Alert,
-    owed: Vec<&'static str>,
+const FIRST_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_BACKOFF: Duration = Duration::from_secs(120);
+
+/// A delivery failure. Permanent ones (a request the endpoint will never
+/// accept, e.g. HTTP 400/413 or an SMTP 5xx) drop the alert for that channel
+/// instead of blocking everything queued behind it.
+#[derive(Debug, Clone)]
+pub struct SendError {
+    pub msg: String,
+    pub permanent: bool,
 }
 
+impl SendError {
+    pub fn transient(msg: impl Into<String>) -> Self {
+        SendError {
+            msg: msg.into(),
+            permanent: false,
+        }
+    }
+
+    pub fn permanent(msg: impl Into<String>) -> Self {
+        SendError {
+            msg: msg.into(),
+            permanent: true,
+        }
+    }
+
+    /// Classify an HTTP error status. Auth, not-found and rate-limit errors
+    /// stay transient: fixing the config (or waiting) makes them succeed.
+    pub fn http(code: u16, msg: impl Into<String>) -> Self {
+        SendError {
+            msg: msg.into(),
+            permanent: matches!(code, 400 | 413 | 414 | 415 | 422),
+        }
+    }
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+enum ChanMsg {
+    Alert(Box<Alert>),
+    Config(Box<NotificationsCfg>),
+}
+
+/// Persist every alert right away, then hand notifying channels their copy.
+/// Each channel runs as its own task with its own queue and backoff, so a
+/// broken or slow channel never delays the others (or local persistence).
 async fn worker(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     mut cfg: NotificationsCfg,
     state: Arc<Mutex<NotifyState>>,
 ) {
-    let mut pending: VecDeque<Pending> = VecDeque::new();
-    let mut failing_since: Option<DateTime<Utc>> = None;
-    let mut failing_alarm_sent = false;
-    let mut backoff = Duration::from_secs(5);
-    let mut retry = tokio::time::interval(backoff);
-    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut channels: BTreeMap<&'static str, mpsc::UnboundedSender<ChanMsg>> = BTreeMap::new();
+    sync_channels(&mut channels, &cfg, &state);
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            Msg::Alert(alert) => {
+                let rendered_plain = hermian_core::render(&alert, Theme::Plain);
+                persist(&alert, &rendered_plain, &cfg);
+                if alert.severity >= cfg.min_severity() && !channels.is_empty() {
+                    for tx in channels.values() {
+                        let _ = tx.send(ChanMsg::Alert(Box::new(alert.clone())));
+                    }
+                } else {
+                    mark_delivered(&state, &alert);
+                }
+            }
+            Msg::Reconfigure(new_cfg) => {
+                cfg = new_cfg;
+                sync_channels(&mut channels, &cfg, &state);
+            }
+        }
+    }
+}
 
-    loop {
-        tokio::select! {
-            maybe = rx.recv() => {
-                match maybe {
-                    Some(Msg::Alert(alert)) => {
-                        // Always-on channels + JSON persistence happen immediately and
-                        // never block on network.
-                        let rendered_plain = hermian_core::render(&alert, Theme::Plain);
-                        persist(&alert, &rendered_plain, &cfg);
-                        let owed = notifying_channels(&cfg);
-                        if alert.severity >= cfg.min_severity() && !owed.is_empty() {
-                            if pending.len() >= MAX_PENDING {
-                                pending.pop_front();
-                            }
-                            pending.push_back(Pending { alert, owed });
-                        } else {
-                            mark_delivered(&state, &alert);
-                        }
-                    }
-                    Some(Msg::Reconfigure(new_cfg)) => {
-                        cfg = new_cfg;
-                    }
-                    None => return,
-                }
+/// Start tasks for newly enabled channels, stop removed ones (dropping the
+/// sender ends the task and its queue), and pass the new config to the rest.
+fn sync_channels(
+    channels: &mut BTreeMap<&'static str, mpsc::UnboundedSender<ChanMsg>>,
+    cfg: &NotificationsCfg,
+    state: &Arc<Mutex<NotifyState>>,
+) {
+    let wanted = notifying_channels(cfg);
+    channels.retain(|name, _| wanted.contains(name));
+    if let Ok(mut s) = state.lock() {
+        s.pending_by_channel
+            .retain(|name, _| wanted.contains(&name.as_str()));
+        s.pending = s.pending_by_channel.values().sum();
+    }
+    for name in wanted {
+        match channels.get(name) {
+            Some(tx) => {
+                let _ = tx.send(ChanMsg::Config(Box::new(cfg.clone())));
             }
-            _ = retry.tick() => {}
+            None => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                tokio::spawn(channel_task(name, rx, cfg.clone(), state.clone()));
+                channels.insert(name, tx);
+            }
         }
+    }
+}
 
-        // Attempt delivery of everything pending, in order, stop at first failure
-        // to preserve ordering and avoid hammering a down endpoint. Network I/O
-        // runs on the blocking pool so the daemon's event loop is never stalled
-        // by a slow SMTP server.
-        let mut delivered_any = false;
-        let mut last_error = String::new();
-        while let Some(p) = pending.front_mut() {
-            let alert = p.alert.clone();
-            let owed = p.owed.clone();
-            let cfg_c = cfg.clone();
-            let results = tokio::task::spawn_blocking(move || {
-                owed.iter()
-                    .map(|ch| (*ch, notify_one(ch, &alert, &cfg_c)))
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default();
-            let mut still_owed = Vec::new();
-            for (ch, r) in results {
-                match r {
-                    Ok(()) => {
-                        delivered_any = true;
-                        if let Ok(mut s) = state.lock() {
-                            *s.per_channel.entry(ch.to_string()).or_default() += 1;
-                        }
-                    }
-                    Err(e) => {
-                        last_error = format!("{}: {}", ch, e);
-                        if let Ok(mut s) = state.lock() {
-                            s.last_error = last_error.clone();
-                        }
-                        still_owed.push(ch);
-                    }
-                }
-            }
-            if still_owed.is_empty() {
-                mark_delivered(&state, &p.alert);
-                pending.pop_front();
-            } else {
-                p.owed = still_owed;
-                break;
-            }
+struct ChannelQueue {
+    name: &'static str,
+    queue: VecDeque<Alert>,
+    cfg: NotificationsCfg,
+    backoff: Duration,
+    failing_since: Option<DateTime<Utc>>,
+    alarm_sent: bool,
+    /// Alerts given up on since start (overflow or permanent rejection).
+    dropped: u64,
+}
+
+impl ChannelQueue {
+    /// Make room when the queue is full: drop the oldest alert below
+    /// CRITICAL, or the oldest overall if everything queued is CRITICAL.
+    fn make_room(&mut self) {
+        if self.queue.len() < MAX_PENDING {
+            return;
         }
-        if pending.is_empty() {
-            failing_since = None;
-            failing_alarm_sent = false;
-            backoff = Duration::from_secs(5);
-        } else {
-            let now = Utc::now();
-            let since = *failing_since.get_or_insert(now);
-            if now - since > chrono::Duration::minutes(15) && !failing_alarm_sent {
-                failing_alarm_sent = true;
-                if let Ok(mut s) = state.lock() {
-                    s.failures += 1;
-                }
-                syslog_msg(
-                    Severity::Critical,
-                    &format!(
-                        "HERMIAN CRITICAL: alert notification delivery has been failing for more than 15 minutes ({} queued, last error: {})",
-                        pending.len(),
-                        last_error
-                    ),
-                );
-            }
-            backoff = if delivered_any {
-                Duration::from_secs(5)
-            } else {
-                (backoff * 2).min(Duration::from_secs(120))
-            };
+        let victim = self
+            .queue
+            .iter()
+            .position(|a| a.severity < Severity::Critical)
+            .unwrap_or(0);
+        if let Some(a) = self.queue.remove(victim) {
+            self.note_drop(&a, "queue full");
         }
+    }
+
+    fn note_drop(&mut self, alert: &Alert, why: &str) {
+        self.dropped += 1;
+        // Every drop is logged locally, so the alert isn't lost outright.
+        syslog_msg(
+            Severity::High,
+            &format!(
+                "hermian: {} dropped alert {} ({}): {} ({} dropped since start)",
+                self.name, alert.ref_id, alert.severity, why, self.dropped
+            ),
+        );
+    }
+
+    /// Returns false once the channel has been removed.
+    fn take(&mut self, msg: Option<ChanMsg>) -> bool {
+        match msg {
+            Some(ChanMsg::Alert(a)) => {
+                self.make_room();
+                self.queue.push_back(*a);
+                true
+            }
+            Some(ChanMsg::Config(c)) => {
+                self.cfg = *c;
+                // New settings deserve a prompt retry.
+                self.backoff = FIRST_BACKOFF;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn publish(&self, state: &Arc<Mutex<NotifyState>>) {
         if let Ok(mut s) = state.lock() {
-            s.pending = pending.len();
+            s.pending_by_channel
+                .insert(self.name.to_string(), self.queue.len());
+            s.pending = s.pending_by_channel.values().sum();
+            if self.dropped > 0 {
+                s.dropped_by_channel
+                    .insert(self.name.to_string(), self.dropped);
+            }
         }
-        retry = tokio::time::interval(backoff);
-        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        retry.tick().await; // consume the immediate first tick
+    }
+
+    fn record_error(&mut self, e: &SendError, state: &Arc<Mutex<NotifyState>>) {
+        let err = format!("{}: {}", self.name, e);
+        if let Ok(mut s) = state.lock() {
+            s.last_error = err.clone();
+        }
+        let now = Utc::now();
+        let since = *self.failing_since.get_or_insert(now);
+        if now - since > chrono::Duration::minutes(15) && !self.alarm_sent {
+            self.alarm_sent = true;
+            if let Ok(mut s) = state.lock() {
+                s.failures += 1;
+            }
+            syslog_msg(
+                Severity::Critical,
+                &format!(
+                    "HERMIAN CRITICAL: {} alert delivery has been failing for more than 15 minutes \
+                     ({} queued, last error: {})",
+                    self.name,
+                    self.queue.len(),
+                    err
+                ),
+            );
+        }
+    }
+}
+
+type SendFn = fn(&str, &Alert, &NotificationsCfg) -> Result<(), SendError>;
+
+async fn channel_task(
+    name: &'static str,
+    rx: mpsc::UnboundedReceiver<ChanMsg>,
+    cfg: NotificationsCfg,
+    state: Arc<Mutex<NotifyState>>,
+) {
+    run_channel(name, rx, cfg, state, send_classified).await
+}
+
+async fn run_channel(
+    name: &'static str,
+    mut rx: mpsc::UnboundedReceiver<ChanMsg>,
+    cfg: NotificationsCfg,
+    state: Arc<Mutex<NotifyState>>,
+    send: SendFn,
+) {
+    let mut q = ChannelQueue {
+        name,
+        queue: VecDeque::new(),
+        cfg,
+        backoff: FIRST_BACKOFF,
+        failing_since: None,
+        alarm_sent: false,
+        dropped: 0,
+    };
+    loop {
+        // Pick up everything already queued without waiting.
+        loop {
+            match rx.try_recv() {
+                Ok(m) => {
+                    q.take(Some(m));
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
+            }
+        }
+        q.publish(&state);
+        let Some(alert) = q.queue.front().cloned() else {
+            if !q.take(rx.recv().await) {
+                return;
+            }
+            continue;
+        };
+        let cfg = q.cfg.clone();
+        let result = tokio::task::spawn_blocking(move || send(name, &alert, &cfg))
+            .await
+            // A panicking send is a failure, not a delivery.
+            .unwrap_or_else(|e| Err(SendError::transient(format!("send panicked: {}", e))));
+        match result {
+            Ok(()) => {
+                if let Some(a) = q.queue.pop_front() {
+                    mark_delivered(&state, &a);
+                }
+                if let Ok(mut s) = state.lock() {
+                    *s.per_channel.entry(name.to_string()).or_default() += 1;
+                }
+                q.backoff = FIRST_BACKOFF;
+                q.failing_since = None;
+                q.alarm_sent = false;
+            }
+            Err(e) if e.permanent => {
+                if let Some(a) = q.queue.pop_front() {
+                    q.note_drop(&a, &e.msg);
+                }
+                q.record_error(&e, &state);
+            }
+            Err(e) => {
+                q.record_error(&e, &state);
+                q.publish(&state);
+                let deadline = tokio::time::Instant::now() + q.backoff;
+                q.backoff = (q.backoff * 2).min(MAX_BACKOFF);
+                // New alerts join the queue but don't cut the backoff short;
+                // a config change does.
+                loop {
+                    tokio::select! {
+                        m = rx.recv() => {
+                            let is_config = matches!(m, Some(ChanMsg::Config(_)));
+                            if !q.take(m) {
+                                return;
+                            }
+                            q.publish(&state);
+                            if is_config {
+                                break;
+                            }
+                        }
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -243,6 +424,10 @@ fn notifying_channels(cfg: &NotificationsCfg) -> Vec<&'static str> {
 
 /// Deliver one alert to one notifying channel.
 pub fn notify_one(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), String> {
+    send_classified(channel, alert, cfg).map_err(|e| e.msg)
+}
+
+fn send_classified(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), SendError> {
     match channel {
         "stdout" => {
             println!("{}", hermian_core::render(alert, Theme::Plain));
@@ -251,7 +436,7 @@ pub fn notify_one(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Resul
         "webhook" => webhook::send(alert, &cfg.webhook),
         "telegram" => crate::channels::telegram::send(alert, &cfg.telegram),
         "email" => crate::channels::email::send(alert, &cfg.email),
-        other => Err(format!("unknown channel {}", other)),
+        other => Err(SendError::permanent(format!("unknown channel {}", other))),
     }
 }
 
@@ -416,7 +601,34 @@ pub mod webhook {
         }
     }
 
-    pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), String> {
+    /// `scheme://host[:port]` only. Slack/Discord/ntfy webhook URLs carry
+    /// their secret in the path or query, so the full URL must never be
+    /// shown in status, logs or errors.
+    pub fn display_url(url: &str) -> String {
+        match url.split_once("://") {
+            Some((scheme, rest)) => {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                let host = authority.rsplit('@').next().unwrap_or(authority);
+                format!("{}://{}/…", scheme, host)
+            }
+            None => "<webhook>".to_string(),
+        }
+    }
+
+    /// ureq errors include the request URL; replace it (and the bearer
+    /// token, should it ever appear) before the text goes anywhere.
+    fn redact(cfg: &WebhookCfg, e: impl std::fmt::Display) -> String {
+        let mut s = e.to_string();
+        if !cfg.url.is_empty() {
+            s = s.replace(&cfg.url, &display_url(&cfg.url));
+        }
+        if !cfg.token.is_empty() {
+            s = s.replace(&cfg.token, "<token>");
+        }
+        s
+    }
+
+    pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), SendError> {
         let body = payload(alert, &cfg.format);
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(cfg.timeout_secs.clamp(2, 60)))
@@ -428,8 +640,14 @@ pub mod webhook {
         }
         match req.send_json(body) {
             Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, _)) => Err(format!("webhook returned HTTP {}", code)),
-            Err(e) => Err(format!("webhook request failed: {}", e)),
+            Err(ureq::Error::Status(code, _)) => Err(SendError::http(
+                code,
+                format!("webhook returned HTTP {}", code),
+            )),
+            Err(e) => Err(SendError::transient(format!(
+                "webhook request failed: {}",
+                redact(cfg, e)
+            ))),
         }
     }
 }
@@ -467,5 +685,155 @@ mod tests {
         assert_eq!(d["embeds"][0]["color"], 0xF77F00);
         let n = webhook::payload(&a, "ntfy");
         assert_eq!(n["priority"], 4);
+    }
+
+    #[test]
+    fn webhook_urls_are_never_shown_in_full() {
+        assert_eq!(
+            webhook::display_url("https://hooks.slack.com/services/T0/B0/SECRET"),
+            "https://hooks.slack.com/…"
+        );
+        assert_eq!(
+            webhook::display_url("https://u:pw@ntfy.example:8443/topic?auth=x"),
+            "https://ntfy.example:8443/…"
+        );
+    }
+
+    fn queue() -> ChannelQueue {
+        ChannelQueue {
+            name: "webhook",
+            queue: VecDeque::new(),
+            cfg: NotificationsCfg::default(),
+            backoff: FIRST_BACKOFF,
+            failing_since: None,
+            alarm_sent: false,
+            dropped: 0,
+        }
+    }
+
+    #[test]
+    fn a_full_queue_sheds_non_critical_alerts_first() {
+        let mut q = queue();
+        let mut crit = alert();
+        crit.severity = Severity::Critical;
+        crit.ref_id = "HER-CRIT".into();
+        q.take(Some(ChanMsg::Alert(Box::new(crit))));
+        for i in 0..MAX_PENDING + 10 {
+            let mut a = alert();
+            a.ref_id = format!("HER-{}", i);
+            q.take(Some(ChanMsg::Alert(Box::new(a))));
+        }
+        assert_eq!(q.queue.len(), MAX_PENDING);
+        assert_eq!(q.dropped, 11);
+        assert_eq!(q.queue.front().unwrap().ref_id, "HER-CRIT");
+    }
+
+    #[test]
+    fn http_errors_are_classified() {
+        assert!(SendError::http(400, "x").permanent);
+        assert!(SendError::http(413, "x").permanent);
+        for code in [401, 403, 404, 408, 429, 500, 502, 503] {
+            assert!(!SendError::http(code, "x").permanent, "{}", code);
+        }
+    }
+
+    fn with_ref(r: &str) -> Alert {
+        let mut a = alert();
+        a.ref_id = r.into();
+        a
+    }
+
+    fn reject_bad(_: &str, a: &Alert, _: &NotificationsCfg) -> Result<(), SendError> {
+        if a.ref_id.ends_with("BAD") {
+            Err(SendError::permanent("HTTP 400 message is too long"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn always_down(_: &str, _: &Alert, _: &NotificationsCfg) -> Result<(), SendError> {
+        Err(SendError::transient("connection refused"))
+    }
+
+    fn panics(_: &str, _: &Alert, _: &NotificationsCfg) -> Result<(), SendError> {
+        panic!("boom")
+    }
+
+    async fn settle() {
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permanent_failure_does_not_block_the_queue() {
+        let state = Arc::new(Mutex::new(NotifyState::default()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        for r in ["HER-1-BAD", "HER-2", "HER-3"] {
+            tx.send(ChanMsg::Alert(Box::new(with_ref(r)))).unwrap();
+        }
+        tokio::spawn(run_channel(
+            "webhook",
+            rx,
+            NotificationsCfg::default(),
+            state.clone(),
+            reject_bad,
+        ));
+        settle().await;
+        let s = state.lock().unwrap().clone();
+        assert_eq!(s.per_channel.get("webhook"), Some(&2), "{:?}", s);
+        assert_eq!(s.pending, 0);
+        assert!(s.last_error.contains("too long"), "{:?}", s.last_error);
+        assert_eq!(s.dropped_by_channel.get("webhook"), Some(&1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_down_channel_does_not_delay_another() {
+        let state = Arc::new(Mutex::new(NotifyState::default()));
+        let (down_tx, down_rx) = mpsc::unbounded_channel();
+        let (up_tx, up_rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_channel(
+            "telegram",
+            down_rx,
+            NotificationsCfg::default(),
+            state.clone(),
+            always_down,
+        ));
+        tokio::spawn(run_channel(
+            "email",
+            up_rx,
+            NotificationsCfg::default(),
+            state.clone(),
+            reject_bad,
+        ));
+        for r in ["HER-1", "HER-2"] {
+            down_tx.send(ChanMsg::Alert(Box::new(with_ref(r)))).unwrap();
+            up_tx.send(ChanMsg::Alert(Box::new(with_ref(r)))).unwrap();
+        }
+        settle().await;
+        let s = state.lock().unwrap().clone();
+        assert_eq!(s.per_channel.get("email"), Some(&2), "{:?}", s);
+        assert_eq!(s.per_channel.get("telegram"), None);
+        assert_eq!(s.pending_by_channel.get("telegram"), Some(&2));
+        assert_eq!(s.pending, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_send_is_not_a_delivery() {
+        let state = Arc::new(Mutex::new(NotifyState::default()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(ChanMsg::Alert(Box::new(with_ref("HER-1"))))
+            .unwrap();
+        tokio::spawn(run_channel(
+            "webhook",
+            rx,
+            NotificationsCfg::default(),
+            state.clone(),
+            panics,
+        ));
+        settle().await;
+        let s = state.lock().unwrap().clone();
+        assert!(s.last_delivery.is_none(), "{:?}", s);
+        assert_eq!(s.pending, 1);
     }
 }
