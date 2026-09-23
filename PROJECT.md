@@ -56,6 +56,12 @@ miss events or lack the context a rule needs.
 A web server spawning a shell is HIGH. A normal shell under an SSH session
 isn't. File rules also distinguish operator edits from unattended writes.
 
+Roles that exempt a process (package and config managers, user tools,
+debuggers, session daemons) need its executable in a root-owned system
+directory; a binary merely named `dpkg` doesn't count. Script tools such as
+dnf or Debian's adduser are identified by name under a system interpreter,
+so a script with such a name run by that interpreter can still pass.
+
 inotify doesn't identify the writer. The daemon tries to find an open file
 descriptor; some rules also look for a recent admin tool. If the writer is
 unknown, session presence is a fallback. That's a heuristic, not proof of who

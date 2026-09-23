@@ -323,7 +323,7 @@ fn exec_from_transient_dir(ev: &ExecEvent, ctx: &Ctx) -> Option<Finding> {
             role_of(&p.comm, &p.exe),
             Role::PackageManager | Role::ConfigManager
         )
-    });
+    }) && ctx.tool_exemption_applies(ev.pid);
 
     // Severity ladder: flagged chain > unattended > interactive/installer.
     let (severity, title) = if in_flagged {

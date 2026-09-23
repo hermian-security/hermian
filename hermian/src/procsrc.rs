@@ -184,6 +184,11 @@ fn proc_pids() -> Vec<u32> {
         .collect()
 }
 
+/// Every pid that exists right now.
+pub fn live_pids() -> std::collections::HashSet<u32> {
+    proc_pids().into_iter().collect()
+}
+
 pub fn proc_info(pid: u32, now: chrono::DateTime<chrono::Utc>) -> Option<ProcInfo> {
     let (ppid, tty_nr, start) = stat_of(pid)?;
     let comm = comm_of(pid).unwrap_or_default();
