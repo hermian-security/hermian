@@ -338,6 +338,21 @@ pub fn is_user_mgmt_tool(comm: &str, exe: &str) -> bool {
     is_system_tool(comm, exe, USER_MGMT)
 }
 
+/// Whether `exe` is under a directory where installed software lives, as
+/// opposed to somewhere a payload would be dropped.
+pub fn is_system_exe_path(exe: &str) -> bool {
+    const DIRS: &[&str] = &[
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/snap/",
+        "/nix/store/",
+    ];
+    !exe.contains("/../") && DIRS.iter().any(|d| exe.starts_with(d))
+}
+
 /// How long an exited process stays in the tree: long enough to attribute a
 /// write that inotify reports after the writer is gone, and to keep ancestry
 /// for alerts on its children.
