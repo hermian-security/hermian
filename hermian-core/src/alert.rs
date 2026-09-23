@@ -180,8 +180,67 @@ fn one() -> u32 {
     1
 }
 
+/// Make untrusted text safe to print: control characters (ESC sequences can
+/// rewrite a terminal, a newline can forge a log line) and bidi overrides
+/// (which reorder what the operator reads) become visible `\x1b` / `\u{202e}`
+/// escapes. Idempotent: the output contains nothing it would escape again.
+pub fn escape_untrusted(s: &str) -> String {
+    if !s.chars().any(needs_escape) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if needs_escape(c) {
+            let cp = c as u32;
+            if cp <= 0xFF {
+                out.push_str(&format!("\\x{:02x}", cp));
+            } else {
+                out.push_str(&format!("\\u{{{:x}}}", cp));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 impl Alert {
+    /// Escape every field that can carry attacker-controlled text (process
+    /// names, paths, usernames, quoted file content). Applied when an alert
+    /// is created and when one is read back from disk.
+    pub fn sanitized(mut self) -> Self {
+        let e = |s: &mut String| *s = escape_untrusted(s);
+        e(&mut self.host);
+        e(&mut self.title);
+        e(&mut self.what);
+        e(&mut self.why);
+        for a in &mut self.actions {
+            e(a);
+        }
+        for f in &mut self.facts {
+            e(&mut f.label);
+            e(&mut f.value);
+        }
+        for n in &mut self.chain {
+            e(&mut n.comm);
+            e(&mut n.exe);
+            if let Some(u) = &mut n.user {
+                e(u);
+            }
+        }
+        self
+    }
+
     pub fn from_finding(finding: Finding, ref_id: String, host: String, ts: DateTime<Utc>) -> Self {
+        Self::from_finding_raw(finding, ref_id, host, ts).sanitized()
+    }
+
+    fn from_finding_raw(finding: Finding, ref_id: String, host: String, ts: DateTime<Utc>) -> Self {
         Alert {
             ref_id,
             ts,
@@ -627,6 +686,36 @@ fn render_compact(alert: &Alert) -> String {
 mod tests {
     use super::*;
     use crate::events::DetectionId;
+
+    #[test]
+    fn untrusted_text_is_escaped_once() {
+        let nasty = "evil\x1b[2J\x1b]0;pwned\x07\nFAKE LOG LINE\u{202e}gpj.exe";
+        let e = escape_untrusted(nasty);
+        assert!(!e.chars().any(needs_escape), "{:?}", e);
+        assert!(e.contains("\\x1b[2J") && e.contains("\\x0a") && e.contains("\\u{202e}"));
+        assert_eq!(escape_untrusted(&e), e);
+        assert_eq!(escape_untrusted("plain /tmp/ünïcode"), "plain /tmp/ünïcode");
+    }
+
+    #[test]
+    fn alerts_escape_every_untrusted_field() {
+        let f = Finding::new(DetectionId::D2, Severity::High, "t", "s")
+            .what("user x\ny logged in")
+            .fact("User", "root\x1b[31m")
+            .chain(vec![ChainNode {
+                pid: 1,
+                uid: 0,
+                user: Some("a\rb".into()),
+                comm: "sh\x07".into(),
+                exe: "/tmp/\u{202e}x".into(),
+                focus: true,
+            }]);
+        let a = Alert::from_finding(f, "HER-1".into(), "h".into(), Utc::now());
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(!json.contains("\\u001b") && !json.contains("\\n") && !json.contains("\\r"));
+        let rendered = render(&a, Theme::Plain);
+        assert!(!rendered.contains('\x1b') && !rendered.contains('\x07'));
+    }
 
     fn sample_alert() -> Alert {
         let chain = vec![

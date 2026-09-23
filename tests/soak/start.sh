@@ -4,6 +4,8 @@
 set -eu
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$DIR/../helpers/disposable_host.sh"
+require_disposable_host
 install -m 0755 "$DIR/hermian-soak-snapshot" /usr/local/bin/hermian-soak-snapshot
 date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/hermian/soak-start
 echo '17 * * * * root /usr/local/bin/hermian-soak-snapshot' > /etc/cron.d/hermian-soak

@@ -29,14 +29,27 @@ extern "C" {
     fn pam_get_item(pamh: *const c_void, item_type: c_int, item: *mut *const c_void) -> c_int;
 }
 
+/// Longest value sent per field. PAM_USER comes from the remote client, and
+/// the whole datagram must fit the daemon's receive buffer.
+const MAX_FIELD_CHARS: usize = 512;
+
 unsafe fn get_item(pamh: *const c_void, item_type: c_int) -> String {
     let mut raw: *const c_void = std::ptr::null();
     if pam_get_item(pamh, item_type, &mut raw) != PAM_SUCCESS || raw.is_null() {
         return String::new();
     }
-    CStr::from_ptr(raw as *const c_char)
-        .to_string_lossy()
-        .into_owned()
+    let s = CStr::from_ptr(raw as *const c_char).to_string_lossy();
+    clip(&s)
+}
+
+/// Cut to [`MAX_FIELD_CHARS`] on a char boundary, marking the cut.
+fn clip(s: &str) -> String {
+    if s.chars().count() <= MAX_FIELD_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX_FIELD_CHARS - 1).collect();
+    out.push('\u{2026}');
+    out
 }
 
 fn report(pamh: *const c_void, result: &str) {
@@ -144,4 +157,18 @@ pub extern "C" fn pam_sm_acct_mgmt(
     _argv: *const *const c_char,
 ) -> c_int {
     PAM_IGNORE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fields_are_clipped_on_a_char_boundary() {
+        assert_eq!(clip("alice"), "alice");
+        let long = "é".repeat(MAX_FIELD_CHARS + 50);
+        let c = clip(&long);
+        assert_eq!(c.chars().count(), MAX_FIELD_CHARS);
+        assert!(c.ends_with('\u{2026}'));
+    }
 }

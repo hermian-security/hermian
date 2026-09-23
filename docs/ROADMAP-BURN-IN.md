@@ -205,8 +205,9 @@ F, G and H are the ones most likely to find bugs of the kind found today.
 ### 3.1 Per-host procedure (about 20 minutes plus 72 h)
 
 ```bash
-# 1. install and wire notifications (§2)
-# 2. attack matrix - all must PASS
+# 1. install and wire notifications (§2); mark the host as disposable
+sudo touch /etc/hermian-disposable-host
+# 2. attack matrix - all must PASS (each scenario cleans up after itself)
 sudo tests/run_suite.sh --skip-fp
 # 3. operator workload - must produce 0 HIGH+
 sudo tests/false_positives/run_false_positive.sh admin-edit 300
