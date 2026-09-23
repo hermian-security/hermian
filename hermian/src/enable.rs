@@ -97,7 +97,11 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         fs::set_permissions(paths::UNIT_PATH, fs::Permissions::from_mode(0o644))?;
     }
 
-    if args.with_pam {
+    // An existing hook is refreshed too, so upgrades (the package's postinst
+    // runs `enable` without --with-pam) pick up placement fixes.
+    if args.with_pam
+        || (pam_hook_configured() && std::path::Path::new(paths::PAM_MODULE_PATH).exists())
+    {
         enable_pam_module()?;
     }
 
@@ -177,28 +181,61 @@ fn enable_pam_module() -> Result<()> {
     Ok(())
 }
 
+/// Whether `/etc/pam.d/sshd` already loads the HERMIAN module.
+pub fn pam_hook_configured() -> bool {
+    fs::read_to_string("/etc/pam.d/sshd")
+        .map(|c| {
+            c.lines()
+                .any(|l| l.contains("pam_hermian.so") && !l.trim_start().starts_with('#'))
+        })
+        .unwrap_or(false)
+}
+
 /// `content` with HERMIAN's PAM lines, or `None` if nothing needs to change.
 ///
 /// The module is referenced by absolute path. A bare `pam_hermian.so` is
 /// looked up in libpam's own directory, which is `/lib/<triplet>/security`
 /// on Debian/Ubuntu and `/usr/lib64/security` on RHEL, not the
 /// `/usr/lib/security` we install to, so the hook silently never loaded.
-/// Older bare-name lines are rewritten.
+/// Older lines (bare name, or `auth` at the end) are rewritten.
+///
+/// The `auth` line goes *before* the first auth rule. Appended at the end it
+/// never ran on a failed login: Debian's common-auth ends failures with
+/// `pam_deny requisite`, which stops the stack. The `session` line can stay
+/// last, since session stacks don't stop early on success.
 fn pam_config_with_hook(content: &str) -> Option<String> {
-    let hook = format!(
-        "# HERMIAN: passive auth telemetry (never affects the auth decision)\n\
-         auth    optional    {m}\nsession optional    {m}\n",
-        m = paths::PAM_MODULE_PATH
-    );
+    let comment = "# HERMIAN: passive auth telemetry (never affects the auth decision)";
+    let auth = format!("auth    optional    {}", paths::PAM_MODULE_PATH);
+    let session = format!("session optional    {}", paths::PAM_MODULE_PATH);
     let kept: Vec<&str> = content
         .lines()
         .filter(|l| !l.contains("pam_hermian.so") && !l.contains("# HERMIAN:"))
         .collect();
-    let mut out = kept.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
+    let is_auth_rule = |l: &str| {
+        let t = l.trim_start();
+        t.starts_with("auth")
+            || t.starts_with("-auth")
+            || t == "@include common-auth"
+            || t.starts_with("@include common-auth ")
+            || t.starts_with("@include password-auth")
+            || t.starts_with("@include system-auth")
+            || t.starts_with("substack")
+    };
+    let first_auth = kept.iter().position(|l| is_auth_rule(l));
+    let mut lines: Vec<String> = kept.iter().map(|l| l.to_string()).collect();
+    match first_auth {
+        Some(i) => {
+            lines.insert(i, auth);
+            lines.insert(i, comment.to_string());
+            lines.push(session);
+        }
+        None => {
+            lines.push(comment.to_string());
+            lines.push(auth);
+            lines.push(session);
+        }
     }
-    out.push_str(&hook);
+    let out = format!("{}\n", lines.join("\n"));
     (out != content).then_some(out)
 }
 
@@ -224,10 +261,19 @@ mod tests {
 
     #[test]
     fn pam_hook_uses_the_absolute_module_path() {
-        let base = "@include common-auth\nsession required pam_loginuid.so\n";
+        let base = "# PAM configuration for sshd\n@include common-auth\nsession required pam_loginuid.so\n";
         let out = pam_config_with_hook(base).unwrap();
-        assert!(out.starts_with(base));
-        assert!(out.contains(&format!("auth    optional    {}", paths::PAM_MODULE_PATH)));
+        let auth = format!("auth    optional    {}", paths::PAM_MODULE_PATH);
+        let lines: Vec<&str> = out.lines().collect();
+        // The auth hook runs before common-auth, so failed logins reach it.
+        let hook_at = lines.iter().position(|l| *l == auth).unwrap();
+        let common_at = lines
+            .iter()
+            .position(|l| *l == "@include common-auth")
+            .unwrap();
+        assert!(hook_at < common_at, "{}", out);
+        assert_eq!(lines[0], "# PAM configuration for sshd");
+        assert!(lines.last().unwrap().starts_with("session optional"));
         // Idempotent.
         assert!(pam_config_with_hook(&out).is_none());
         // Old bare-name lines are replaced, not duplicated.
