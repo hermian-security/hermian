@@ -22,7 +22,7 @@ upgrading.
 ### Debian / Ubuntu
 
 ```bash
-VER=v0.1.0-beta.4
+VER=v0.1.0-beta.5
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 cd /tmp
 curl -fsSLO "$BASE/SHA256SUMS"
@@ -38,7 +38,7 @@ can read; from your home directory apt still installs, with a warning.
 ### Other systemd distros
 
 ```bash
-VER=v0.1.0-beta.4
+VER=v0.1.0-beta.5
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 cd /tmp
