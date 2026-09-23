@@ -917,6 +917,54 @@ mod tests {
         assert!(eng.process(Event::File(ev)).is_empty());
     }
 
+    #[test]
+    fn binaries_named_like_trusted_tools_get_no_exemption() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron"));
+        let fake = |pid, comm: &str| WriterInfo {
+            pid,
+            uid: 0,
+            comm: comm.into(),
+            exe: format!("/tmp/{}", comm),
+            tty_nr: 0,
+        };
+        eng.process(exec(t, 500, 400, 0, "dpkg", "/tmp/dpkg"));
+        let cron = eng.process(Event::File(file(
+            t,
+            "/etc/cron.d/evil",
+            FileKind::Created,
+            Some(fake(500, "dpkg")),
+            Some("* * * * * root /opt/evil.sh\n"),
+        )));
+        assert!(has(&cron, DetectionId::D3, Severity::High), "{:?}", cron);
+
+        eng.process(exec(t, 501, 400, 0, "crontab", "/tmp/crontab"));
+        let spool = eng.process(Event::File(file(
+            t,
+            "/var/spool/cron/crontabs/root",
+            FileKind::Modified,
+            Some(fake(501, "crontab")),
+            Some("* * * * * /opt/evil.sh\n"),
+        )));
+        assert!(has(&spool, DetectionId::D3, Severity::High), "{:?}", spool);
+
+        eng.process(exec(t, 502, 400, 0, "visudo", "/tmp/visudo"));
+        let sudo = eng.process(Event::File(file(
+            t,
+            "/etc/sudoers.d/99-x",
+            FileKind::Created,
+            Some(fake(502, "visudo")),
+            Some("mallory ALL=(ALL) NOPASSWD: ALL\n"),
+        )));
+        assert!(
+            has(&sudo, DetectionId::D4, Severity::Critical),
+            "{:?}",
+            sudo
+        );
+    }
+
     // ---- D4 -------------------------------------------------------------
 
     #[test]
@@ -990,6 +1038,13 @@ mod tests {
         assert!(eng.process(mk(501, "gdb", 16)).is_empty());
         // Non-attach requests are ignored.
         assert!(eng.process(mk(502, "weird", 3)).is_empty());
+        // A binary merely named gdb is still an unexpected attacher.
+        eng.process(exec(t, 503, 1, 1000, "gdb", "/dev/shm/gdb"));
+        assert!(has(
+            &eng.process(mk(503, "gdb", 16)),
+            DetectionId::D4,
+            Severity::High
+        ));
     }
 
     #[test]
