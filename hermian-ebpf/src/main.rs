@@ -110,9 +110,12 @@ const SCHED_EXEC_PID: usize = 12;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
-/// How many envp entries to inspect for LD_PRELOAD. Kept small: each probe
-/// costs verifier budget and the variable is conventionally exported early.
-const ENV_SCAN: usize = 12;
+/// How many envp entries to inspect for LD_PRELOAD. Each probe costs verifier
+/// budget; 12 was trivially bypassed by exporting a dozen dummy variables
+/// first. Still a bound, not a guarantee.
+const ENV_SCAN: usize = 32;
+
+const LD_PRELOAD_EQ: &[u8; 11] = b"LD_PRELOAD=";
 
 #[inline(always)]
 fn current_pid_uid() -> (u32, u32, u32) {
@@ -159,14 +162,16 @@ fn read_user_ptr(addr: u64) -> Option<u64> {
 
 #[inline(always)]
 fn scan_env_for_ld_preload(envp: u64) -> u8 {
-    let mut buf = [0u8; 11]; // "LD_PRELOAD="
+    // One byte more than "LD_PRELOAD=": the helper always NUL-terminates, so
+    // an 11-byte buffer only ever held "LD_PRELOAD" + NUL and never matched.
+    let mut buf = [0u8; 12];
     for i in 0..ENV_SCAN {
         let Some(p) = read_user_ptr(envp + (i as u64) * 8) else {
             break;
         };
         // SAFETY: p is a user pointer; the helper bounds-checks it.
         if unsafe { bpf_probe_read_user_str_bytes(p as *const u8, &mut buf) }.is_ok()
-            && &buf == b"LD_PRELOAD="
+            && buf[..11] == LD_PRELOAD_EQ[..]
         {
             return 1;
         }
