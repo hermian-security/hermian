@@ -1,6 +1,7 @@
 //! eBPF loader and perf-buffer readers.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -198,31 +199,74 @@ fn decode(kind: MapKind, buf: &BytesMut) -> Option<RawEvent> {
     }
 }
 
+/// Perf ring size per CPU, in pages (power of two). aya's default is small:
+/// at ~430 bytes per exec event it held only a few dozen, so a fork/exec
+/// burst overflowed it. 64 pages is 256 KiB per CPU on 4 KiB pages.
+const EXEC_PAGES: usize = 64;
+const OTHER_PAGES: usize = 16;
+
+/// Events the kernel dropped because a perf ring was full, since startup.
+pub static LOST_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Log lost events at most once a minute, with the running total.
+fn report_lost(map: &str, cpu: u32, lost: usize, last_report: &mut Option<std::time::Instant>) {
+    let total = LOST_EVENTS.fetch_add(lost as u64, Ordering::Relaxed) + lost as u64;
+    let due = last_report
+        .map(|t| t.elapsed() >= Duration::from_secs(60))
+        .unwrap_or(true);
+    if due {
+        *last_report = Some(std::time::Instant::now());
+        crate::daemon::log_daemon(
+            hermian_core::Severity::High,
+            &format!(
+                "eBPF {} ring on cpu {} dropped {} event(s) ({} total since start); \
+                 exec/connect events are being missed",
+                map, cpu, lost, total
+            ),
+        );
+    }
+}
+
 fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
-    for (map_name, kind) in [
-        ("EXEC_EVENTS", MapKind::Exec),
-        ("CONNECT_EVENTS", MapKind::Connect),
-        ("PTRACE_EVENTS", MapKind::Ptrace),
+    for (map_name, kind, pages) in [
+        ("EXEC_EVENTS", MapKind::Exec, EXEC_PAGES),
+        ("CONNECT_EVENTS", MapKind::Connect, OTHER_PAGES),
+        ("PTRACE_EVENTS", MapKind::Ptrace, OTHER_PAGES),
     ] {
         let map = bpf
             .take_map(map_name)
             .ok_or_else(|| anyhow!("map {} not found", map_name))?;
         let mut array = AsyncPerfEventArray::try_from(map)?;
         for cpu in online_cpus().map_err(|(_, e)| e)? {
-            let mut buf = array.open(cpu, None)?;
+            let mut buf = array.open(cpu, Some(pages))?;
             let tx = tx.clone();
             tokio::spawn(async move {
-                let mut buffers = (0..16)
+                let mut buffers = (0..64)
                     .map(|_| BytesMut::with_capacity(1024))
                     .collect::<Vec<_>>();
+                let mut last_report = None;
+                let mut last_error: Option<std::time::Instant> = None;
                 loop {
                     let events = match buf.read_events(&mut buffers).await {
                         Ok(e) => e,
-                        Err(_) => {
+                        Err(e) => {
+                            if last_error
+                                .map(|t| t.elapsed() >= Duration::from_secs(60))
+                                .unwrap_or(true)
+                            {
+                                last_error = Some(std::time::Instant::now());
+                                crate::daemon::log_daemon(
+                                    hermian_core::Severity::Low,
+                                    &format!("eBPF {} read on cpu {} failed: {}", map_name, cpu, e),
+                                );
+                            }
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             continue;
                         }
                     };
+                    if events.lost > 0 {
+                        report_lost(map_name, cpu, events.lost, &mut last_report);
+                    }
                     for b in buffers.iter().take(events.read) {
                         if let Some(ev) = decode(kind, b) {
                             if tx.send(ev).await.is_err() {
@@ -240,6 +284,18 @@ fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lost_events_are_counted_and_throttled() {
+        let before = LOST_EVENTS.load(Ordering::Relaxed);
+        let mut last = None;
+        report_lost("EXEC_EVENTS", 0, 3, &mut last);
+        let first = last;
+        assert!(first.is_some());
+        report_lost("EXEC_EVENTS", 0, 2, &mut last);
+        assert_eq!(last, first, "second report within a minute is throttled");
+        assert_eq!(LOST_EVENTS.load(Ordering::Relaxed) - before, 5);
+    }
 
     /// Loads the embedded object into the running kernel, so the verifier
     /// checks every program. Needs root; CI runs it with sudo:
