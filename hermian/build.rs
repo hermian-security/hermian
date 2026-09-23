@@ -65,9 +65,20 @@ fn clean_cargo() -> Command {
     cmd
 }
 
-fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+enum BuildError {
+    /// No usable BPF toolchain: falling back to the vendored object is fine.
+    NoToolchain(String),
+    /// A toolchain ran and the build failed: most likely an error in
+    /// hermian-ebpf itself. Falling back would silently ship an object that
+    /// doesn't match the source (and may not match `RawExec`'s layout).
+    Failed(String),
+}
+
+fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, BuildError> {
     if !bpf_linker_available() {
-        return Err("bpf-linker not found on PATH (cargo install bpf-linker)".into());
+        return Err(BuildError::NoToolchain(
+            "bpf-linker not found on PATH (cargo install bpf-linker)".into(),
+        ));
     }
     let target_dir = out_dir.join("ebpf-target");
     let target_dir_s = target_dir.to_string_lossy().into_owned();
@@ -77,8 +88,10 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
         .join("hermian-ebpf");
 
     let mut attempts: Vec<String> = Vec::new();
+    let mut ran = false;
 
     if toolchain_has_target() {
+        ran = true;
         let status = clean_cargo()
             .current_dir(ebpf_dir)
             .args([
@@ -88,9 +101,10 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
                 "bpfel-unknown-none",
                 "--target-dir",
                 &target_dir_s,
+                "--locked",
             ])
             .status()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| BuildError::NoToolchain(e.to_string()))?;
         if status.success() && artifact.exists() {
             return Ok(artifact);
         }
@@ -101,6 +115,7 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
         if !nightly_has_rust_src() {
             attempts.push("nightly present but missing rust-src component".into());
         } else {
+            ran = true;
             let status = clean_cargo()
                 .current_dir(ebpf_dir)
                 .args([
@@ -112,9 +127,10 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
                     "bpfel-unknown-none",
                     "--target-dir",
                     &target_dir_s,
+                    "--locked",
                 ])
                 .status()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| BuildError::NoToolchain(e.to_string()))?;
             if status.success() && artifact.exists() {
                 return Ok(artifact);
             }
@@ -122,14 +138,37 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    Err(format!(
+    let why = format!(
         "tried: {}",
         if attempts.is_empty() {
             "nothing (no usable toolchain)".to_string()
         } else {
             attempts.join("; ")
         }
-    ))
+    );
+    Err(if ran {
+        BuildError::Failed(why)
+    } else {
+        BuildError::NoToolchain(why)
+    })
+}
+
+#[derive(PartialEq)]
+enum SourceMode {
+    /// Build from source if a toolchain exists, else use the vendored object.
+    Auto,
+    /// `HERMIAN_EBPF_FROM_SOURCE=1`: build from source or fail (CI).
+    Force,
+    /// `HERMIAN_EBPF_FROM_SOURCE=0`: always use the vendored object.
+    Never,
+}
+
+fn source_mode() -> SourceMode {
+    match env::var("HERMIAN_EBPF_FROM_SOURCE").ok().as_deref() {
+        None | Some("") => SourceMode::Auto,
+        Some("0") | Some("false") | Some("no") => SourceMode::Never,
+        Some(_) => SourceMode::Force,
+    }
 }
 
 fn main() {
@@ -142,7 +181,12 @@ fn main() {
     // skips the BPF toolchain requirement entirely. The object is
     // target-independent, so it may be produced on any machine.
     if let Some(prebuilt) = env::var_os("HERMIAN_EBPF_PREBUILT") {
-        let p = PathBuf::from(prebuilt);
+        let given = PathBuf::from(prebuilt);
+        // include_bytes! resolves relative paths against src/ebpf.rs, not the
+        // package dir, so hand it an absolute path.
+        let p = given
+            .canonicalize()
+            .unwrap_or_else(|_| panic!("HERMIAN_EBPF_PREBUILT={} is not a file", given.display()));
         if !p.is_file() {
             panic!("HERMIAN_EBPF_PREBUILT={} is not a file", p.display());
         }
@@ -157,19 +201,32 @@ fn main() {
     //      hosts whose LLVM is too old for bpf-linker);
     //   3. fail with instructions.
     // HERMIAN_EBPF_FROM_SOURCE=1 forces (1) and refuses to fall back, so CI
-    // can prove the vendored object is up to date.
+    // can prove the vendored object is up to date; =0 skips straight to (2).
+    // A toolchain that runs but fails to compile is an error, not a reason
+    // to fall back.
     let vendored = ebpf_dir.join("prebuilt/hermian-ebpf.o");
     println!("cargo:rerun-if-changed={}", vendored.display());
     println!("cargo:rerun-if-env-changed=HERMIAN_EBPF_FROM_SOURCE");
-    let force_source = env::var_os("HERMIAN_EBPF_FROM_SOURCE").is_some();
+    let mode = source_mode();
 
-    let obj_path = match build_ebpf(&ebpf_dir, &out_dir) {
+    let result = if mode == SourceMode::Never {
+        Err(BuildError::NoToolchain("HERMIAN_EBPF_FROM_SOURCE=0".into()))
+    } else {
+        build_ebpf(&ebpf_dir, &out_dir)
+    };
+    let obj_path = match result {
         Ok(p) => p,
-        Err(why) if vendored.is_file() && !force_source => {
+        Err(BuildError::Failed(why)) if mode != SourceMode::Force => panic!(
+            "\n\nhermian-ebpf failed to compile ({why}).\n\
+             Not falling back to the vendored object: it would no longer match the source.\n\
+             Fix the error, or build with HERMIAN_EBPF_FROM_SOURCE=0 to use \
+             hermian-ebpf/prebuilt/hermian-ebpf.o on purpose.\n"
+        ),
+        Err(BuildError::NoToolchain(why)) if vendored.is_file() && mode != SourceMode::Force => {
             println!("cargo:warning=hermian-ebpf: no BPF toolchain ({why}); using vendored hermian-ebpf/prebuilt/hermian-ebpf.o");
             vendored
         }
-        Err(why) => panic!(
+        Err(BuildError::Failed(why) | BuildError::NoToolchain(why)) => panic!(
             "\n\nhermian-ebpf build failed ({why}) and no vendored object was found.\n\
              One of the following is required on the build host:\n  \
              a) rustup target add bpfel-unknown-none && cargo install bpf-linker\n  \
