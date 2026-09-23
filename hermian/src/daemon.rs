@@ -156,7 +156,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         ebpf: None,
         audit: false,
         auth: authlog::AuthSource::None,
-        pam: pamsock::pam_module_installed(),
+        pam: pamsock::pam_active(),
         watch_health: None,
     };
     let mut _ebpf_runtime: Option<ebpf::EbpfRuntime> = None;
@@ -674,12 +674,7 @@ fn write_status_snapshot(
     } else {
         "/proc"
     };
-    let auth_src = match (sources.pam, sources.auth) {
-        (true, _) => "PAM + inotify",
-        (false, authlog::AuthSource::File) => "auth.log + inotify",
-        (false, authlog::AuthSource::Journal) => "journald + inotify",
-        (false, authlog::AuthSource::None) => "inotify only",
-    };
+    let auth_src = auth_source_label(sources.pam, sources.auth);
     let mut detections = std::collections::BTreeMap::new();
     detections.insert("d1".to_string(), line(det.d1_process_chains, exec_src));
     detections.insert("d2".to_string(), line(det.d2_auth, auth_src));
@@ -758,6 +753,19 @@ fn write_status_snapshot(
     let _ = status::write_state(&state);
 }
 
+/// Every SSH auth source actually in use. PAM used to hide the log source
+/// (and was claimed whenever the .so existed, even with no hook).
+fn auth_source_label(pam: bool, log: authlog::AuthSource) -> &'static str {
+    match (pam, log) {
+        (true, authlog::AuthSource::File) => "PAM + auth.log + inotify",
+        (true, authlog::AuthSource::Journal) => "PAM + journald + inotify",
+        (true, authlog::AuthSource::None) => "PAM + inotify",
+        (false, authlog::AuthSource::File) => "auth.log + inotify",
+        (false, authlog::AuthSource::Journal) => "journald + inotify",
+        (false, authlog::AuthSource::None) => "inotify only",
+    }
+}
+
 fn line(enabled: bool, source: &str) -> String {
     if enabled {
         source.to_string()
@@ -770,6 +778,15 @@ fn line(enabled: bool, source: &str) -> String {
 mod tests {
     use super::*;
     use hermian_core::{Allowlist, Baseline};
+
+    #[test]
+    fn auth_label_names_every_source() {
+        use authlog::AuthSource::*;
+        assert_eq!(auth_source_label(false, Journal), "journald + inotify");
+        assert_eq!(auth_source_label(true, Journal), "PAM + journald + inotify");
+        assert_eq!(auth_source_label(true, None), "PAM + inotify");
+        assert_eq!(auth_source_label(false, None), "inotify only");
+    }
 
     fn engine() -> Engine {
         Engine::new(

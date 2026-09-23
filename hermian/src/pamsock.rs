@@ -16,6 +16,23 @@ pub fn pam_module_installed() -> bool {
     std::path::Path::new(paths::PAM_MODULE_PATH).exists()
 }
 
+/// Whether sshd actually loads the module: installed *and* referenced by an
+/// uncommented line in /etc/pam.d/sshd. The package always ships the .so,
+/// so its presence alone says nothing about coverage.
+pub fn pam_active() -> bool {
+    pam_module_installed()
+        && std::fs::read_to_string("/etc/pam.d/sshd")
+            .map(|c| pam_config_loads_module(&c))
+            .unwrap_or(false)
+}
+
+fn pam_config_loads_module(content: &str) -> bool {
+    content
+        .lines()
+        .map(str::trim_start)
+        .any(|l| !l.starts_with('#') && l.contains("pam_hermian.so"))
+}
+
 pub fn spawn_pam_listener(
     tx: mpsc::Sender<Event>,
     shutdown: Arc<AtomicBool>,
@@ -135,6 +152,17 @@ mod tests {
         assert_eq!(ev.rhost, Some("10.0.0.5".parse().unwrap()));
         assert!(parse_pam_payload(r#"{"result":"success","user":""}"#).is_none());
         assert!(parse_pam_payload("garbage").is_none());
+    }
+
+    #[test]
+    fn pam_counts_only_when_sshd_loads_it() {
+        assert!(!pam_config_loads_module("@include common-auth\n"));
+        assert!(!pam_config_loads_module(
+            "# auth optional /usr/lib/security/pam_hermian.so\n"
+        ));
+        assert!(pam_config_loads_module(
+            "auth    optional    /usr/lib/security/pam_hermian.so\n"
+        ));
     }
 
     #[test]
