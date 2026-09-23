@@ -240,9 +240,20 @@ pub fn is_user_mgmt_tool(comm: &str) -> bool {
     comm_matches(comm, USER_MGMT)
 }
 
+/// How long an exited process stays in the tree: long enough to attribute a
+/// write that inotify reports after the writer is gone, and to keep ancestry
+/// for alerts on its children.
+pub const EXIT_GRACE_SECS: i64 = 300;
+
 #[derive(Debug, Default)]
 pub struct ProcessTree {
     procs: HashMap<u32, ProcInfo>,
+    /// When a tracked pid was seen to exit. Exited processes don't count as
+    /// live sessions, and a new exec on the pid is a new process.
+    exited: HashMap<u32, DateTime<Utc>>,
+    /// When the current image was exec'd, for processes we saw start.
+    /// (`ProcInfo::start` mixes units: exec time vs. /proc clock ticks.)
+    exec_at: HashMap<u32, DateTime<Utc>>,
 }
 
 impl ProcessTree {
@@ -251,7 +262,41 @@ impl ProcessTree {
     }
 
     pub fn upsert(&mut self, info: ProcInfo) {
+        self.exited.remove(&info.pid);
         self.procs.insert(info.pid, info);
+    }
+
+    pub fn is_exited(&self, pid: u32) -> bool {
+        self.exited.contains_key(&pid)
+    }
+
+    /// Reconcile with the set of pids that exist right now: mark the missing
+    /// ones as exited and drop those that exited more than
+    /// [`EXIT_GRACE_SECS`] ago, unless a live process still descends from
+    /// them (its chain would lose them otherwise).
+    pub fn reap(&mut self, alive: &std::collections::HashSet<u32>, now: DateTime<Utc>) {
+        for pid in self.procs.keys() {
+            if !alive.contains(pid) {
+                self.exited.entry(*pid).or_insert(now);
+            }
+        }
+        self.exited.retain(|pid, _| !alive.contains(pid));
+        let cutoff = now - chrono::Duration::seconds(EXIT_GRACE_SECS);
+        let parents_of_live: std::collections::HashSet<u32> = self
+            .procs
+            .values()
+            .filter(|p| !self.exited.contains_key(&p.pid))
+            .map(|p| p.ppid)
+            .collect();
+        let expired: Vec<u32> = self
+            .exited
+            .iter()
+            .filter(|(pid, at)| **at < cutoff && !parents_of_live.contains(pid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        for pid in expired {
+            self.remove(pid);
+        }
     }
 
     /// Maximum re-exec history retained per PID.
@@ -260,7 +305,11 @@ impl ProcessTree {
     pub fn upsert_exec(&mut self, ev: &ExecEvent) {
         // Same PID re-exec'ing (exec in a shell, wrappers, `env`, setuid
         // helpers): keep the prior image so the chain still shows the shell.
+        // The old holder of this pid exited: this is a new process (PID
+        // reuse), not a re-exec, so it inherits nothing.
+        let reused = self.exited.remove(&ev.pid).is_some();
         let previous = match self.procs.get(&ev.pid) {
+            _ if reused => Vec::new(),
             // Different parent = PID reuse by an unrelated process: start fresh.
             Some(old) if old.ppid != ev.ppid => Vec::new(),
             // Same image again (re-running the same binary): keep history as is.
@@ -294,6 +343,7 @@ impl ProcessTree {
             previous,
         };
         self.procs.insert(ev.pid, info);
+        self.exec_at.insert(ev.pid, ev.ts);
     }
 
     /// Refresh `seen_at` for a live process so pruning does not drop it.
@@ -309,6 +359,8 @@ impl ProcessTree {
 
     pub fn remove(&mut self, pid: u32) {
         self.procs.remove(&pid);
+        self.exited.remove(&pid);
+        self.exec_at.remove(&pid);
     }
 
     pub fn len(&self) -> usize {
@@ -401,18 +453,20 @@ impl ProcessTree {
     /// True if any known process on the host is part of an interactive session.
     /// Used as the fallback when a file writer cannot be identified.
     pub fn any_interactive_session(&self) -> bool {
+        // Only live processes: a session that ended an hour ago doesn't make
+        // an unattended write look operator-driven.
+        let live = || self.procs.values().filter(|p| !self.is_exited(p.pid));
         // A TTY-attached process that is not a getty waiting for login.
-        if self
-            .procs
-            .values()
+        if live()
             .any(|p| p.tty_nr != 0 && !p.comm.starts_with("agetty") && !p.comm.starts_with("getty"))
         {
             return true;
         }
         // A session daemon (sshd, su, sudo, tmux...) that has spawned something:
         // the bare sshd listener has no children of its own.
-        self.procs.values().any(|child| {
+        live().any(|child| {
             child.ppid != 0
+                && !self.is_exited(child.ppid)
                 && self
                     .procs
                     .get(&child.ppid)
@@ -426,12 +480,24 @@ impl ProcessTree {
     }
 
     pub fn prune(&mut self, cutoff: DateTime<Utc>) {
-        self.procs.retain(|_, v| v.seen_at >= cutoff);
+        let stale: Vec<u32> = self
+            .procs
+            .values()
+            .filter(|v| v.seen_at < cutoff)
+            .map(|v| v.pid)
+            .collect();
+        for pid in stale {
+            self.remove(pid);
+        }
     }
 
-    /// Any process matching `pred` that started (or was last seen) within
-    /// `window` of `now`. Used to attribute atomic-rename writes, where the
-    /// writer has already closed the file, to the tool that just ran.
+    /// Any process matching `pred` that was exec'd or exited within `window`
+    /// of `now`. Used to attribute atomic-rename writes, where the writer has
+    /// already closed the file, to the tool that just ran.
+    ///
+    /// Not `seen_at`: that's refreshed by every connect, so a long-running
+    /// daemon with a matching role (snapd, nix-daemon) would look "recent"
+    /// forever and excuse any write.
     pub fn recent_process(
         &self,
         now: DateTime<Utc>,
@@ -439,10 +505,20 @@ impl ProcessTree {
         pred: impl Fn(&ProcInfo) -> bool,
     ) -> Option<&ProcInfo> {
         let cutoff = now - window;
+        let activity = |p: &ProcInfo| {
+            let started = self.exec_at.get(&p.pid).copied();
+            let ended = self.exited.get(&p.pid).copied();
+            started
+                .into_iter()
+                .chain(ended)
+                .filter(|t| *t >= cutoff)
+                .max()
+        };
         self.procs
             .values()
-            .filter(|p| p.seen_at >= cutoff && pred(p))
-            .max_by_key(|p| p.seen_at)
+            .filter_map(|p| activity(p).filter(|_| pred(p)).map(|t| (t, p)))
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, p)| p)
     }
 }
 
@@ -545,6 +621,98 @@ mod tests {
         fresh.ppid = 1;
         t.upsert_exec(&fresh);
         assert_eq!(t.chain_of(200).len(), 2);
+    }
+
+    fn exec_ev(pid: u32, ppid: u32, comm: &str, ts: DateTime<Utc>) -> ExecEvent {
+        ExecEvent {
+            ts,
+            pid,
+            ppid,
+            uid: 0,
+            gid: 0,
+            comm: comm.into(),
+            exe: format!("/usr/bin/{}", comm),
+            argv0: comm.into(),
+            ld_preload: false,
+            deleted_exe: false,
+            tty_nr: 0,
+            container: false,
+            container_id: None,
+        }
+    }
+
+    #[test]
+    fn ended_sessions_stop_counting() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(100, 1, "sshd"));
+        t.upsert(info(200, 100, "sshd"));
+        t.upsert(info(300, 200, "bash"));
+        assert!(t.any_interactive_session());
+        // The session's processes exit; only systemd and the listener remain.
+        let alive: std::collections::HashSet<u32> = [1, 100].into_iter().collect();
+        t.reap(&alive, now);
+        assert!(!t.any_interactive_session());
+        // Still in the tree during the grace period...
+        assert!(t.get(300).is_some());
+        // ...and gone after it.
+        t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
+        assert!(t.get(300).is_none() && t.get(200).is_none());
+        assert!(t.get(100).is_some());
+    }
+
+    #[test]
+    fn exited_ancestors_of_live_processes_are_kept() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(100, 1, "nginx"));
+        t.upsert(info(200, 100, "bash"));
+        t.upsert(info(300, 200, "implant"));
+        // The shell exited but its child keeps running.
+        let alive: std::collections::HashSet<u32> = [1, 100, 300].into_iter().collect();
+        t.reap(&alive, now);
+        t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
+        let comms: Vec<String> = t.chain_of(300).iter().map(|p| p.comm.clone()).collect();
+        assert_eq!(comms, vec!["systemd", "nginx", "bash", "implant"]);
+    }
+
+    #[test]
+    fn exec_on_an_exited_pid_is_a_new_process() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert_exec(&exec_ev(500, 1, "bash", now));
+        t.reap(&[1].into_iter().collect(), now);
+        // Same pid, same parent, different program: reuse, not re-exec.
+        t.upsert_exec(&exec_ev(500, 1, "cron", now));
+        let comms: Vec<String> = t.chain_of(500).iter().map(|p| p.comm.clone()).collect();
+        assert_eq!(comms, vec!["systemd", "cron"]);
+        assert!(!t.is_exited(500));
+    }
+
+    #[test]
+    fn a_busy_daemon_is_not_a_recent_process() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        // snapd was already running at startup and keeps making connections.
+        t.upsert(info(700, 1, "snapd"));
+        t.touch(700, now);
+        let is_pm = |p: &ProcInfo| p.comm == "snapd" || p.comm == "useradd";
+        assert!(t
+            .recent_process(now, chrono::Duration::seconds(8), is_pm)
+            .is_none());
+        // A tool that just ran does count, including right after it exits.
+        t.upsert_exec(&exec_ev(701, 1, "useradd", now));
+        assert!(t
+            .recent_process(now, chrono::Duration::seconds(8), is_pm)
+            .is_some());
+        let later = now + chrono::Duration::seconds(30);
+        t.reap(&[1, 700].into_iter().collect(), later);
+        assert!(t
+            .recent_process(later, chrono::Duration::seconds(8), is_pm)
+            .is_some());
     }
 
     #[test]
