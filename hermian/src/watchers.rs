@@ -196,6 +196,8 @@ impl Watches {
         for p in systemd_target_dirs() {
             self.add(&p);
         }
+        // /home itself, so a new home directory is noticed right away.
+        self.add(Path::new("/home"));
         for p in user_home_watches() {
             self.add(&p);
         }
@@ -307,6 +309,18 @@ fn watcher_loop(
                         continue;
                     };
                     if event.mask.contains(EventMask::ISDIR) {
+                        // A new ~/.ssh, home or cron dir: watch it now, not at
+                        // the next 60s rescan, and pick up whatever was already
+                        // written into it (mkdir ~/.ssh && echo key > ...).
+                        if event
+                            .mask
+                            .intersects(EventMask::CREATE | EventMask::MOVED_TO)
+                        {
+                            if let Some(name) = &event.name {
+                                let dir = base.join(name);
+                                adopt_new_dir(&mut w, &dir, &config_path, &mut pending, 0);
+                            }
+                        }
                         continue;
                     }
                     let full = match &event.name {
@@ -363,6 +377,75 @@ fn watcher_loop(
             last_rescan = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// Directories the watcher keeps a watch on (besides the fixed lists, which
+/// `refresh` re-adds anyway).
+fn is_wanted_dir(path: &str) -> bool {
+    if WATCH_DIRS.contains(&path) {
+        return true;
+    }
+    let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    // /home/<user>
+    if parent == "/home" && !name.is_empty() {
+        return true;
+    }
+    // /root/.ssh, /home/<user>/.ssh
+    if name == ".ssh"
+        && (parent == "/root" || parent.starts_with("/home/") && parent.matches('/').count() == 2)
+    {
+        return true;
+    }
+    // systemctl enable targets
+    parent == "/etc/systemd/system" && (name.ends_with(".wants") || name.ends_with(".requires"))
+}
+
+/// Watch a directory that just appeared and queue what's already inside.
+/// Depth-limited so a new home with a `.ssh` is covered in one go.
+fn adopt_new_dir(
+    w: &mut Watches,
+    dir: &Path,
+    config_path: &Path,
+    pending: &mut HashMap<String, Pending>,
+    depth: u8,
+) {
+    let dir_s = dir.to_string_lossy().into_owned();
+    if depth > 1 || !is_wanted_dir(&dir_s) {
+        return;
+    }
+    // Only real directories: a symlinked ~/.ssh would point the watch elsewhere.
+    if !std::fs::symlink_metadata(dir)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    w.add(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = Instant::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            adopt_new_dir(w, &path, config_path, pending, depth + 1);
+            continue;
+        }
+        let path_s = path.to_string_lossy().into_owned();
+        let is_config = path == config_path;
+        if !is_config && !is_interesting(&path_s) {
+            continue;
+        }
+        pending.entry(path_s.clone()).or_insert_with(|| Pending {
+            first: now,
+            last: now,
+            kind: FileKind::Created,
+            writer: lookup_writer(&path_s),
+            is_config,
+        });
     }
 }
 
@@ -501,6 +584,19 @@ mod tests {
         assert!(!is_interesting("/etc/ssh/moduli"));
         assert!(!is_interesting("/root/notes.txt"));
         assert!(!is_interesting("/home/dev/project/.bashrc"));
+    }
+
+    #[test]
+    fn new_dirs_worth_watching() {
+        assert!(is_wanted_dir("/root/.ssh"));
+        assert!(is_wanted_dir("/home/mallory"));
+        assert!(is_wanted_dir("/home/mallory/.ssh"));
+        assert!(is_wanted_dir("/etc/cron.d"));
+        assert!(is_wanted_dir("/etc/systemd/system/multi-user.target.wants"));
+        assert!(!is_wanted_dir("/home/mallory/project"));
+        assert!(!is_wanted_dir("/home/mallory/project/.ssh"));
+        assert!(!is_wanted_dir("/etc/nginx"));
+        assert!(!is_wanted_dir("/tmp/.ssh"));
     }
 
     #[test]
