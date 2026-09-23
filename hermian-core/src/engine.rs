@@ -20,6 +20,9 @@ const FLAG_TTL_SECS: i64 = 600;
 const TREE_RETENTION_HOURS: i64 = 48;
 /// Idle auth sources are forgotten after this long.
 const BURST_RETENTION_SECS: i64 = 3600;
+/// A file change with an unknown writer counts as operator-driven only if
+/// something was started from an interactive session this recently.
+const OPERATOR_WINDOW_SECS: i64 = 15;
 /// Event timestamps further ahead of the wall clock than this are clamped.
 pub const MAX_FUTURE_SKEW_SECS: i64 = 60;
 /// Upper bound on remembered D1 flags; the oldest are dropped first.
@@ -200,7 +203,9 @@ impl Engine {
             Event::File(mut e) => {
                 // If the daemon could not determine session presence, derive it.
                 if e.writer.is_none() && !e.session_present {
-                    e.session_present = self.tree.any_interactive_session();
+                    e.session_present = self
+                        .tree
+                        .recent_interactive_activity(now, Duration::seconds(OPERATOR_WINDOW_SECS));
                 }
                 if let Some(w) = &e.writer {
                     self.tree.touch(w.pid, now);
@@ -945,6 +950,108 @@ mod tests {
             max_sev(&alerts).map(|s| s < Severity::High).unwrap_or(true),
             "{:?}",
             alerts
+        );
+    }
+
+    #[test]
+    fn an_idle_session_does_not_excuse_unattended_writes() {
+        // An SSH shell has been sitting open for an hour; a detached process
+        // plants a key and a cron job and exits before inotify fires.
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        let hour_ago = t - Duration::hours(1);
+        at(
+            &mut eng,
+            exec(hour_ago, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"),
+        );
+        at(&mut eng, exec(hour_ago, 50, 1, 0, "sshd", "/usr/sbin/sshd"));
+        at(
+            &mut eng,
+            exec(hour_ago, 60, 50, 1000, "bash", "/usr/bin/bash"),
+        );
+        let key = at(
+            &mut eng,
+            Event::File(file(
+                t,
+                "/root/.ssh/authorized_keys",
+                FileKind::Modified,
+                None,
+                Some("ssh-ed25519 AAAA attacker\n"),
+            )),
+        );
+        assert!(has(&key, DetectionId::D3, Severity::High), "{:?}", key);
+        let cron = at(
+            &mut eng,
+            Event::File(file(
+                t,
+                "/etc/cron.d/x",
+                FileKind::Created,
+                None,
+                Some("* * * * * root /opt/x\n"),
+            )),
+        );
+        assert!(has(&cron, DetectionId::D3, Severity::High), "{:?}", cron);
+    }
+
+    #[test]
+    fn an_active_operator_still_downgrades_unknown_writers() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        let hour_ago = t - Duration::hours(1);
+        at(
+            &mut eng,
+            exec(hour_ago, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"),
+        );
+        at(&mut eng, exec(hour_ago, 50, 1, 0, "sshd", "/usr/sbin/sshd"));
+        at(
+            &mut eng,
+            exec(hour_ago, 60, 50, 1000, "bash", "/usr/bin/bash"),
+        );
+        // `sudo tee -a` a second ago, already exited.
+        at(
+            &mut eng,
+            exec(t - Duration::seconds(1), 70, 60, 0, "tee", "/usr/bin/tee"),
+        );
+        let a = at(
+            &mut eng,
+            Event::File(file(t, "/etc/cron.d/job", FileKind::Modified, None, None)),
+        );
+        assert!(
+            max_sev(&a).map(|s| s < Severity::High).unwrap_or(true),
+            "{:?}",
+            a
+        );
+
+        // A vim opened ten minutes ago, saving now.
+        let mut eng = engine_without_baseline();
+        at(
+            &mut eng,
+            exec(hour_ago, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"),
+        );
+        at(&mut eng, exec(hour_ago, 50, 1, 0, "sshd", "/usr/sbin/sshd"));
+        at(
+            &mut eng,
+            exec(hour_ago, 60, 50, 1000, "bash", "/usr/bin/bash"),
+        );
+        at(
+            &mut eng,
+            exec(
+                t - Duration::minutes(10),
+                80,
+                60,
+                0,
+                "vim",
+                "/usr/bin/vim.basic",
+            ),
+        );
+        let b = at(
+            &mut eng,
+            Event::File(file(t, "/root/.bashrc", FileKind::MovedTo, None, None)),
+        );
+        assert!(
+            max_sev(&b).map(|s| s < Severity::High).unwrap_or(true),
+            "{:?}",
+            b
         );
     }
 

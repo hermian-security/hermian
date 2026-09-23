@@ -282,8 +282,50 @@ fn short_hash(h: &str) -> String {
     }
 }
 
+/// Whether the state directory exists but this user can't read it. State is
+/// root-only on purpose; without sudo, "can't read" must not be reported as
+/// "never installed".
+pub fn state_unreadable() -> bool {
+    matches!(
+        fs::metadata(paths::state_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
+/// `systemctl is-active hermian`, which needs no privileges.
+fn unit_state() -> String {
+    std::process::Command::new("systemctl")
+        .args(["is-active", "hermian"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub fn cmd_status(json: bool) -> Result<()> {
     let st = Style::detect();
+    if state_unreadable() {
+        let unit = unit_state();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"status": "permission-denied", "service": unit})
+            );
+            return Ok(());
+        }
+        println!(
+            "{}",
+            st.banner(
+                &format!("HERMIAN {}", hermian_core::VERSION),
+                &st.warn("NEEDS ROOT")
+            )
+        );
+        println!("{}", st.rule());
+        println!("  Service: {}", unit);
+        println!("  Status details are root-only. Run:\n\n    sudo hermian status\n");
+        return Ok(());
+    }
     let state = read_state();
     if json {
         match state {
@@ -327,4 +369,41 @@ pub fn cmd_status(json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn unreadable_state_is_not_reported_as_missing() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can read anything
+        }
+        let dir = std::env::temp_dir().join(format!("hermian-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("state.json"), "{}").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // SAFETY: no other test reads HERMIAN_STATE_DIR.
+        unsafe { std::env::set_var("HERMIAN_STATE_DIR", &dir) };
+        let unreadable = state_unreadable();
+        let state = read_state();
+        unsafe { std::env::remove_var("HERMIAN_STATE_DIR") };
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(unreadable);
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn missing_state_is_not_permission_denied() {
+        // The default path doesn't exist on a dev machine, or is root-only.
+        let p = paths::state_file();
+        if !p.parent().map(|d| d.exists()).unwrap_or(false) {
+            assert!(!state_unreadable());
+        }
+    }
 }
