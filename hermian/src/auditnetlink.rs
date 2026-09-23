@@ -321,6 +321,7 @@ fn nlmsg_align(len: u32) -> usize {
 struct PendingExec {
     ppid: u32,
     uid: u32,
+    gid: u32,
     comm: String,
     exe: String,
     argv0: Option<String>,
@@ -341,6 +342,21 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
         // SAFETY: valid fd and buffer.
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n <= 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                // Timeout or signal: the normal idle path.
+                Some(libc::EAGAIN) | Some(libc::EINTR) => {}
+                // The kernel dropped audit records for us.
+                Some(libc::ENOBUFS) => {
+                    crate::daemon::log_daemon(
+                        hermian_core::Severity::High,
+                        "audit receive buffer overflowed; exec events were lost",
+                    );
+                }
+                // Anything else would repeat immediately: don't spin.
+                _ if n < 0 => std::thread::sleep(Duration::from_millis(200)),
+                _ => {}
+            }
             pending.retain(|_, (_, p)| p.seen.elapsed() < Duration::from_secs(5));
             continue;
         }
@@ -388,7 +404,25 @@ fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
-/// Audit hex-encodes values containing spaces or control chars.
+/// A string field (`comm`, `exe`, `a0`...). The kernel writes a value in
+/// quotes when it's plain, and as bare hex when it contains spaces or
+/// control characters. Only the bare form may be hex-decoded: `field` strips
+/// the quotes, so decoding its output mangled any quoted name that happened
+/// to look like hex (a binary called `cafe` or `deadbeef` became garbage).
+fn text_field(body: &str, key: &str) -> Option<String> {
+    let needle = format!(" {}=", key);
+    let start = if let Some(s) = body.strip_prefix(&needle[1..]) {
+        s
+    } else {
+        body.find(&needle).map(|i| &body[i + needle.len()..])?
+    };
+    if let Some(q) = start.strip_prefix('"') {
+        return q.split('"').next().map(str::to_string);
+    }
+    start.split_whitespace().next().map(decode_value)
+}
+
+/// Decode a bare audit value, which is hex when it isn't `(null)`/`(none)`.
 fn decode_value(v: &str) -> String {
     let odd_len = v.len() & 1 == 1;
     if v.is_empty() || v.starts_with('"') || odd_len || !v.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -432,8 +466,9 @@ fn handle_record(
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(0),
                         uid: field(body, "uid").and_then(|v| v.parse().ok()).unwrap_or(0),
-                        comm: field(body, "comm").map(decode_value).unwrap_or_default(),
-                        exe: field(body, "exe").map(decode_value).unwrap_or_default(),
+                        gid: field(body, "gid").and_then(|v| v.parse().ok()).unwrap_or(0),
+                        comm: text_field(body, "comm").unwrap_or_default(),
+                        exe: text_field(body, "exe").unwrap_or_default(),
                         argv0: None,
                         success: field(body, "success").map(|v| v == "yes").unwrap_or(true),
                         seen: Instant::now(),
@@ -443,8 +478,8 @@ fn handle_record(
         }
         AUDIT_EXECVE => {
             if let Some((_, p)) = pending.get_mut(&serial) {
-                if let Some(a0) = field(body, "a0") {
-                    p.argv0 = Some(decode_value(a0));
+                if let Some(a0) = text_field(body, "a0") {
+                    p.argv0 = Some(a0);
                 }
             }
         }
@@ -474,7 +509,7 @@ fn emit_exec(p: PendingExec, pid: u32, tx: &mpsc::Sender<Event>) {
         pid,
         ppid: p.ppid,
         uid: p.uid,
-        gid: p.uid,
+        gid: p.gid,
         comm,
         argv0: p.argv0.unwrap_or_else(|| exe.clone()),
         deleted_exe: deleted || exe.contains("memfd:"),
@@ -512,6 +547,23 @@ mod tests {
         assert_eq!(decode_value("2F746D702F61206220"), "/tmp/a b ");
         assert_eq!(decode_value("\"plain\""), "plain");
         assert_eq!(decode_value("bash"), "bash");
+    }
+
+    #[test]
+    fn quoted_hex_looking_names_are_not_decoded() {
+        // A binary really named "cafe" is logged quoted; it must stay "cafe".
+        let body = "pid=1 comm=\"cafe\" exe=\"/tmp/deadbeef\" a0=2F746D702F61206220";
+        assert_eq!(text_field(body, "comm").as_deref(), Some("cafe"));
+        assert_eq!(text_field(body, "exe").as_deref(), Some("/tmp/deadbeef"));
+        // Bare values are hex and do get decoded.
+        assert_eq!(text_field(body, "a0").as_deref(), Some("/tmp/a b "));
+    }
+
+    #[test]
+    fn gid_is_parsed_not_copied_from_uid() {
+        let (_, body) = split_header(SYSCALL_REC).unwrap();
+        assert_eq!(field(body, "gid"), Some("0"));
+        assert_eq!(field("uid=1000 gid=27 egid=27", "gid"), Some("27"));
     }
 
     #[test]

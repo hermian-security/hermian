@@ -15,7 +15,9 @@ pub mod events;
 pub mod proctree;
 pub mod selftest;
 
-pub use alert::{render, render_alert, Alert, ChainNode, Fact, Finding, RefGen, Theme};
+pub use alert::{
+    escape_untrusted, render, render_alert, Alert, ChainNode, Fact, Finding, RefGen, Theme,
+};
 pub use allowlist::Allowlist;
 pub use baseline::Baseline;
 pub use config::{Config, DEFAULT_CONFIG_TOML};

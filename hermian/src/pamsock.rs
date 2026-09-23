@@ -34,8 +34,13 @@ pub fn spawn_pam_listener(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) ->
     Ok(())
 }
 
+/// Larger than any datagram the module sends. The username is chosen by the
+/// remote client; a 4 KiB buffer truncated long ones, the JSON then failed to
+/// parse and the attempt vanished, so long usernames hid brute force.
+const MAX_DATAGRAM: usize = 64 * 1024;
+
 fn pam_listener_loop(sock: UnixDatagram, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
-    let mut buf = [0u8; 4096];
+    let mut buf = vec![0u8; MAX_DATAGRAM];
     while !shutdown.load(Ordering::Relaxed) {
         match sock.recv(&mut buf) {
             Ok(n) if n > 0 => {
@@ -83,11 +88,15 @@ pub fn parse_pam_payload(payload: &str) -> Option<AuthEvent> {
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok());
+    // The module stamps the time it saw the attempt; it's sent a moment ago,
+    // so anything far off means a bad clock or a bad sender. Use now then.
+    let now = chrono::Utc::now();
     let ts = v
         .get("ts")
         .and_then(|t| t.as_u64())
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs as i64, 0))
-        .unwrap_or_else(chrono::Utc::now);
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs.min(i64::MAX as u64) as i64, 0))
+        .filter(|t| (*t - now).num_seconds().abs() <= 60)
+        .unwrap_or(now);
     Some(AuthEvent {
         ts,
         result,
@@ -110,5 +119,32 @@ mod tests {
         assert_eq!(ev.rhost, Some("10.0.0.5".parse().unwrap()));
         assert!(parse_pam_payload(r#"{"result":"success","user":""}"#).is_none());
         assert!(parse_pam_payload("garbage").is_none());
+    }
+
+    #[test]
+    fn bad_sender_timestamps_fall_back_to_now() {
+        let ev = parse_pam_payload(r#"{"ts":99999999999,"result":"failure","user":"x"}"#).unwrap();
+        assert!((ev.ts - chrono::Utc::now()).num_seconds().abs() < 5);
+    }
+
+    #[test]
+    fn long_usernames_still_arrive() {
+        let dir = std::env::temp_dir().join(format!("hermian-pam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let rx = UnixDatagram::bind(&path).unwrap();
+        let tx = UnixDatagram::unbound().unwrap();
+        let payload = serde_json::json!({
+            "result": "attempt",
+            "user": "a".repeat(20_000),
+            "rhost": "198.51.100.7",
+        })
+        .to_string();
+        tx.send_to(payload.as_bytes(), &path).unwrap();
+        let mut buf = vec![0u8; MAX_DATAGRAM];
+        let n = rx.recv(&mut buf).unwrap();
+        let ev = parse_pam_payload(&String::from_utf8_lossy(&buf[..n])).unwrap();
+        assert_eq!(ev.rhost, Some("198.51.100.7".parse().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
