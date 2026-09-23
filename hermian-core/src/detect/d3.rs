@@ -9,7 +9,7 @@ use crate::detect::{writer_label, Ctx};
 use crate::events::{
     is_container_overlay_path, is_editor_artifact, DetectionId, FileEvent, FileKind, Severity,
 };
-use crate::proctree::{is_user_mgmt_tool, role_of, Role};
+use crate::proctree::{is_system_tool, is_user_mgmt_tool, role_of, Role};
 
 pub fn evaluate(ev: &FileEvent, ctx: &Ctx) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -37,6 +37,9 @@ pub fn evaluate(ev: &FileEvent, ctx: &Ctx) -> Vec<Finding> {
 /// persistence surface on the system.
 fn writer_is_installer(ev: &FileEvent, ctx: &Ctx) -> bool {
     let Some(w) = &ev.writer else { return false };
+    if !ctx.tool_exemption_applies(w.pid) {
+        return false;
+    }
     if matches!(
         role_of(&w.comm, &w.exe),
         Role::PackageManager | Role::ConfigManager
@@ -257,7 +260,10 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     }
     // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
     if let Some(w) = &ev.writer {
-        if w.comm == "crontab" || w.comm == "anacron" || is_user_mgmt_tool(&w.comm) {
+        if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
+            || is_user_mgmt_tool(&w.comm, &w.exe))
+            && ctx.tool_exemption_applies(w.pid)
+        {
             return None;
         }
     }
@@ -474,7 +480,7 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     // `systemctl enable` is performed by systemd itself (PID 1) creating the symlink.
     if is_enable_link {
         if let Some(w) = &ev.writer {
-            if w.pid == 1 || w.comm == "systemctl" || w.comm == "systemd" {
+            if w.pid == 1 || is_system_tool(&w.comm, &w.exe, &["systemctl", "systemd"]) {
                 return None;
             }
         }
