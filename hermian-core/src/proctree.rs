@@ -326,6 +326,34 @@ fn exe_contains(exe: &str, needles: &[&str]) -> bool {
     !exe.is_empty() && needles.iter().any(|n| exe.contains(n))
 }
 
+const EDITORS: &[&str] = &[
+    "vim",
+    "vi",
+    "nvim",
+    "vim.basic",
+    "vim.tiny",
+    "nano",
+    "emacs",
+    "micro",
+    "joe",
+    "mcedit",
+    "hx",
+    "helix",
+    "ne",
+    "jed",
+    "ed",
+    "sudoedit",
+    "visudo",
+    "vipw",
+    "vigr",
+];
+
+/// Text editors, by comm or exe name. Not a trust decision (nothing is
+/// exempted because of it), so the name is enough.
+pub fn is_editor(comm: &str, exe: &str) -> bool {
+    comm_matches(comm.trim(), EDITORS) || comm_matches(exe_basename(exe), EDITORS)
+}
+
 pub fn is_session_daemon(comm: &str, exe: &str) -> bool {
     is_system_tool(comm, exe, SESSION_DAEMONS)
 }
@@ -589,6 +617,36 @@ impl ProcessTree {
                             && !is_session_daemon(&child.comm, &child.exe)
                     })
                     .unwrap_or(false)
+        })
+    }
+
+    /// Whether an operator looks active *right now*: a program started from
+    /// an interactive session within `window` of `now` (a `sed -i`, `tee`,
+    /// `crontab`, even if it already exited), or an editor that is running
+    /// in one (vim sessions last for minutes before `:w`).
+    ///
+    /// This is the fallback when a file's writer is gone before it can be
+    /// identified. Asking "is anyone logged in at all?" instead made every
+    /// unattended write look operator-driven while an idle SSH or tmux
+    /// session sat open, which is most of the time on a real server.
+    /// Session daemons themselves (a new sshd, sudo) don't count: logging
+    /// in isn't editing a file.
+    pub fn recent_interactive_activity(
+        &self,
+        now: DateTime<Utc>,
+        window: chrono::Duration,
+    ) -> bool {
+        self.procs.values().any(|p| {
+            if is_session_daemon(&p.comm, &p.exe) {
+                return false;
+            }
+            let recent = self
+                .exec_at
+                .get(&p.pid)
+                .map(|t| *t <= now + window && now - *t <= window)
+                .unwrap_or(false);
+            let live_editor = !self.is_exited(p.pid) && is_editor(&p.comm, &p.exe);
+            (recent || live_editor) && self.has_interactive_session(p.pid, p.tty_nr)
         })
     }
 
