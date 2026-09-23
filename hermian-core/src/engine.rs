@@ -20,6 +20,10 @@ const FLAG_TTL_SECS: i64 = 600;
 const TREE_RETENTION_HOURS: i64 = 48;
 /// Idle auth sources are forgotten after this long.
 const BURST_RETENTION_SECS: i64 = 3600;
+/// Event timestamps further ahead of the wall clock than this are clamped.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 60;
+/// Upper bound on remembered D1 flags; the oldest are dropped first.
+const MAX_FLAGS: usize = 4096;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Counters {
@@ -142,6 +146,22 @@ impl Engine {
     }
 
     pub fn process(&mut self, ev: Event) -> Vec<Alert> {
+        self.process_at(ev, Utc::now())
+    }
+
+    /// Like [`process`](Self::process) with an explicit wall clock.
+    ///
+    /// Event timestamps come from logs and collectors and can be wrong (a
+    /// syslog line with the wrong year, a clock step). A timestamp in the
+    /// future used to set dedup/flag/baseline state ahead of real time, which
+    /// suppressed that signature until the clock caught up and stopped flag
+    /// pruning. Timestamps more than [`MAX_FUTURE_SKEW_SECS`] ahead of
+    /// `wall` are clamped to `wall`.
+    pub fn process_at(&mut self, mut ev: Event, wall: DateTime<Utc>) -> Vec<Alert> {
+        let limit = wall + Duration::seconds(MAX_FUTURE_SKEW_SECS);
+        if ev.ts() > limit {
+            ev.set_ts(wall);
+        }
         self.counters.record_event();
         let now = ev.ts();
         self.counters.roll_day(&day_key(now));
@@ -327,12 +347,12 @@ impl Engine {
     }
 
     fn prune_flags(&mut self, now: DateTime<Utc>) {
-        while self
-            .flags
-            .front()
-            .map(|f| now - f.ts > Duration::seconds(FLAG_TTL_SECS))
-            .unwrap_or(false)
-        {
+        // Not just the front: flags aren't guaranteed to be in time order
+        // (event timestamps can arrive out of order), and one young flag at
+        // the front used to shield every expired flag behind it.
+        let ttl = Duration::seconds(FLAG_TTL_SECS);
+        self.flags.retain(|f| now - f.ts <= ttl);
+        while self.flags.len() > MAX_FLAGS {
             self.flags.pop_front();
         }
     }
@@ -436,6 +456,13 @@ mod tests {
             exe: format!("/usr/bin/{}", comm),
             tty_nr,
         }
+    }
+
+    /// Process an event as if the wall clock were at the event's own time,
+    /// for tests that step time forward.
+    fn at(eng: &mut Engine, ev: Event) -> Vec<Alert> {
+        let ts = ev.ts();
+        eng.process_at(ev, ts)
     }
 
     fn has(alerts: &[Alert], d: DetectionId, s: Severity) -> bool {
@@ -715,14 +742,17 @@ mod tests {
         let mut baseline = Baseline::new(true, 24, Utc::now());
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
-        let alerts = eng.process(Event::Auth(AuthEvent {
-            ts: Utc::now().with_hour(12).unwrap(),
-            result: AuthResult::Success,
-            user: "deploy".into(),
-            rhost: Some("203.0.113.9".parse().unwrap()),
-            service: "sshd".into(),
-            tty: "ssh".into(),
-        }));
+        let alerts = at(
+            &mut eng,
+            Event::Auth(AuthEvent {
+                ts: Utc::now().with_hour(12).unwrap(),
+                result: AuthResult::Success,
+                user: "deploy".into(),
+                rhost: Some("203.0.113.9".parse().unwrap()),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+            }),
+        );
         assert!(has(&alerts, DetectionId::D2, Severity::Low), "{:?}", alerts);
     }
 
@@ -980,13 +1010,16 @@ mod tests {
         )));
         assert!(alerts.is_empty(), "{:?}", alerts);
         // Same rename 60s later with nothing recent is unattended tampering.
-        let later = eng.process(Event::File(file(
-            t + Duration::seconds(400),
-            "/etc/shadow",
-            FileKind::MovedTo,
-            None,
-            None,
-        )));
+        let later = at(
+            &mut eng,
+            Event::File(file(
+                t + Duration::seconds(400),
+                "/etc/shadow",
+                FileKind::MovedTo,
+                None,
+                None,
+            )),
+        );
         assert!(
             has(&later, DetectionId::D4, Severity::Critical),
             "{:?}",
@@ -1182,14 +1215,17 @@ mod tests {
         eng.forget_listener("tcp", 4444);
         // dedup window still open, so still suppressed by dedup - advance time.
         let later = t + Duration::seconds(400);
-        let alerts = eng.process(Event::Listener(ListenerEvent {
-            ts: later,
-            proto: "tcp".into(),
-            addr: "0.0.0.0".parse().unwrap(),
-            port: 4444,
-            pid: 0,
-            comm: "x".into(),
-        }));
+        let alerts = at(
+            &mut eng,
+            Event::Listener(ListenerEvent {
+                ts: later,
+                proto: "tcp".into(),
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 4444,
+                pid: 0,
+                comm: "x".into(),
+            }),
+        );
         assert_eq!(alerts.len(), 1);
     }
 
@@ -1242,6 +1278,50 @@ mod tests {
         assert!(eng
             .alert_from(finding(Severity::Critical, "now critical"), t)
             .is_some());
+    }
+
+    #[test]
+    fn future_timestamps_do_not_blind_dedup() {
+        let mut eng = engine_without_baseline();
+        let wall = Utc::now();
+        eng.process_at(exec(wall, 100, 1, 33, "nginx", "/usr/sbin/nginx"), wall);
+        // A bogus event dated a year ahead creates the dedup entry...
+        let bogus = eng.process_at(
+            exec(
+                wall + Duration::days(365),
+                200,
+                100,
+                33,
+                "bash",
+                "/usr/bin/bash",
+            ),
+            wall,
+        );
+        assert!(has(&bogus, DetectionId::D1, Severity::High));
+        // ...and ten minutes later (past the window) the same signature must
+        // alert again, not stay suppressed for a year.
+        let later = wall + Duration::seconds(600);
+        let again = eng.process_at(exec(later, 200, 100, 33, "bash", "/usr/bin/bash"), later);
+        assert!(has(&again, DetectionId::D1, Severity::High), "{:?}", again);
+    }
+
+    #[test]
+    fn expired_flags_are_pruned_behind_a_young_one() {
+        let mut eng = engine_without_baseline();
+        let wall = Utc::now();
+        let flag = |ts| FlaggedChain {
+            pids: vec![1234],
+            detection: DetectionId::D1,
+            severity: Severity::High,
+            ts,
+            reason: "x".into(),
+        };
+        eng.flags.push_back(flag(wall));
+        for _ in 0..10 {
+            eng.flags.push_back(flag(wall - Duration::hours(2)));
+        }
+        eng.tick(wall);
+        assert_eq!(eng.flags.len(), 1);
     }
 
     #[test]
