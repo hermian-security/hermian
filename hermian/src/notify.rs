@@ -39,6 +39,9 @@ pub struct NotifyState {
     /// Alerts each notifying channel still owes.
     #[serde(default)]
     pub pending_by_channel: BTreeMap<String, usize>,
+    /// Alerts a channel gave up on: queue overflow or a permanent rejection.
+    #[serde(default)]
+    pub dropped_by_channel: BTreeMap<String, u64>,
 }
 
 pub struct Notifier {
@@ -227,16 +230,44 @@ struct ChannelQueue {
     backoff: Duration,
     failing_since: Option<DateTime<Utc>>,
     alarm_sent: bool,
+    /// Alerts given up on since start (overflow or permanent rejection).
+    dropped: u64,
 }
 
 impl ChannelQueue {
+    /// Make room when the queue is full: drop the oldest alert below
+    /// CRITICAL, or the oldest overall if everything queued is CRITICAL.
+    fn make_room(&mut self) {
+        if self.queue.len() < MAX_PENDING {
+            return;
+        }
+        let victim = self
+            .queue
+            .iter()
+            .position(|a| a.severity < Severity::Critical)
+            .unwrap_or(0);
+        if let Some(a) = self.queue.remove(victim) {
+            self.note_drop(&a, "queue full");
+        }
+    }
+
+    fn note_drop(&mut self, alert: &Alert, why: &str) {
+        self.dropped += 1;
+        // Every drop is logged locally, so the alert isn't lost outright.
+        syslog_msg(
+            Severity::High,
+            &format!(
+                "hermian: {} dropped alert {} ({}): {} ({} dropped since start)",
+                self.name, alert.ref_id, alert.severity, why, self.dropped
+            ),
+        );
+    }
+
     /// Returns false once the channel has been removed.
     fn take(&mut self, msg: Option<ChanMsg>) -> bool {
         match msg {
             Some(ChanMsg::Alert(a)) => {
-                if self.queue.len() >= MAX_PENDING {
-                    self.queue.pop_front();
-                }
+                self.make_room();
                 self.queue.push_back(*a);
                 true
             }
@@ -255,6 +286,10 @@ impl ChannelQueue {
             s.pending_by_channel
                 .insert(self.name.to_string(), self.queue.len());
             s.pending = s.pending_by_channel.values().sum();
+            if self.dropped > 0 {
+                s.dropped_by_channel
+                    .insert(self.name.to_string(), self.dropped);
+            }
         }
     }
 
@@ -309,6 +344,7 @@ async fn run_channel(
         backoff: FIRST_BACKOFF,
         failing_since: None,
         alarm_sent: false,
+        dropped: 0,
     };
     loop {
         // Pick up everything already queued without waiting.
@@ -346,7 +382,9 @@ async fn run_channel(
                 q.alarm_sent = false;
             }
             Err(e) if e.permanent => {
-                q.queue.pop_front();
+                if let Some(a) = q.queue.pop_front() {
+                    q.note_drop(&a, &e.msg);
+                }
                 q.record_error(&e, &state);
             }
             Err(e) => {
@@ -563,6 +601,33 @@ pub mod webhook {
         }
     }
 
+    /// `scheme://host[:port]` only. Slack/Discord/ntfy webhook URLs carry
+    /// their secret in the path or query, so the full URL must never be
+    /// shown in status, logs or errors.
+    pub fn display_url(url: &str) -> String {
+        match url.split_once("://") {
+            Some((scheme, rest)) => {
+                let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+                let host = authority.rsplit('@').next().unwrap_or(authority);
+                format!("{}://{}/…", scheme, host)
+            }
+            None => "<webhook>".to_string(),
+        }
+    }
+
+    /// ureq errors include the request URL; replace it (and the bearer
+    /// token, should it ever appear) before the text goes anywhere.
+    fn redact(cfg: &WebhookCfg, e: impl std::fmt::Display) -> String {
+        let mut s = e.to_string();
+        if !cfg.url.is_empty() {
+            s = s.replace(&cfg.url, &display_url(&cfg.url));
+        }
+        if !cfg.token.is_empty() {
+            s = s.replace(&cfg.token, "<token>");
+        }
+        s
+    }
+
     pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), SendError> {
         let body = payload(alert, &cfg.format);
         let agent = ureq::AgentBuilder::new()
@@ -581,7 +646,7 @@ pub mod webhook {
             )),
             Err(e) => Err(SendError::transient(format!(
                 "webhook request failed: {}",
-                e
+                redact(cfg, e)
             ))),
         }
     }
@@ -620,6 +685,47 @@ mod tests {
         assert_eq!(d["embeds"][0]["color"], 0xF77F00);
         let n = webhook::payload(&a, "ntfy");
         assert_eq!(n["priority"], 4);
+    }
+
+    #[test]
+    fn webhook_urls_are_never_shown_in_full() {
+        assert_eq!(
+            webhook::display_url("https://hooks.slack.com/services/T0/B0/SECRET"),
+            "https://hooks.slack.com/…"
+        );
+        assert_eq!(
+            webhook::display_url("https://u:pw@ntfy.example:8443/topic?auth=x"),
+            "https://ntfy.example:8443/…"
+        );
+    }
+
+    fn queue() -> ChannelQueue {
+        ChannelQueue {
+            name: "webhook",
+            queue: VecDeque::new(),
+            cfg: NotificationsCfg::default(),
+            backoff: FIRST_BACKOFF,
+            failing_since: None,
+            alarm_sent: false,
+            dropped: 0,
+        }
+    }
+
+    #[test]
+    fn a_full_queue_sheds_non_critical_alerts_first() {
+        let mut q = queue();
+        let mut crit = alert();
+        crit.severity = Severity::Critical;
+        crit.ref_id = "HER-CRIT".into();
+        q.take(Some(ChanMsg::Alert(Box::new(crit))));
+        for i in 0..MAX_PENDING + 10 {
+            let mut a = alert();
+            a.ref_id = format!("HER-{}", i);
+            q.take(Some(ChanMsg::Alert(Box::new(a))));
+        }
+        assert_eq!(q.queue.len(), MAX_PENDING);
+        assert_eq!(q.dropped, 11);
+        assert_eq!(q.queue.front().unwrap().ref_id, "HER-CRIT");
     }
 
     #[test]
@@ -678,6 +784,7 @@ mod tests {
         assert_eq!(s.per_channel.get("webhook"), Some(&2), "{:?}", s);
         assert_eq!(s.pending, 0);
         assert!(s.last_error.contains("too long"), "{:?}", s.last_error);
+        assert_eq!(s.dropped_by_channel.get("webhook"), Some(&1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -28,7 +28,13 @@ pub mod telegram {
 
     /// ureq includes the request URL (and thus the bot token) in its errors.
     fn redact(cfg: &TelegramCfg, e: impl std::fmt::Display) -> String {
-        e.to_string().replace(&cfg.bot_token, "<token>")
+        let s = e.to_string();
+        // replace("") would insert "<token>" between every character.
+        if cfg.bot_token.is_empty() {
+            s
+        } else {
+            s.replace(&cfg.bot_token, "<token>")
+        }
     }
 
     /// Escape for Telegram's HTML parse mode.
