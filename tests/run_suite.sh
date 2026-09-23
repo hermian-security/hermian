@@ -23,6 +23,9 @@ done
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
+. "$DIR/helpers/disposable_host.sh"
+require_disposable_host
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "run as root" >&2
     exit 1
@@ -31,6 +34,20 @@ if ! command -v hermian >/dev/null 2>&1; then
     echo "hermian is not installed on PATH" >&2
     exit 1
 fi
+
+# Safety net: each attack cleans up after itself, but make sure nothing is
+# left behind if the suite is interrupted.
+cleanup() {
+    rm -f /etc/cron.d/hermian-test-backdoor
+    rm -f /etc/systemd/system/hermian-test.service
+    rm -f /tmp/.hermian-test-suid /tmp/.x.sh
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    sed -i '/hermian-libevil/d' /etc/ld.so.preload 2>/dev/null || true
+    sed -i '/HERMIANATTACKSIM/d' /root/.ssh/authorized_keys 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 FAILS=0
 echo "=== HERMIAN validation suite ==="
@@ -42,7 +59,7 @@ echo
 
 echo "--- Attack simulations (expect HIGH/CRITICAL alerts) ---"
 run_attack() {
-    "$DIR/attacks/run_attack.sh" "$1" "$2" || FAILS=$((FAILS + 1))
+    sh "$DIR/attacks/run_attack.sh" "$1" "$2" || FAILS=$((FAILS + 1))
 }
 run_attack webshell            "Web server"
 run_attack ssh-key-injection   "SSH key"
@@ -63,20 +80,10 @@ if [ "$SKIP_FP" -eq 0 ]; then
     echo "--- False-positive workloads (expect ZERO HIGH/CRITICAL) ---"
     echo "(running each for ${FP_SECONDS}s; use --quick for a smoke check)"
     for env in idle admin-edit web dev ssh-ansible ci; do
-        "$DIR/false_positives/run_false_positive.sh" "$env" "$FP_SECONDS" || FAILS=$((FAILS + 1))
+        sh "$DIR/false_positives/run_false_positive.sh" "$env" "$FP_SECONDS" || FAILS=$((FAILS + 1))
     done
     echo
 fi
-
-echo "--- Cleanup of test artifacts ---"
-rm -f /etc/cron.d/hermian-test-backdoor
-rm -f /etc/systemd/system/hermian-test.service
-rm -f /tmp/.hermian-test-suid
-systemctl daemon-reload || true
-sed -i '/hermian-libevil/d' /etc/ld.so.preload 2>/dev/null || true
-sed -i '/HERMIANATTACKSIM/d' /root/.ssh/authorized_keys 2>/dev/null || true
-echo "done."
-echo
 
 if [ "$FAILS" -eq 0 ]; then
     echo "RESULT: PASS"
