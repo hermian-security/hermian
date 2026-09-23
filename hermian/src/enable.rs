@@ -166,20 +166,40 @@ fn enable_pam_module() -> Result<()> {
         return Ok(());
     }
     let content = fs::read_to_string(sshd_pam)?;
-    if content.contains("pam_hermian.so") {
+    let Some(new_content) = pam_config_with_hook(&content) else {
         return Ok(());
-    }
-    let mut new_content = content.clone();
-    if !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    new_content.push_str("# HERMIAN: passive auth telemetry (never affects the auth decision)\n");
-    new_content
-        .push_str("auth    optional    pam_hermian.so\nsession optional    pam_hermian.so\n");
+    };
     // Keep a backup; PAM edits deserve one.
-    let _ = fs::copy(sshd_pam, "/etc/pam.d/sshd.hermian-bak");
+    if !content.contains("pam_hermian.so") {
+        let _ = fs::copy(sshd_pam, "/etc/pam.d/sshd.hermian-bak");
+    }
     fs::write(sshd_pam, new_content)?;
     Ok(())
+}
+
+/// `content` with HERMIAN's PAM lines, or `None` if nothing needs to change.
+///
+/// The module is referenced by absolute path. A bare `pam_hermian.so` is
+/// looked up in libpam's own directory, which is `/lib/<triplet>/security`
+/// on Debian/Ubuntu and `/usr/lib64/security` on RHEL, not the
+/// `/usr/lib/security` we install to, so the hook silently never loaded.
+/// Older bare-name lines are rewritten.
+fn pam_config_with_hook(content: &str) -> Option<String> {
+    let hook = format!(
+        "# HERMIAN: passive auth telemetry (never affects the auth decision)\n\
+         auth    optional    {m}\nsession optional    {m}\n",
+        m = paths::PAM_MODULE_PATH
+    );
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|l| !l.contains("pam_hermian.so") && !l.contains("# HERMIAN:"))
+        .collect();
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&hook);
+    (out != content).then_some(out)
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
@@ -195,5 +215,27 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
             args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pam_hook_uses_the_absolute_module_path() {
+        let base = "@include common-auth\nsession required pam_loginuid.so\n";
+        let out = pam_config_with_hook(base).unwrap();
+        assert!(out.starts_with(base));
+        assert!(out.contains(&format!("auth    optional    {}", paths::PAM_MODULE_PATH)));
+        // Idempotent.
+        assert!(pam_config_with_hook(&out).is_none());
+        // Old bare-name lines are replaced, not duplicated.
+        let old = format!(
+            "{}# HERMIAN: passive auth telemetry\nauth    optional    pam_hermian.so\nsession optional    pam_hermian.so\n",
+            base
+        );
+        let fixed = pam_config_with_hook(&old).unwrap();
+        assert_eq!(fixed, out);
     }
 }
