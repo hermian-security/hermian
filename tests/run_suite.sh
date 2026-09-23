@@ -45,6 +45,12 @@ if [ -z "${HERMIAN_SUITE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&
         --setenv=HERMIAN_DISPOSABLE_HOST="${HERMIAN_DISPOSABLE_HOST:-}" \
         sh "$DIR/run_suite.sh" "$@"
 fi
+if [ -n "${HERMIAN_SUITE_DETACHED:-}" ]; then
+    # Starting the suite was itself operator activity (HERMIAN looks back 15s).
+    # Let that pass so the first file-based scenario is judged as unattended.
+    echo "(waiting 20s so launching the suite doesn't count as operator activity)"
+    sleep 20
+fi
 
 # Safety net: each attack cleans up after itself, but make sure nothing is
 # left behind if the suite is interrupted.
