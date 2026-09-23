@@ -125,9 +125,18 @@ pub fn stat_of(pid: u32) -> Option<(u32, i64, u64)> {
 }
 
 pub fn uid_of(pid: u32) -> Option<u32> {
+    status_id(pid, "Uid:")
+}
+
+pub fn gid_of(pid: u32) -> Option<u32> {
+    status_id(pid, "Gid:")
+}
+
+/// The real id from a `Uid:`/`Gid:` line of /proc/<pid>/status.
+fn status_id(pid: u32, key: &str) -> Option<u32> {
     let content = read_file(&format!("/proc/{}/status", pid))?;
     content.lines().find_map(|l| {
-        l.strip_prefix("Uid:")
+        l.strip_prefix(key)
             .and_then(|v| v.split_whitespace().next())
             .and_then(|s| s.parse::<u32>().ok())
     })
