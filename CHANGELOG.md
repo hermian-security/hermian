@@ -6,6 +6,29 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.5 - 2026-09-23
+
+Fixes from the first full run on a real host (Ubuntu 22.04, kernel 6.8): the
+attack suite now passes 7/7 there.
+
+### Fixed
+
+- An idle SSH, tmux or desktop session no longer turns unattended changes to
+  `authorized_keys`, cron or shell profiles into INFO. Only an operator active
+  in the last 15 seconds, or a running editor, downgrades a change whose
+  writer is gone (#39).
+- The PAM hook runs before `common-auth`, so failed logins reach it. PAM
+  attempts are ignored while journald or auth.log already reports failures,
+  so nothing is counted twice (#40).
+- Every distinct config change pages; a second change within the dedup
+  window used to be silent (#41).
+- `hermian status`, `alerts` and `show` without sudo say they need root
+  instead of "not installed" or "no alerts" (#42).
+- Status lists the SSH auth sources actually in use and only claims PAM when
+  sshd loads the module (#43).
+- A systemd drop-in written into a brand-new `x.service.d` dir is caught right
+  away (#44).
+
 ### Changed
 
 - README install steps are shorter, cover the tarball path properly, and add
@@ -13,6 +36,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   plus upgrade and uninstall sections.
 - Releases carry GitHub build attestations, and their notes are this
   changelog's section for the version with a link to the install steps.
+- The attack suite runs itself outside the login session, so launching it
+  doesn't count as operator activity.
+
+### Upgrade
+
+- Nothing to do by hand. The package re-runs `hermian enable`, which moves an
+  existing PAM hook to its new place. The manual `--with-pam` step from
+  beta.4's notes is no longer needed.
 
 ## 0.1.0-beta.4 - 2026-09-23
 
