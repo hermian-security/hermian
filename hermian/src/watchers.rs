@@ -98,10 +98,23 @@ fn is_interesting(path: &str) -> bool {
                         | ".zlogin"
                 )
         }
+        // Enable links and drop-ins. These dirs were already watched, but
+        // their events were thrown away here.
+        p if is_systemd_subdir(p) => true,
         _ => WATCH_DIRS
             .iter()
             .any(|d| *d != "/etc" && *d != "/root" && *d != "/etc/ssh" && parent == *d),
     }
+}
+
+/// `/etc/systemd/system/<x>.wants`, `.requires` or `.d` (drop-ins).
+fn is_systemd_subdir(dir: &str) -> bool {
+    dir.strip_prefix("/etc/systemd/system/")
+        .map(|name| {
+            !name.contains('/')
+                && (name.ends_with(".wants") || name.ends_with(".requires") || name.ends_with(".d"))
+        })
+        .unwrap_or(false)
 }
 
 const MASK: WatchMask = WatchMask::MODIFY
@@ -183,6 +196,8 @@ impl Watches {
         for p in systemd_target_dirs() {
             self.add(&p);
         }
+        // /home itself, so a new home directory is noticed right away.
+        self.add(Path::new("/home"));
         for p in user_home_watches() {
             self.add(&p);
         }
@@ -195,6 +210,70 @@ impl Watches {
     }
 }
 
+/// Enough of a file's metadata to tell that it changed: inode, mtime, size.
+type Fingerprint = (u64, i64, i64, u64);
+
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(path).ok()?;
+    Some((m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
+}
+
+/// Fingerprints of every interesting file under the current watches. Kept up
+/// to date as events are emitted, so after an inotify queue overflow the
+/// lost changes can be found by comparing against a fresh one.
+fn snapshot(w: &Watches) -> HashMap<String, Fingerprint> {
+    let mut out = HashMap::new();
+    let mut consider = |p: &Path| {
+        let s = p.to_string_lossy().into_owned();
+        if p == w.config_path || is_interesting(&s) {
+            if let Some(fp) = fingerprint(p) {
+                out.insert(s, fp);
+            }
+        }
+    };
+    for p in w.paths.values() {
+        let is_dir = std::fs::symlink_metadata(p)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            consider(p);
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(p) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if e.file_type().map(|t| !t.is_dir()).unwrap_or(false) {
+                consider(&e.path());
+            }
+        }
+    }
+    out
+}
+
+/// What changed between two snapshots.
+fn snapshot_changes(
+    old: &HashMap<String, Fingerprint>,
+    new: &HashMap<String, Fingerprint>,
+) -> Vec<(String, FileKind)> {
+    let mut out: Vec<(String, FileKind)> = new
+        .iter()
+        .filter_map(|(p, fp)| match old.get(p) {
+            None => Some((p.clone(), FileKind::Created)),
+            Some(prev) if prev != fp => Some((p.clone(), FileKind::Modified)),
+            _ => None,
+        })
+        .collect();
+    out.extend(
+        old.keys()
+            .filter(|p| !new.contains_key(*p))
+            .map(|p| (p.clone(), FileKind::Removed)),
+    );
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn systemd_target_dirs() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir("/etc/systemd/system") else {
         return Vec::new();
@@ -204,7 +283,8 @@ fn systemd_target_dirs() -> Vec<PathBuf> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            (name.ends_with(".wants") || name.ends_with(".requires")) && e.path().is_dir()
+            (name.ends_with(".wants") || name.ends_with(".requires") || name.ends_with(".d"))
+                && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
         })
         .map(|e| e.path())
         .collect()
@@ -273,16 +353,20 @@ fn watcher_loop(
     let mut buffer = [0u8; 16384];
     let mut last_rescan = Instant::now();
     let mut pending: HashMap<String, Pending> = HashMap::new();
+    let mut known = snapshot(&w);
+    let mut overflows: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
+        let mut overflowed = false;
         // Non-blocking read; inotify's fd is nonblocking by default in this crate.
         match w.inotify.read_events(&mut buffer) {
             Ok(events) => {
                 for event in events {
                     if event.mask.contains(EventMask::Q_OVERFLOW) {
+                        overflowed = true;
                         continue;
                     }
                     if event.mask.contains(EventMask::IGNORED) {
@@ -293,6 +377,18 @@ fn watcher_loop(
                         continue;
                     };
                     if event.mask.contains(EventMask::ISDIR) {
+                        // A new ~/.ssh, home or cron dir: watch it now, not at
+                        // the next 60s rescan, and pick up whatever was already
+                        // written into it (mkdir ~/.ssh && echo key > ...).
+                        if event
+                            .mask
+                            .intersects(EventMask::CREATE | EventMask::MOVED_TO)
+                        {
+                            if let Some(name) = &event.name {
+                                let dir = base.join(name);
+                                adopt_new_dir(&mut w, &dir, &config_path, &mut pending, 0);
+                            }
+                        }
                         continue;
                     }
                     let full = match &event.name {
@@ -327,6 +423,38 @@ fn watcher_loop(
             Err(_) => std::thread::sleep(Duration::from_millis(150)),
         }
 
+        // The kernel dropped events. Find what changed since the last
+        // snapshot and queue those, rather than silently missing them.
+        if overflowed {
+            overflows += 1;
+            let fresh = snapshot(&w);
+            let changes = snapshot_changes(&known, &fresh);
+            let now = Instant::now();
+            for (path, kind) in &changes {
+                let is_config = Path::new(path) == config_path;
+                let writer = if *kind == FileKind::Removed {
+                    None
+                } else {
+                    lookup_writer(path)
+                };
+                pending.entry(path.clone()).or_insert(Pending {
+                    first: now,
+                    last: now,
+                    kind: *kind,
+                    writer,
+                    is_config,
+                });
+            }
+            known = fresh;
+            w.last_error = format!(
+                "inotify queue overflowed {} time(s); rescanned, {} change(s) recovered",
+                overflows,
+                changes.len()
+            );
+            eprintln!("hermian: {}", w.last_error);
+            w.publish();
+        }
+
         // Flush settled bursts.
         let now = Instant::now();
         let ready: Vec<String> = pending
@@ -336,6 +464,10 @@ fn watcher_loop(
             .collect();
         for key in ready {
             if let Some(p) = pending.remove(&key) {
+                match fingerprint(Path::new(&key)) {
+                    Some(fp) => known.insert(key.clone(), fp),
+                    None => known.remove(&key),
+                };
                 let ev = build_file_event(&key, p);
                 if tx.blocking_send(Event::File(ev)).is_err() {
                     return;
@@ -346,9 +478,82 @@ fn watcher_loop(
         if last_rescan.elapsed() > Duration::from_secs(60) {
             w.refresh();
             w.publish();
+            // Pick up newly watched files without reporting them as changes.
+            for (path, fp) in snapshot(&w) {
+                known.entry(path).or_insert(fp);
+            }
             last_rescan = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// Directories the watcher keeps a watch on (besides the fixed lists, which
+/// `refresh` re-adds anyway).
+fn is_wanted_dir(path: &str) -> bool {
+    if WATCH_DIRS.contains(&path) {
+        return true;
+    }
+    let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    // /home/<user>
+    if parent == "/home" && !name.is_empty() {
+        return true;
+    }
+    // /root/.ssh, /home/<user>/.ssh
+    if name == ".ssh"
+        && (parent == "/root" || parent.starts_with("/home/") && parent.matches('/').count() == 2)
+    {
+        return true;
+    }
+    // systemctl enable targets
+    parent == "/etc/systemd/system" && (name.ends_with(".wants") || name.ends_with(".requires"))
+}
+
+/// Watch a directory that just appeared and queue what's already inside.
+/// Depth-limited so a new home with a `.ssh` is covered in one go.
+fn adopt_new_dir(
+    w: &mut Watches,
+    dir: &Path,
+    config_path: &Path,
+    pending: &mut HashMap<String, Pending>,
+    depth: u8,
+) {
+    let dir_s = dir.to_string_lossy().into_owned();
+    if depth > 1 || !is_wanted_dir(&dir_s) {
+        return;
+    }
+    // Only real directories: a symlinked ~/.ssh would point the watch elsewhere.
+    if !std::fs::symlink_metadata(dir)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    w.add(dir);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = Instant::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            adopt_new_dir(w, &path, config_path, pending, depth + 1);
+            continue;
+        }
+        let path_s = path.to_string_lossy().into_owned();
+        let is_config = path == config_path;
+        if !is_config && !is_interesting(&path_s) {
+            continue;
+        }
+        pending.entry(path_s.clone()).or_insert_with(|| Pending {
+            first: now,
+            last: now,
+            kind: FileKind::Created,
+            writer: lookup_writer(&path_s),
+            is_config,
+        });
     }
 }
 
@@ -456,7 +661,7 @@ fn content_for(path: &str, is_config: bool) -> Option<String> {
         || name.starts_with(".z")
         || name == ".profile";
     if tracked {
-        procsrc::read_file(path)
+        procsrc::read_regular_file(path)
     } else {
         None
     }
@@ -476,10 +681,65 @@ mod tests {
         assert!(is_interesting("/home/dev/.zshrc"));
         assert!(is_interesting("/home/dev/.ssh/authorized_keys"));
         assert!(is_interesting("/etc/systemd/system/x.service"));
+        assert!(is_interesting(
+            "/etc/systemd/system/multi-user.target.wants/x.service"
+        ));
+        assert!(is_interesting(
+            "/etc/systemd/system/ssh.service.d/override.conf"
+        ));
+        assert!(!is_interesting("/etc/systemd/system/a.d/b/c.conf"));
         assert!(!is_interesting("/etc/hosts"));
         assert!(!is_interesting("/etc/ssh/moduli"));
         assert!(!is_interesting("/root/notes.txt"));
         assert!(!is_interesting("/home/dev/project/.bashrc"));
+    }
+
+    #[test]
+    fn new_dirs_worth_watching() {
+        assert!(is_wanted_dir("/root/.ssh"));
+        assert!(is_wanted_dir("/home/mallory"));
+        assert!(is_wanted_dir("/home/mallory/.ssh"));
+        assert!(is_wanted_dir("/etc/cron.d"));
+        assert!(is_wanted_dir("/etc/systemd/system/multi-user.target.wants"));
+        assert!(!is_wanted_dir("/home/mallory/project"));
+        assert!(!is_wanted_dir("/home/mallory/project/.ssh"));
+        assert!(!is_wanted_dir("/etc/nginx"));
+        assert!(!is_wanted_dir("/tmp/.ssh"));
+    }
+
+    #[test]
+    fn overflow_rescan_finds_lost_changes() {
+        let fp = |ino, size| (ino, 1_700_000_000, 0, size);
+        let mut old = HashMap::new();
+        old.insert("/etc/cron.d/keep".to_string(), fp(1, 10));
+        old.insert("/etc/cron.d/edited".to_string(), fp(2, 10));
+        old.insert("/etc/cron.d/gone".to_string(), fp(3, 10));
+        let mut new = old.clone();
+        new.insert("/etc/cron.d/edited".to_string(), fp(2, 99));
+        new.remove("/etc/cron.d/gone");
+        new.insert("/root/.ssh/authorized_keys".to_string(), fp(4, 80));
+        let changes = snapshot_changes(&old, &new);
+        assert_eq!(
+            changes,
+            vec![
+                ("/etc/cron.d/edited".to_string(), FileKind::Modified),
+                ("/etc/cron.d/gone".to_string(), FileKind::Removed),
+                ("/root/.ssh/authorized_keys".to_string(), FileKind::Created),
+            ]
+        );
+        assert!(snapshot_changes(&new, &new).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_changes_on_rewrite() {
+        let dir = std::env::temp_dir().join(format!("hermian-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x");
+        std::fs::write(&f, "a").unwrap();
+        let before = fingerprint(&f).unwrap();
+        std::fs::write(&f, "abc").unwrap();
+        assert_ne!(before, fingerprint(&f).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

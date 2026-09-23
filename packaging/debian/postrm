@@ -1,17 +1,25 @@
 #!/bin/sh
 set -e
 
+# The module is gone after remove, so its PAM lines must go too; the
+# comment line and the backup go with them. Same filter as hermian uninstall.
+remove_pam_hook() {
+    if [ -f /etc/pam.d/sshd ] && grep -q -e 'pam_hermian\.so' -e '# HERMIAN:' /etc/pam.d/sshd 2>/dev/null; then
+        sed -i -e '/pam_hermian\.so/d' -e '/# HERMIAN:/d' /etc/pam.d/sshd
+    fi
+}
+
 case "$1" in
     remove)
         rm -f /etc/systemd/system/hermian.service
+        remove_pam_hook
         systemctl daemon-reload >/dev/null 2>&1 || true
     ;;
     purge)
         rm -f /etc/systemd/system/hermian.service
         rm -rf /etc/hermian /var/lib/hermian /var/log/hermian /run/hermian
-        if [ -f /etc/pam.d/sshd ] && grep -q pam_hermian.so /etc/pam.d/sshd 2>/dev/null; then
-            sed -i '/pam_hermian.so/d' /etc/pam.d/sshd
-        fi
+        remove_pam_hook
+        rm -f /etc/pam.d/sshd.hermian-bak
         systemctl daemon-reload >/dev/null 2>&1 || true
     ;;
 esac

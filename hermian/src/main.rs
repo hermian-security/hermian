@@ -6,6 +6,7 @@ mod channels;
 mod cli;
 mod collect;
 mod config;
+mod configdiff;
 mod daemon;
 mod ebpf;
 mod enable;
