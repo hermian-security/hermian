@@ -6,16 +6,20 @@ use crate::events::Severity;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("baseline.duration_hours must be greater than 0")]
+    #[error("baseline.duration_hours must be between 1 and 8760 (one year)")]
     BaselineDuration,
-    #[error("ssh.failed_burst_count must be greater than 0")]
+    #[error("ssh.failed_burst_count must be between 1 and 10000")]
     BurstCount,
-    #[error("ssh.failed_burst_window_secs must be greater than 0")]
+    #[error("ssh.failed_burst_window_secs must be between 1 and 86400 (one day)")]
     BurstWindow,
-    #[error("notifications.dedup_window_secs must be greater than 0")]
+    #[error("notifications.dedup_window_secs must be between 1 and 86400 (one day)")]
     DedupWindow,
-    #[error("unknown notification channel '{0}' (supported: journald, file, stdout, webhook)")]
+    #[error(
+        "unknown notification channel '{0}' (supported: journald, file, stdout, webhook, telegram, email)"
+    )]
     UnknownChannel(String),
+    #[error("notifications.{0}.timeout_secs must be between 1 and 300")]
+    Timeout(&'static str),
     #[error("notifications.channels must not be empty")]
     NoChannels,
     #[error("notifications.min_severity must be one of INFO, LOW, HIGH, CRITICAL")]
@@ -276,6 +280,9 @@ pub struct Config {
     pub allowlist: Allowlist,
 }
 
+pub const MAX_BASELINE_HOURS: u32 = 24 * 365;
+pub const MAX_WINDOW_SECS: u64 = 86_400;
+
 pub const SUPPORTED_CHANNELS: &[&str] =
     &["journald", "file", "stdout", "webhook", "telegram", "email"];
 pub const SUPPORTED_EMAIL_TRANSPORTS: &[&str] = &["smtp", "sendmail"];
@@ -288,17 +295,29 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.baseline.duration_hours == 0 {
+        // Upper bounds too: chrono panics on out-of-range durations, so a
+        // typo like duration_hours = 99999999999 used to crash the daemon on
+        // (re)load instead of being rejected.
+        if !(1..=MAX_BASELINE_HOURS).contains(&self.baseline.duration_hours) {
             return Err(ConfigError::BaselineDuration);
         }
-        if self.ssh.failed_burst_count == 0 {
+        if !(1..=10_000).contains(&self.ssh.failed_burst_count) {
             return Err(ConfigError::BurstCount);
         }
-        if self.ssh.failed_burst_window_secs == 0 {
+        if !(1..=MAX_WINDOW_SECS).contains(&self.ssh.failed_burst_window_secs) {
             return Err(ConfigError::BurstWindow);
         }
-        if self.notifications.dedup_window_secs == 0 {
+        if !(1..=MAX_WINDOW_SECS).contains(&self.notifications.dedup_window_secs) {
             return Err(ConfigError::DedupWindow);
+        }
+        for (name, t) in [
+            ("webhook", self.notifications.webhook.timeout_secs),
+            ("telegram", self.notifications.telegram.timeout_secs),
+            ("email", self.notifications.email.timeout_secs),
+        ] {
+            if !(1..=300).contains(&t) {
+                return Err(ConfigError::Timeout(name));
+            }
         }
         if self.ssh.off_hours_start > 23 || self.ssh.off_hours_end > 23 {
             return Err(ConfigError::OffHours);
@@ -518,6 +537,23 @@ reason = "ansible"
     fn invalid_thresholds_rejected() {
         let cfg = Config::parse("[ssh]\nfailed_burst_count = 0\n").unwrap();
         assert!(matches!(cfg.validate(), Err(ConfigError::BurstCount)));
+    }
+
+    #[test]
+    fn huge_values_are_rejected_not_crashed_on() {
+        for (toml_text, want) in [
+            ("[baseline]\nduration_hours = 4000000000\n", "baseline"),
+            (
+                "[notifications]\ndedup_window_secs = 9223372036854775807\n",
+                "dedup",
+            ),
+            ("[ssh]\nfailed_burst_window_secs = 9999999999999\n", "burst"),
+            ("[notifications.telegram]\ntimeout_secs = 0\n", "timeout"),
+        ] {
+            let cfg = Config::parse(toml_text).unwrap();
+            let err = cfg.validate().expect_err(want);
+            assert!(!err.to_string().is_empty());
+        }
     }
 
     #[test]
