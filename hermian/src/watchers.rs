@@ -506,8 +506,9 @@ fn is_wanted_dir(path: &str) -> bool {
     {
         return true;
     }
-    // systemctl enable targets
-    parent == "/etc/systemd/system" && (name.ends_with(".wants") || name.ends_with(".requires"))
+    // systemctl enable targets and drop-in dirs: `mkdir x.service.d` plus an
+    // override in one go was missed until the 60s rescan.
+    is_systemd_subdir(path)
 }
 
 /// Watch a directory that just appeared and queue what's already inside.
@@ -701,6 +702,8 @@ mod tests {
         assert!(is_wanted_dir("/home/mallory/.ssh"));
         assert!(is_wanted_dir("/etc/cron.d"));
         assert!(is_wanted_dir("/etc/systemd/system/multi-user.target.wants"));
+        assert!(is_wanted_dir("/etc/systemd/system/ssh.service.d"));
+        assert!(!is_wanted_dir("/etc/systemd/system/ssh.service.d/nested"));
         assert!(!is_wanted_dir("/home/mallory/project"));
         assert!(!is_wanted_dir("/home/mallory/project/.ssh"));
         assert!(!is_wanted_dir("/etc/nginx"));
