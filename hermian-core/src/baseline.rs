@@ -74,7 +74,10 @@ impl Baseline {
             return None;
         }
         let started = self.started_at?;
-        let deadline = started + Duration::hours(self.duration_hours as i64);
+        // duration_hours comes from baseline.json too, which isn't validated:
+        // clamp it rather than let chrono panic on overflow.
+        let hours = self.duration_hours.min(crate::config::MAX_BASELINE_HOURS) as i64;
+        let deadline = started.checked_add_signed(Duration::hours(hours))?;
         let rem = deadline - now;
         if rem.num_seconds() > 0 {
             Some(rem)
@@ -140,6 +143,18 @@ mod tests {
     fn disabled_baseline_is_complete_immediately() {
         let b = Baseline::new(false, 24, now());
         assert!(b.is_complete());
+    }
+
+    #[test]
+    fn huge_duration_from_disk_does_not_panic() {
+        let mut b: Baseline = serde_json::from_str(
+            r#"{"enabled":true,"complete":false,"duration_hours":4294967295,
+                "started_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let t = "2026-06-01T00:00:00Z".parse().unwrap();
+        assert!(b.remaining(t).is_some());
+        assert!(!b.check_completion(t));
     }
 
     #[test]
