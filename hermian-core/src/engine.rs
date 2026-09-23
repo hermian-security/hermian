@@ -287,6 +287,13 @@ impl Engine {
         alerts
     }
 
+    /// Tell the engine which pids exist right now (the daemon reads /proc).
+    /// Exited processes stop counting as live sessions and are dropped from
+    /// the tree after a short grace period.
+    pub fn reap_exited(&mut self, alive: &std::collections::HashSet<u32>, now: DateTime<Utc>) {
+        self.tree.reap(alive, now);
+    }
+
     /// Forget a listener so it will alert again if it reappears (called when
     /// the daemon observes the port closing).
     pub fn forget_listener(&mut self, proto: &str, port: u16) {
