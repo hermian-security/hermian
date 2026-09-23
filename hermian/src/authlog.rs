@@ -27,8 +27,14 @@ pub enum AuthSource {
     None,
 }
 
+/// Prefer journald whenever it's running: its `_UID`/`_COMM` fields come from
+/// the kernel, while a text auth log accepts whatever `logger` writes. (A
+/// leftover auth.log on a journald-only host also goes stale.)
 pub fn detect_source() -> AuthSource {
-    if AUTH_LOG_CANDIDATES
+    let journald = std::path::Path::new("/run/systemd/journal/socket").exists();
+    if journald && which("journalctl") {
+        AuthSource::Journal
+    } else if AUTH_LOG_CANDIDATES
         .iter()
         .any(|p| std::path::Path::new(p).exists())
     {
@@ -107,10 +113,14 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                 }
                 Ok(_) => {
                     idle_polls = 0;
-                    if let Some(ev) = parse_line(&line) {
-                        if tx.blocking_send(Event::Auth(ev)).is_err() {
-                            return;
-                        }
+                    let Some((ev, pid)) = parse_line_with_pid(&line) else {
+                        continue;
+                    };
+                    if sender_is_not_sshd(pid) {
+                        continue;
+                    }
+                    if tx.blocking_send(Event::Auth(ev)).is_err() {
+                        return;
                     }
                 }
                 Err(_) => break,
@@ -119,22 +129,28 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     }
 }
 
+/// Anyone can write `sshd[<pid>]: Accepted ...` to syslog with `logger`, and
+/// a text log doesn't record the real sender. When the tagged pid is still
+/// alive we can at least check it's a root sshd; a live pid that isn't one is
+/// a forgery. (A dead pid can't be checked; journald's trusted fields are
+/// preferred for that reason.)
+fn sender_is_not_sshd(pid: u32) -> bool {
+    let Some(comm) = crate::procsrc::comm_of(pid) else {
+        return false;
+    };
+    let uid = crate::procsrc::uid_of(pid);
+    !matches!(comm.as_str(), "sshd" | "sshd-session") || uid != Some(0)
+}
+
+/// Only trusted (kernel-supplied) fields: `SYSLOG_IDENTIFIER` is whatever
+/// the sender claims (`logger -t sshd`), and `_COMM` alone can be set by any
+/// process, so require it to run as root too.
+const JOURNAL_MATCHES: &[&str] = &["_UID=0", "_COMM=sshd", "+", "_UID=0", "_COMM=sshd-session"];
+
 fn spawn_journalctl() -> std::io::Result<Child> {
     Command::new("journalctl")
-        .args([
-            "-f",
-            "-n",
-            "0",
-            "-o",
-            "short-iso",
-            "--no-pager",
-            "-q",
-            "_COMM=sshd",
-            "+",
-            "_COMM=sshd-session",
-            "+",
-            "SYSLOG_IDENTIFIER=sshd",
-        ])
+        .args(["-f", "-n", "0", "-o", "short-iso", "--no-pager", "-q"])
+        .args(JOURNAL_MATCHES)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -178,14 +194,40 @@ fn journal_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-/// Parse a syslog / journal `short-iso` sshd line into an [`AuthEvent`].
-pub fn parse_line(line: &str) -> Option<AuthEvent> {
-    let line = line.trim();
-    if !line.contains("sshd") {
+/// Split `<timestamp> <host> <tag>[<pid>]: <message>` and return the tag's
+/// pid and the message, only when the tag is sshd's own.
+///
+/// The message is split at the tag, never by searching for `"]: "`: a remote
+/// client controls the username sshd logs ("Invalid user x]: Accepted
+/// publickey for root from ..."), so anything after the tag is untrusted.
+fn split_sshd_line(line: &str) -> Option<(Option<DateTime<Utc>>, u32, &str)> {
+    let ts = parse_timestamp(line);
+    // ISO/RFC 3339 timestamps are one token; classic syslog "Jan 15 10:20:30" is three.
+    let skip = if ts.is_some() { 1 } else { 3 };
+    let mut rest = line;
+    for _ in 0..skip + 1 {
+        rest = rest.trim_start().split_once(char::is_whitespace)?.1;
+    }
+    let (tag, msg) = rest.trim_start().split_once(char::is_whitespace)?;
+    let (name, pid) = tag.strip_suffix("]:")?.split_once('[')?;
+    if !matches!(name, "sshd" | "sshd-session") {
         return None;
     }
-    let ts = parse_timestamp(line).unwrap_or_else(Utc::now);
-    let msg = line.rsplit_once("]: ").map(|(_, m)| m).unwrap_or(line);
+    let pid: u32 = pid.parse().ok()?;
+    Some((ts, pid, msg.trim_start()))
+}
+
+/// Parse a syslog / journal `short-iso` sshd line into an [`AuthEvent`].
+pub fn parse_line(line: &str) -> Option<AuthEvent> {
+    parse_line_with_pid(line).map(|(ev, _)| ev)
+}
+
+fn parse_line_with_pid(line: &str) -> Option<(AuthEvent, u32)> {
+    let (ts, pid, msg) = split_sshd_line(line.trim())?;
+    parse_message(msg, ts.unwrap_or_else(Utc::now)).map(|ev| (ev, pid))
+}
+
+fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
     let lower = msg.to_ascii_lowercase();
 
     if lower.starts_with("accepted ") {
@@ -256,7 +298,10 @@ fn word_after(msg: &str, pattern: &str) -> Option<String> {
 }
 
 fn extract_rhost(msg: &str) -> Option<IpAddr> {
-    let from = msg.find(" from ")?;
+    // sshd puts "from <ip> port <n>" after the (client-chosen) username, so
+    // take the last one: a username like "a from 203.0.113.1" can't reframe
+    // the source.
+    let from = msg.rfind(" from ")?;
     let token: String = msg[from + 6..]
         .chars()
         .take_while(|c| !c.is_whitespace())
@@ -294,6 +339,65 @@ mod tests {
         let c = parse_line("Jan 15 10:20:30 web sshd[1234]: Connection closed by authenticating user root 198.51.100.7 port 4 [preauth]").unwrap();
         assert_eq!(c.result, AuthResult::Failure);
         assert_eq!(c.user, "root");
+    }
+
+    #[test]
+    fn username_cannot_forge_a_success() {
+        // Remote, pre-auth: sshd logs the client-chosen username verbatim.
+        let line = "2024-01-15T10:20:30+0000 web sshd[1234]: Invalid user x]: Accepted \
+                    publickey for root from 203.0.113.9 port 1 ssh2 from 198.51.100.7 port 4";
+        let ev = parse_line(line).unwrap();
+        assert_eq!(ev.result, AuthResult::Failure);
+        assert_eq!(ev.rhost, Some("198.51.100.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn username_cannot_reframe_the_source() {
+        let line = "Jan 15 10:20:30 web sshd[1234]: Failed password for invalid user \
+                    a from 203.0.113.1 from 198.51.100.7 port 4 ssh2";
+        let ev = parse_line(line).unwrap();
+        assert_eq!(ev.rhost, Some("198.51.100.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_sshd_tags_are_accepted() {
+        // `logger "sshd[1]: Accepted ..."` is tagged with the user's name.
+        assert!(parse_line(
+            "Jan 15 10:20:30 web mallory: sshd[1]: Accepted publickey for root from 203.0.113.9 port 1 ssh2"
+        )
+        .is_none());
+        assert!(parse_line(
+            "Jan 15 10:20:30 web notsshd[9]: Accepted publickey for root from 203.0.113.9 port 1 ssh2"
+        )
+        .is_none());
+        // No pid: not sshd's format.
+        assert!(parse_line(
+            "Jan 15 10:20:30 web sshd: Accepted publickey for root from 203.0.113.9 port 1 ssh2"
+        )
+        .is_none());
+        let ok = parse_line_with_pid(
+            "Jan  5 10:20:30 web sshd-session[77]: Accepted publickey for bob from 10.0.0.1 port 1 ssh2",
+        )
+        .unwrap();
+        assert_eq!(ok.1, 77);
+        assert_eq!(ok.0.user, "bob");
+    }
+
+    #[test]
+    fn journal_matches_use_trusted_fields_only() {
+        assert!(!JOURNAL_MATCHES.iter().any(|m| m.starts_with("SYSLOG_")));
+        // Every OR-group pins _UID=0.
+        for group in JOURNAL_MATCHES.split(|m| *m == "+") {
+            assert!(group.contains(&"_UID=0"), "{:?}", group);
+        }
+    }
+
+    #[test]
+    fn live_non_sshd_pid_is_a_forgery() {
+        // This test process is alive and isn't sshd.
+        assert!(sender_is_not_sshd(std::process::id()));
+        // A pid that can't exist can't be checked.
+        assert!(!sender_is_not_sshd(u32::MAX));
     }
 
     #[test]
