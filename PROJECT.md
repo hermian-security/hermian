@@ -42,7 +42,7 @@ are the detailed rule reference, including exemptions and severity choices.
 
 | Group | Looks for |
 | --- | --- |
-| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells, download-and-exec chains, transient or deleted executables |
+| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (through `env`/`setsid`-style wrappers), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
 | [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
 | [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron, shell profiles, SSH keys, and systemd changes |
 | [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
@@ -55,6 +55,12 @@ miss events or lack the context a rule needs.
 
 A web server spawning a shell is HIGH. A normal shell under an SSH session
 isn't. File rules also distinguish operator edits from unattended writes.
+
+Roles that exempt a process (package and config managers, user tools,
+debuggers, session daemons) need its executable in a root-owned system
+directory; a binary merely named `dpkg` doesn't count. Script tools such as
+dnf or Debian's adduser are identified by name under a system interpreter,
+so a script with such a name run by that interpreter can still pass.
 
 inotify doesn't identify the writer. The daemon tries to find an open file
 descriptor; some rules also look for a recent admin tool. If the writer is
@@ -80,7 +86,7 @@ exception. See the examples in `/etc/hermian/config.toml`.
 | Process metadata | `/proc` at startup and while handling events |
 | TCP listeners | `/proc/net/tcp*`, polled every 5 s |
 | Setuid/setgid files | Sweep every 20 s, depth-limited to four levels |
-| SSH auth | `auth.log` / `secure`, or journald; PAM telemetry is optional |
+| SSH auth | journald (root `sshd` entries only) when running, else `auth.log` / `secure`; PAM telemetry is optional |
 
 eBPF needs kernel 5.8+ and the required permissions. If it can't load, execution
 falls back to one-second `/proc` polling and audit when available. HERMIAN leaves
@@ -143,8 +149,12 @@ Monitoring logs and notifies by default; it doesn't kill or quarantine processes
 `hermian isolate` adds nftables rules. `hermian unisolate` removes them.
 
 Isolation requires `response.management_cidrs`. Automatic isolation also needs
-`response.auto_isolate = true`. The rules keep loopback, established flows, DNS,
-and management CIDRs, so this isn't a complete network cutoff. Check your CIDRs
+`response.auto_isolate = true` and `CAP_NET_ADMIN`, which `hermian enable`
+grants only when isolation is configured; re-run it after turning isolation on.
+The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
+neighbour discovery, DNS to the resolvers in resolv.conf, and TCP to the
+notification endpoints resolved at isolation time. It isn't a complete
+network cutoff. Check your CIDRs
 and recovery access on a test host first; don't assume remote access is guaranteed.
 
 `hermian uninstall` tries to lift isolation, then removes the unit, config, state,
@@ -163,6 +173,9 @@ HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
 ```
 
 `HERMIAN_EBPF_PREBUILT=/path/to/object` selects an explicit object instead.
+If a BPF toolchain is installed but the source fails to compile, the build
+fails rather than quietly using the vendored object; set
+`HERMIAN_EBPF_FROM_SOURCE=0` to use the vendored object on purpose.
 Linux CI rebuilds from source and compares against the vendored object.
 
 ## Testing and next steps

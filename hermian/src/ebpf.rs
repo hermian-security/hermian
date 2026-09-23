@@ -1,6 +1,7 @@
 //! eBPF loader and perf-buffer readers.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -198,31 +199,74 @@ fn decode(kind: MapKind, buf: &BytesMut) -> Option<RawEvent> {
     }
 }
 
+/// Perf ring size per CPU, in pages (power of two). aya's default is small:
+/// at ~430 bytes per exec event it held only a few dozen, so a fork/exec
+/// burst overflowed it. 64 pages is 256 KiB per CPU on 4 KiB pages.
+const EXEC_PAGES: usize = 64;
+const OTHER_PAGES: usize = 16;
+
+/// Events the kernel dropped because a perf ring was full, since startup.
+pub static LOST_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Log lost events at most once a minute, with the running total.
+fn report_lost(map: &str, cpu: u32, lost: usize, last_report: &mut Option<std::time::Instant>) {
+    let total = LOST_EVENTS.fetch_add(lost as u64, Ordering::Relaxed) + lost as u64;
+    let due = last_report
+        .map(|t| t.elapsed() >= Duration::from_secs(60))
+        .unwrap_or(true);
+    if due {
+        *last_report = Some(std::time::Instant::now());
+        crate::daemon::log_daemon(
+            hermian_core::Severity::High,
+            &format!(
+                "eBPF {} ring on cpu {} dropped {} event(s) ({} total since start); \
+                 exec/connect events are being missed",
+                map, cpu, lost, total
+            ),
+        );
+    }
+}
+
 fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
-    for (map_name, kind) in [
-        ("EXEC_EVENTS", MapKind::Exec),
-        ("CONNECT_EVENTS", MapKind::Connect),
-        ("PTRACE_EVENTS", MapKind::Ptrace),
+    for (map_name, kind, pages) in [
+        ("EXEC_EVENTS", MapKind::Exec, EXEC_PAGES),
+        ("CONNECT_EVENTS", MapKind::Connect, OTHER_PAGES),
+        ("PTRACE_EVENTS", MapKind::Ptrace, OTHER_PAGES),
     ] {
         let map = bpf
             .take_map(map_name)
             .ok_or_else(|| anyhow!("map {} not found", map_name))?;
         let mut array = AsyncPerfEventArray::try_from(map)?;
         for cpu in online_cpus().map_err(|(_, e)| e)? {
-            let mut buf = array.open(cpu, None)?;
+            let mut buf = array.open(cpu, Some(pages))?;
             let tx = tx.clone();
             tokio::spawn(async move {
-                let mut buffers = (0..16)
+                let mut buffers = (0..64)
                     .map(|_| BytesMut::with_capacity(1024))
                     .collect::<Vec<_>>();
+                let mut last_report = None;
+                let mut last_error: Option<std::time::Instant> = None;
                 loop {
                     let events = match buf.read_events(&mut buffers).await {
                         Ok(e) => e,
-                        Err(_) => {
+                        Err(e) => {
+                            if last_error
+                                .map(|t| t.elapsed() >= Duration::from_secs(60))
+                                .unwrap_or(true)
+                            {
+                                last_error = Some(std::time::Instant::now());
+                                crate::daemon::log_daemon(
+                                    hermian_core::Severity::Low,
+                                    &format!("eBPF {} read on cpu {} failed: {}", map_name, cpu, e),
+                                );
+                            }
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             continue;
                         }
                     };
+                    if events.lost > 0 {
+                        report_lost(map_name, cpu, events.lost, &mut last_report);
+                    }
                     for b in buffers.iter().take(events.read) {
                         if let Some(ev) = decode(kind, b) {
                             if tx.send(ev).await.is_err() {
@@ -235,4 +279,108 @@ fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_events_are_counted_and_throttled() {
+        let before = LOST_EVENTS.load(Ordering::Relaxed);
+        let mut last = None;
+        report_lost("EXEC_EVENTS", 0, 3, &mut last);
+        let first = last;
+        assert!(first.is_some());
+        report_lost("EXEC_EVENTS", 0, 2, &mut last);
+        assert_eq!(last, first, "second report within a minute is throttled");
+        assert_eq!(LOST_EVENTS.load(Ordering::Relaxed) - before, 5);
+    }
+
+    /// Loads the embedded object into the running kernel, so the verifier
+    /// checks every program. Needs root; CI runs it with sudo:
+    ///   sudo <test-binary> --ignored ebpf_object_loads
+    #[test]
+    #[ignore]
+    fn ebpf_object_loads_and_sees_ld_preload() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(4096);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            assert!(runtime.attached.contains(&"sched_process_exec"));
+            assert!(runtime.attached.contains(&"sys_enter_execve"));
+
+            // Filler variables sort before LD_PRELOAD (Command keeps env
+            // sorted), pushing it past the old 12-entry scan.
+            let mut cmd = std::process::Command::new("/bin/true");
+            cmd.env_clear();
+            for i in 0..20 {
+                cmd.env(format!("HERMIAN_FILLER_{:02}", i), "x");
+            }
+            cmd.env("LD_PRELOAD", "");
+            let child = cmd.spawn().unwrap();
+            let pid = child.id();
+            let _ = child.wait_with_output();
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("no exec event for the test child")
+                    .unwrap();
+                if let RawEvent::Exec(e) = ev {
+                    if e.pid == pid {
+                        assert_eq!(e.ld_preload, 1, "LD_PRELOAD not seen");
+                        break;
+                    }
+                }
+            }
+            drop(runtime);
+        });
+    }
+
+    /// Failed execs leave their intent behind. With a plain hash map, 4096 of
+    /// them filled it and every later exec lost argv0/LD_PRELOAD.
+    #[test]
+    #[ignore]
+    fn ebpf_intents_survive_a_failed_exec_flood() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(65536);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            for _ in 0..5000 {
+                let _ = std::process::Command::new("/nonexistent/hermian-flood").status();
+            }
+            let child = std::process::Command::new("/bin/true")
+                .env_clear()
+                .env("LD_PRELOAD", "")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let _ = child.wait_with_output();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("no exec event for the test child")
+                    .unwrap();
+                if let RawEvent::Exec(e) = ev {
+                    if e.pid == pid {
+                        assert_eq!(e.ld_preload, 1, "intent lost after the flood");
+                        assert_eq!(to_str(&e.argv0), "/bin/true");
+                        break;
+                    }
+                }
+            }
+            drop(runtime);
+        });
+    }
 }

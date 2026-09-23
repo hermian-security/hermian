@@ -32,6 +32,9 @@ jobs:
       - run: python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v
       - run: sh -n tests/attacks/run_attack.sh
       - run: sh -n tests/run_suite.sh
+      - run: sh -n tests/false_positives/run_false_positive.sh
+      - run: sh -n tests/helpers/disposable_host.sh
+      - run: sh -n tests/soak/start.sh
       - name: sh -n on packaging scripts
         run: for f in packaging/install.sh packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm; do sh -n "$f"; done
 
@@ -87,6 +90,13 @@ jobs:
       # stale hermian-ebpf/prebuilt/hermian-ebpf.o fails CI instead of shipping.
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo clippy --all-targets --locked -- -D warnings
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked
+      - name: nft accepts the isolation ruleset
+        run: |
+          sudo apt-get install -y nftables
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked -p hermian --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
+          test -n "$BIN"
+          sudo "$BIN" --ignored --exact isolate::tests::nft_accepts_the_ruleset
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
       - name: Vendored eBPF object is current
         run: |
@@ -96,6 +106,14 @@ jobs:
         run: |
           ./target/release/hermian --version
           HERMIAN_COLOR=never ./target/release/hermian test
+      # Unit tests can't load eBPF; this puts the object through the runner
+      # kernel's verifier and checks the LD_PRELOAD scan end to end.
+      - name: Load the eBPF object (verifier + live exec event)
+        run: |
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked -p hermian --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
+          test -n "$BIN"
+          sudo "$BIN" --ignored --test-threads=1 ebpf::tests::
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hermian-linux-amd64
