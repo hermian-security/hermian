@@ -211,15 +211,20 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         paths::config_path(),
         shutdown.clone(),
     )?);
-    if let Err(e) = pamsock::spawn_pam_listener(event_tx.clone(), shutdown.clone()) {
-        log_daemon(Severity::Low, &format!("PAM socket unavailable: {:#}", e));
-    }
     match authlog::spawn_authlog_tailer(event_tx.clone(), shutdown.clone()) {
         Ok(src) => sources.auth = src,
         Err(e) => log_daemon(
             Severity::Low,
             &format!("auth log source unavailable: {:#}", e),
         ),
+    }
+    // The PAM module reports an "attempt" for every authentication, before
+    // the outcome is known. With a log source already reporting failures,
+    // counting attempts too would double every failure and count successful
+    // logins as failures, so they're only used when there's no log source.
+    let pam_attempts = sources.auth == authlog::AuthSource::None;
+    if let Err(e) = pamsock::spawn_pam_listener(event_tx.clone(), shutdown.clone(), pam_attempts) {
+        log_daemon(Severity::Low, &format!("PAM socket unavailable: {:#}", e));
     }
     if sources.auth == authlog::AuthSource::None && !sources.pam {
         log_daemon(
