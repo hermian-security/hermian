@@ -6,6 +6,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- README install steps are shorter, cover the tarball path properly, and add
+  optional origin checks with `gh attestation verify` or `cosign verify-blob`,
+  plus upgrade and uninstall sections.
+- Releases carry GitHub build attestations, and their notes are this
+  changelog's section for the version with a link to the install steps.
+
 ## 0.1.0-beta.4 - 2026-09-23
 
 ### Security

@@ -145,25 +145,32 @@ prerelease. Docs, CI, and chore-only changes don't get a tag.
 
 Record notes under Unreleased while the PR is open. The release prep PR bumps
 `workspace.package.version` (next `0.1.0-beta.N` during beta), updates
-Cargo.lock to match, and moves those notes into a dated section. Don't mix the
-bump into the feat/fix PR. Don't run a blanket `cargo update` just to change
-the workspace version.
+Cargo.lock to match (`cargo update --workspace`), and moves those notes into a
+dated `## x.y.z - YYYY-MM-DD` section. Don't mix the bump into the feat/fix PR.
+Don't run a blanket `cargo update` just to change the workspace version.
+
+That changelog section becomes the GitHub release notes verbatim, and the
+workflow fails without one. Put anything users must do once after upgrading
+under an `### Upgrade` heading in it. Install commands live only in the
+README's Install section; the release notes link to it at the tag.
 
 Release procedure:
 
 1. User-facing change is on `main` with green CI.
 2. Open `release/x.y.z` with the version bump, changelog move, and README
-   `VER=` (plus the same pin in `docs/ROADMAP-BURN-IN.md` if it still has one).
+   `VER=` pins (Install section).
 3. Merge it through the normal PR checks.
 4. Wait for CI on that `main` commit. A green PR build isn't enough.
 5. Tag `v` + that exact version on that commit and push only that tag.
-6. Watch `release.yml`, then `sha256sum -c SHA256SUMS`. Don't move a failed tag.
+6. Watch `release.yml`, then check the published files as the README describes
+   (`sha256sum -c`, `gh attestation verify`, `cosign verify-blob`). Don't move a
+   failed tag.
 
 Example commands, only after the version has been prepared and approved:
 
 ```sh
-git tag -a v0.1.0-beta.2 -m "HERMIAN 0.1.0-beta.2"
-git push origin v0.1.0-beta.2
+git tag -a v0.1.0-beta.5 -m "HERMIAN 0.1.0-beta.5"
+git push origin v0.1.0-beta.5
 gh run list --workflow release.yml
 ```
 
