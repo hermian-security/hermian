@@ -36,7 +36,7 @@ const RETENTION_WINDOWS: i32 = 12;
 impl Deduper {
     pub fn new(window_secs: u64) -> Self {
         Deduper {
-            window: Duration::seconds(window_secs.max(1) as i64),
+            window: Duration::seconds(window_secs.clamp(1, crate::config::MAX_WINDOW_SECS) as i64),
             entries: HashMap::new(),
         }
     }

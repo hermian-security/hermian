@@ -42,7 +42,7 @@ are the detailed rule reference, including exemptions and severity choices.
 
 | Group | Looks for |
 | --- | --- |
-| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells, download-and-exec chains, transient or deleted executables |
+| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (through `env`/`setsid`-style wrappers), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
 | [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
 | [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron, shell profiles, SSH keys, and systemd changes |
 | [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
@@ -55,6 +55,12 @@ miss events or lack the context a rule needs.
 
 A web server spawning a shell is HIGH. A normal shell under an SSH session
 isn't. File rules also distinguish operator edits from unattended writes.
+
+Roles that exempt a process (package and config managers, user tools,
+debuggers, session daemons) need its executable in a root-owned system
+directory; a binary merely named `dpkg` doesn't count. Script tools such as
+dnf or Debian's adduser are identified by name under a system interpreter,
+so a script with such a name run by that interpreter can still pass.
 
 inotify doesn't identify the writer. The daemon tries to find an open file
 descriptor; some rules also look for a recent admin tool. If the writer is

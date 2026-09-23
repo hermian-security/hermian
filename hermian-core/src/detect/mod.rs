@@ -94,6 +94,22 @@ impl<'a> Ctx<'a> {
         })
     }
 
+    /// Whether a trusted tool (crontab, usermod, visudo, systemctl, a package
+    /// manager...) running as `pid` may be exempted from file rules.
+    ///
+    /// The real `crontab` or `usermod` run from a web shell is still a web
+    /// shell planting persistence, so the exemption needs an ordinary origin:
+    /// no web server or database in the chain and no recent D1 flag on it.
+    pub fn tool_exemption_applies(&self, pid: u32) -> bool {
+        let service_origin = self.tree.chain_of(pid).iter().any(|p| {
+            matches!(
+                crate::proctree::role_of(&p.comm, &p.exe),
+                crate::proctree::Role::WebServer | crate::proctree::Role::Database
+            )
+        });
+        !service_origin && !self.has_recent_flag(pid, 600, Some(DetectionId::D1))
+    }
+
     /// Structured process chain for `pid`, focus on the last node.
     pub fn chain_nodes(&self, pid: u32) -> Vec<ChainNode> {
         chain_from_procs(&self.tree.chain_of(pid), self.user_names)
