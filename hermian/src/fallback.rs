@@ -163,7 +163,7 @@ fn proc_poller_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                 pid: info.pid,
                 ppid: info.ppid,
                 uid: info.uid,
-                gid: info.uid,
+                gid: procsrc::gid_of(info.pid).unwrap_or(info.uid),
                 comm: info.comm,
                 argv0: procsrc::cmdline_of(info.pid).unwrap_or_else(|| info.exe.clone()),
                 exe: info.exe,

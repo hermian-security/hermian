@@ -14,8 +14,8 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    auditnetlink, authlog, config, ebpf, fallback, isolate, notify, pamsock, paths, procsrc,
-    selfprotect, status, watchers,
+    auditnetlink, authlog, config, configdiff, ebpf, fallback, isolate, notify, pamsock, paths,
+    procsrc, selfprotect, status, watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -103,7 +103,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             failures: s.failures,
             pending: 0,
             last_error: String::new(),
-            per_channel: Default::default(),
+            ..Default::default()
         })
         .unwrap_or_default();
     let notifier =
@@ -304,6 +304,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let now = Utc::now();
+                engine.reap_exited(&procsrc::live_pids(), now);
                 for a in engine.tick(now) {
                     notifier.send(a);
                 }
@@ -517,33 +518,40 @@ fn reload_config(
         .and_then(|c| c.validate().map(|_| c).map_err(|e| e.to_string()));
     match parsed {
         Ok(new_cfg) => {
-            let summary = describe_changes(current_cfg, &new_cfg);
+            let diff = configdiff::diff(current_cfg, &new_cfg);
+            let functional = diff.is_functional();
+            let alert = self_alert(
+                engine,
+                if functional {
+                    Severity::Critical
+                } else {
+                    Severity::Info
+                },
+                if !functional {
+                    "HERMIAN configuration reloaded with no functional change"
+                } else if diff.destinations_changed {
+                    "HERMIAN alert destinations changed and reloaded"
+                } else {
+                    "HERMIAN configuration changed and reloaded"
+                },
+                "The configuration file changed while the daemon was running. It validated and has been applied.",
+                "Changing a security daemon's configuration at runtime is how an attacker blinds a host. If this was you, no action is needed.",
+                &["Confirm the change was yours.", "Review the active configuration with 'hermian status'."],
+                &[("Trigger", trigger), ("Changes", &diff.summary), ("Config hash", &new_hash)],
+                "selfprotect|config-reload",
+            );
+            // If alerts are being repointed, the old destinations must hear
+            // about it too: otherwise the notice goes only to whoever did it.
+            if diff.destinations_changed {
+                if let Some(a) = &alert {
+                    notify_old_destinations(a.clone(), current_cfg.notifications.clone());
+                }
+            }
             engine.set_config(new_cfg.clone(), new_cfg.allowlist.clone());
             notifier.reconfigure(new_cfg.notifications.clone());
             *current_cfg = new_cfg;
             let _ = selfprotect::update_config_hash(&new_hash);
-            let functional = summary != "no functional change";
-            emit_self(
-                notifier,
-                self_alert(
-                    engine,
-                    if functional {
-                        Severity::Critical
-                    } else {
-                        Severity::Info
-                    },
-                    if functional {
-                        "HERMIAN configuration changed and reloaded"
-                    } else {
-                        "HERMIAN configuration reloaded with no functional change"
-                    },
-                    "The configuration file changed while the daemon was running. It validated and has been applied.",
-                    "Changing a security daemon's configuration at runtime is how an attacker blinds a host. If this was you, no action is needed.",
-                    &["Confirm the change was yours.", "Review the active configuration with 'hermian status'."],
-                    &[("Trigger", trigger), ("Changes", &summary), ("Config hash", &new_hash)],
-                    "selfprotect|config-reload",
-                ),
-            );
+            emit_self(notifier, alert);
         }
         Err(e) => {
             emit_self(
@@ -563,88 +571,24 @@ fn reload_config(
     }
 }
 
-fn describe_changes(old: &Config, new: &Config) -> String {
-    let mut out = Vec::new();
-    let d = |name: &str, a: bool, b: bool, out: &mut Vec<String>| {
-        if a != b {
-            out.push(format!(
-                "{} {}",
-                name,
-                if b { "enabled" } else { "disabled" }
-            ));
-        }
-    };
-    d(
-        "D1",
-        old.detections.d1_process_chains,
-        new.detections.d1_process_chains,
-        &mut out,
-    );
-    d(
-        "D2",
-        old.detections.d2_auth,
-        new.detections.d2_auth,
-        &mut out,
-    );
-    d(
-        "D3",
-        old.detections.d3_persistence,
-        new.detections.d3_persistence,
-        &mut out,
-    );
-    d(
-        "D4",
-        old.detections.d4_priv_esc,
-        new.detections.d4_priv_esc,
-        &mut out,
-    );
-    d(
-        "D5",
-        old.detections.d5_network,
-        new.detections.d5_network,
-        &mut out,
-    );
-    d(
-        "auto_isolate",
-        old.response.auto_isolate,
-        new.response.auto_isolate,
-        &mut out,
-    );
-    d(
-        "permit_root",
-        old.ssh.permit_root,
-        new.ssh.permit_root,
-        &mut out,
-    );
-    let count = |a: &hermian_core::Allowlist| {
-        a.process_chains.len()
-            + a.persistence.len()
-            + a.ssh_sources.len()
-            + a.binaries.len()
-            + a.destinations.len()
-            + a.debuggers.len()
-    };
-    let (oa, na) = (count(&old.allowlist), count(&new.allowlist));
-    if oa != na {
-        out.push(format!("allowlist entries {} -> {}", oa, na));
-    }
-    if old.notifications.channels != new.notifications.channels {
-        out.push(format!(
-            "channels -> {}",
-            new.notifications.channels.join(",")
-        ));
-    }
-    if old.notifications.min_severity != new.notifications.min_severity {
-        out.push(format!(
-            "min_severity -> {}",
-            new.notifications.min_severity
-        ));
-    }
-    if out.is_empty() {
-        "no functional change".to_string()
-    } else {
-        out.join("; ")
-    }
+/// Best-effort, one-shot delivery to the notifying channels of a config that
+/// is about to be replaced. Runs off the event loop; failures are only logged.
+fn notify_old_destinations(alert: Alert, old: hermian_core::config::NotificationsCfg) {
+    let _ = std::thread::Builder::new()
+        .name("hermian-old-dest".into())
+        .spawn(move || {
+            for ch in notify::NOTIFYING_CHANNELS {
+                if *ch == "stdout" || !old.has_channel(ch) {
+                    continue;
+                }
+                if let Err(e) = notify::notify_one(ch, &alert, &old) {
+                    log_daemon(
+                        Severity::Low,
+                        &format!("could not tell the previous {} destination: {}", ch, e),
+                    );
+                }
+            }
+        });
 }
 
 fn emit_self(notifier: &notify::Notifier, alert: Option<Alert>) {

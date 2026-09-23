@@ -2,7 +2,7 @@
 
 use crate::alert::Finding;
 use crate::detect::Ctx;
-use crate::events::{is_suspicious_exec_dir, DetectionId, ExecEvent, Severity};
+use crate::events::{is_suspicious_exec_dir, DetectionId, ExecEvent, ProcInfo, Severity};
 use crate::proctree::{role_of, Role};
 
 pub fn evaluate(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
@@ -27,16 +27,46 @@ pub fn evaluate(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     findings
 }
 
+/// Programs that only set something up and then exec the real command.
+/// `env sh`, `setsid bash`, `nohup sh -c` (or Java's Runtime.exec through
+/// `/usr/bin/env`) put one of these between the service and the shell.
+const WRAPPERS: &[&str] = &[
+    "env", "setsid", "nohup", "timeout", "nice", "ionice", "stdbuf", "chrt", "taskset", "xargs",
+    "script", "unbuffer", "flock",
+];
+
+fn is_wrapper(p: &ProcInfo) -> bool {
+    let base = p.exe.rsplit('/').next().unwrap_or("");
+    WRAPPERS.contains(&p.comm.as_str()) || WRAPPERS.contains(&base)
+}
+
+/// Index of the nearest ancestor of `chain[last]` that isn't a wrapper.
+fn effective_parent(chain: &[ProcInfo], last: usize) -> Option<usize> {
+    (0..last).rev().find(|i| !is_wrapper(&chain[*i]))
+}
+
+/// Tools that open a raw network channel: reverse/bind shells, relays.
+const NETCAT_LIKE: &[&str] = &["nc", "ncat", "netcat", "socat", "openssl", "telnet"];
+
 fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) -> Option<Finding> {
     if roles.len() < 2 {
         return None;
     }
     let last = roles.len() - 1;
-    if roles[last] != Role::Shell || roles[last - 1] != service {
+    let chain = ctx.tree.chain_of(ev.pid);
+    let parent_idx = effective_parent(&chain, last)?;
+    if roles[parent_idx] != service {
         return None;
     }
-    let chain = ctx.tree.chain_of(ev.pid);
-    let parent = &chain[last - 1];
+    // Shells always; downloaders and netcat-style tools are the next most
+    // common first step. General interpreters are logged, since apps do run
+    // `php artisan` or `python manage.py` legitimately.
+    let base = ev.exe.rsplit('/').next().unwrap_or("");
+    let netcat = NETCAT_LIKE.contains(&ev.comm.as_str()) || NETCAT_LIKE.contains(&base);
+    if roles[last] != Role::Shell {
+        return service_to_tool(ev, ctx, &chain, parent_idx, roles[last], netcat, service);
+    }
+    let parent = &chain[parent_idx];
     if ctx
         .allowlist
         .chain_allowed(&parent.comm, &ev.comm, Some(ev.uid), ctx.user_name(ev.uid))
@@ -95,6 +125,95 @@ fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) ->
     )
 }
 
+fn service_to_tool(
+    ev: &ExecEvent,
+    ctx: &Ctx,
+    chain: &[ProcInfo],
+    parent_idx: usize,
+    role: Role,
+    netcat: bool,
+    service: Role,
+) -> Option<Finding> {
+    let severity = if netcat || role == Role::Downloader {
+        Severity::High
+    } else if role == Role::Interpreter {
+        Severity::Low
+    } else {
+        return None;
+    };
+    let parent = &chain[parent_idx];
+    if ctx
+        .allowlist
+        .chain_allowed(&parent.comm, &ev.comm, Some(ev.uid), ctx.user_name(ev.uid))
+    {
+        return None;
+    }
+    let svc = if service == Role::WebServer {
+        "Web server"
+    } else {
+        "Database server"
+    };
+    let (title, why) = if netcat {
+        (
+            format!("{} spawned a network relay tool", svc),
+            "nc, socat and similar tools are how reverse and bind shells are opened; a service \
+             has no reason to start one.",
+        )
+    } else if role == Role::Downloader {
+        (
+            format!("{} spawned a download tool", svc),
+            "Fetching content with curl or wget straight from a service process is the staging \
+             step of most remote code execution chains.",
+        )
+    } else {
+        (
+            format!("{} spawned an interpreter", svc),
+            "Some applications run scripts this way; it's also how injected code gets a full \
+             interpreter without a shell. Logged for context.",
+        )
+    };
+    Some(
+        Finding::new(
+            DetectionId::D1,
+            severity,
+            &title,
+            &format!("d1|service-tool|{}|{}|{}", parent.comm, parent.pid, ev.comm),
+        )
+        .what(format!(
+            "{} (pid {}) started {} (pid {}) running as {}.",
+            parent.comm,
+            parent.pid,
+            ev.comm,
+            ev.pid,
+            ctx.user_name(ev.uid).unwrap_or("an unknown user")
+        ))
+        .chain(ctx.chain_nodes(ev.pid))
+        .fact("Command", &ev.argv0)
+        .why(why)
+        .actions([
+            "Review the service's logs for the request that coincides with this alert.",
+            "Identify the application component that started the process.",
+            "Allowlist the parent/child pair if this is expected behaviour.",
+        ]),
+    )
+}
+
+/// A downloader that ran recently from the web-shell part of this chain:
+/// `curl ... | sh` and `curl -o x; ./x` make the payload the downloader's
+/// *sibling*, not its child.
+fn recent_sibling_download<'a>(
+    ctx: &'a Ctx,
+    chain: &[ProcInfo],
+    from: usize,
+    last: usize,
+) -> Option<&'a ProcInfo> {
+    let shell_pids: Vec<u32> = chain[from..last].iter().map(|p| p.pid).collect();
+    ctx.tree
+        .recent_process(ctx.now, chrono::Duration::seconds(120), |p| {
+            shell_pids.contains(&p.ppid) && role_of(&p.comm, &p.exe) == Role::Downloader
+        })
+}
+
 fn web_shell_downloader_exec(ev: &ExecEvent, ctx: &Ctx, roles: &[Role]) -> Option<Finding> {
     let last = roles.len().checked_sub(1)?;
     let web_idx = roles.iter().position(|r| *r == Role::WebServer)?;
@@ -134,10 +253,20 @@ fn web_shell_downloader_exec(ev: &ExecEvent, ctx: &Ctx, roles: &[Role]) -> Optio
     }
 
     let parent_is_downloader = last >= 1 && roles[last - 1] == Role::Downloader;
-    if !parent_is_downloader {
-        return None;
-    }
-    let parent = &chain[last - 1];
+    // The payload: a shell/interpreter or a binary outside system dirs, run
+    // after a download from the same web-shell chain.
+    let payload_like = matches!(roles[last], Role::Shell | Role::Interpreter)
+        || !crate::proctree::is_system_exe_path(&ev.exe);
+    let sibling = if parent_is_downloader || !payload_like || last <= shell_idx {
+        None
+    } else {
+        recent_sibling_download(ctx, &chain, shell_idx, last)
+    };
+    let parent = match (parent_is_downloader, sibling) {
+        (true, _) => &chain[last - 1],
+        (false, Some(dl)) => dl,
+        (false, None) => return None,
+    };
     if ctx
         .allowlist
         .chain_allowed(&parent.comm, &ev.comm, Some(ev.uid), ctx.user_name(ev.uid))
@@ -194,7 +323,7 @@ fn exec_from_transient_dir(ev: &ExecEvent, ctx: &Ctx) -> Option<Finding> {
             role_of(&p.comm, &p.exe),
             Role::PackageManager | Role::ConfigManager
         )
-    });
+    }) && ctx.tool_exemption_applies(ev.pid);
 
     // Severity ladder: flagged chain > unattended > interactive/installer.
     let (severity, title) = if in_flagged {
