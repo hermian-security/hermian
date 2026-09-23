@@ -19,7 +19,9 @@ fn load_all() -> Result<Vec<Alert>> {
         .flatten()
         .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
         .filter_map(|e| fs::read_to_string(e.path()).ok())
-        .filter_map(|t| serde_json::from_str(&t).ok())
+        .filter_map(|t| serde_json::from_str::<Alert>(&t).ok())
+        // Files written before escaping existed may hold raw control chars.
+        .map(Alert::sanitized)
         .collect();
     // Newest first; the ref id is a monotonic per-day sequence so it breaks
     // ties between alerts raised in the same instant.
@@ -114,20 +116,27 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Accept a full ref or a bare sequence number for today.
-fn resolve_ref(input: &str) -> String {
+/// Accept a full ref or a bare sequence number for today. Anything else is
+/// rejected: the result becomes part of a file path.
+fn resolve_ref(input: &str) -> Option<String> {
     let trimmed = input.trim();
-    if trimmed.to_ascii_uppercase().starts_with("HER-") {
-        return trimmed.to_ascii_uppercase();
-    }
     if let Ok(n) = trimmed.parse::<u32>() {
-        return format!("HER-{}-{:03}", Utc::now().format("%Y-%m%d"), n);
+        return Some(format!("HER-{}-{:03}", Utc::now().format("%Y-%m%d"), n));
     }
-    trimmed.to_string()
+    let upper = trimmed.to_ascii_uppercase();
+    let valid = upper.starts_with("HER-")
+        && upper.len() <= 64
+        && upper.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    valid.then_some(upper)
 }
 
 pub fn load_alert(ref_id: &str) -> Result<Alert> {
-    let ref_id = resolve_ref(ref_id);
+    let ref_id = resolve_ref(ref_id).ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' is not an alert reference (e.g. HER-2026-0923-004 or 4)",
+            ref_id.escape_debug()
+        )
+    })?;
     let path = paths::alerts_dir().join(format!("{}.json", ref_id));
     let text = fs::read_to_string(&path).with_context(|| {
         format!(
@@ -136,7 +145,9 @@ pub fn load_alert(ref_id: &str) -> Result<Alert> {
             paths::alerts_dir().display()
         )
     })?;
-    serde_json::from_str(&text).context("alert file is corrupt")
+    serde_json::from_str::<Alert>(&text)
+        .map(Alert::sanitized)
+        .context("alert file is corrupt")
 }
 
 pub fn cmd_show(args: &ShowArgs) -> Result<()> {
@@ -147,4 +158,21 @@ pub fn cmd_show(args: &ShowArgs) -> Result<()> {
         print!("{}", render(&alert, Style::detect().theme()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refs_cannot_escape_the_alerts_dir() {
+        assert_eq!(
+            resolve_ref("her-2026-0923-004").as_deref(),
+            Some("HER-2026-0923-004")
+        );
+        assert!(resolve_ref("7").unwrap().ends_with("-007"));
+        assert!(resolve_ref("../../etc/shadow").is_none());
+        assert!(resolve_ref("HER-../../x").is_none());
+        assert!(resolve_ref("/etc/passwd").is_none());
+    }
 }

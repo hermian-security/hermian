@@ -20,7 +20,11 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
         return findings;
     }
 
-    let window = ctx.cfg.ssh.failed_burst_window_secs as i64;
+    let window = ctx
+        .cfg
+        .ssh
+        .failed_burst_window_secs
+        .clamp(1, crate::config::MAX_WINDOW_SECS) as i64;
     let threshold = ctx.cfg.ssh.failed_burst_count as usize;
 
     match ev.result {
