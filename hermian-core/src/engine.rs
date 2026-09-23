@@ -563,6 +563,81 @@ mod tests {
     }
 
     #[test]
+    fn curl_pipe_sh_from_a_web_shell_is_critical() {
+        // Realistic shape: the payload is the downloader's sibling.
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, 33, "curl", "/usr/bin/curl"));
+        let piped = eng.process(exec(t, 301, 200, 33, "sh", "/usr/bin/dash"));
+        assert!(
+            has(&piped, DetectionId::D1, Severity::Critical),
+            "{:?}",
+            piped
+        );
+    }
+
+    #[test]
+    fn curl_then_run_from_a_web_shell_is_critical() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "php-fpm", "/usr/sbin/php-fpm8.2"));
+        eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, 33, "wget", "/usr/bin/wget"));
+        let run = eng.process(exec(
+            t + Duration::seconds(3),
+            301,
+            200,
+            33,
+            "x",
+            "/var/www/html/uploads/x",
+        ));
+        assert!(has(&run, DetectionId::D1, Severity::Critical), "{:?}", run);
+        // Ordinary tools in the same shell aren't escalated.
+        let grep = eng.process(exec(t, 302, 200, 33, "grep", "/usr/bin/grep"));
+        assert!(
+            !has(&grep, DetectionId::D1, Severity::Critical),
+            "{:?}",
+            grep
+        );
+    }
+
+    #[test]
+    fn web_server_children_beyond_shells() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        let nc = eng.process(exec(t, 201, 100, 33, "nc", "/usr/bin/nc.openbsd"));
+        assert!(has(&nc, DetectionId::D1, Severity::High), "{:?}", nc);
+        let curl = eng.process(exec(t, 202, 100, 33, "curl", "/usr/bin/curl"));
+        assert!(has(&curl, DetectionId::D1, Severity::High), "{:?}", curl);
+        let py = eng.process(exec(t, 203, 100, 33, "python3", "/usr/bin/python3.12"));
+        assert!(has(&py, DetectionId::D1, Severity::Low), "{:?}", py);
+        assert!(!has(&py, DetectionId::D1, Severity::High));
+    }
+
+    #[test]
+    fn wrappers_between_web_server_and_shell_are_seen_through() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "env", "/usr/bin/env"));
+        // env execs sh in the same pid.
+        let a = eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
+        assert!(has(&a, DetectionId::D1, Severity::High), "{:?}", a);
+        // setsid as a separate process (another worker, so dedup doesn't hide it).
+        eng.process(exec(t, 110, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 300, 110, 33, "setsid", "/usr/bin/setsid"));
+        let b = eng.process(exec(t, 301, 300, 33, "bash", "/usr/bin/bash"));
+        assert!(has(&b, DetectionId::D1, Severity::High), "{:?}", b);
+    }
+
+    #[test]
     fn transient_exec_inside_flagged_chain_is_critical() {
         let mut eng = engine_without_baseline();
         let t = Utc::now();

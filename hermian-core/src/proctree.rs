@@ -240,6 +240,21 @@ pub fn is_user_mgmt_tool(comm: &str) -> bool {
     comm_matches(comm, USER_MGMT)
 }
 
+/// Whether `exe` is under a directory where installed software lives, as
+/// opposed to somewhere a payload would be dropped.
+pub fn is_system_exe_path(exe: &str) -> bool {
+    const DIRS: &[&str] = &[
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/snap/",
+        "/nix/store/",
+    ];
+    !exe.contains("/../") && DIRS.iter().any(|d| exe.starts_with(d))
+}
+
 #[derive(Debug, Default)]
 pub struct ProcessTree {
     procs: HashMap<u32, ProcInfo>,
