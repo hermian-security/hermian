@@ -43,6 +43,11 @@ pub fn save_default_config() -> Result<()> {
 
 /// Write `content` to `path` with mode 0600 atomically (temp file + rename).
 pub fn write_secure(path: &Path, content: &str) -> Result<()> {
+    write_secure_bytes(path, content.as_bytes())
+}
+
+/// Byte version of [`write_secure`].
+pub fn write_secure_bytes(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(
@@ -60,7 +65,7 @@ pub fn write_secure(path: &Path, content: &str) -> Result<()> {
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
-        f.write_all(content.as_bytes())?;
+        f.write_all(content)?;
         f.sync_all()?;
     }
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;

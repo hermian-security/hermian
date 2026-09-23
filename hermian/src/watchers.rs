@@ -98,10 +98,23 @@ fn is_interesting(path: &str) -> bool {
                         | ".zlogin"
                 )
         }
+        // Enable links and drop-ins. These dirs were already watched, but
+        // their events were thrown away here.
+        p if is_systemd_subdir(p) => true,
         _ => WATCH_DIRS
             .iter()
             .any(|d| *d != "/etc" && *d != "/root" && *d != "/etc/ssh" && parent == *d),
     }
+}
+
+/// `/etc/systemd/system/<x>.wants`, `.requires` or `.d` (drop-ins).
+fn is_systemd_subdir(dir: &str) -> bool {
+    dir.strip_prefix("/etc/systemd/system/")
+        .map(|name| {
+            !name.contains('/')
+                && (name.ends_with(".wants") || name.ends_with(".requires") || name.ends_with(".d"))
+        })
+        .unwrap_or(false)
 }
 
 const MASK: WatchMask = WatchMask::MODIFY
@@ -206,7 +219,8 @@ fn systemd_target_dirs() -> Vec<PathBuf> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            (name.ends_with(".wants") || name.ends_with(".requires")) && e.path().is_dir()
+            (name.ends_with(".wants") || name.ends_with(".requires") || name.ends_with(".d"))
+                && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
         })
         .map(|e| e.path())
         .collect()
@@ -539,7 +553,7 @@ fn content_for(path: &str, is_config: bool) -> Option<String> {
         || name.starts_with(".z")
         || name == ".profile";
     if tracked {
-        procsrc::read_file(path)
+        procsrc::read_regular_file(path)
     } else {
         None
     }
@@ -559,6 +573,13 @@ mod tests {
         assert!(is_interesting("/home/dev/.zshrc"));
         assert!(is_interesting("/home/dev/.ssh/authorized_keys"));
         assert!(is_interesting("/etc/systemd/system/x.service"));
+        assert!(is_interesting(
+            "/etc/systemd/system/multi-user.target.wants/x.service"
+        ));
+        assert!(is_interesting(
+            "/etc/systemd/system/ssh.service.d/override.conf"
+        ));
+        assert!(!is_interesting("/etc/systemd/system/a.d/b/c.conf"));
         assert!(!is_interesting("/etc/hosts"));
         assert!(!is_interesting("/etc/ssh/moduli"));
         assert!(!is_interesting("/root/notes.txt"));
