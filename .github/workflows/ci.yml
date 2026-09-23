@@ -21,8 +21,8 @@ jobs:
     name: validation harness (non-root)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.8'
       - name: Lint workflow definitions
@@ -35,6 +35,8 @@ jobs:
       - run: sh -n tests/false_positives/run_false_positive.sh
       - run: sh -n tests/helpers/disposable_host.sh
       - run: sh -n tests/soak/start.sh
+      - name: sh -n on packaging scripts
+        run: for f in packaging/install.sh packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm; do sh -n "$f"; done
 
   core:
     name: core (${{ matrix.os }})
@@ -43,52 +45,59 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p hermian-core --all-targets -- -D warnings
-      - run: cargo test -p hermian-core
+      - run: cargo clippy -p hermian-core --all-targets --locked -- -D warnings
+      - run: cargo test -p hermian-core --locked
 
   linux:
     name: daemon + eBPF (linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           components: rust-src
       - run: rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install libpam
         run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
       # bpf-linker via `cargo install` needs a matching system LLVM (21+),
       # which no runner image has. The project publishes static musl binaries
       # with LLVM bundled; use those.
+      # Pinned by checksum as well as version: this binary runs with the
+      # job's permissions and produces the object we compare against.
       - name: Install bpf-linker (prebuilt, static)
         env:
           BPF_LINKER_VERSION: v0.11.1
+          BPF_LINKER_SHA256: e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8
         run: |
           curl -fsSL "https://github.com/aya-rs/bpf-linker/releases/download/${BPF_LINKER_VERSION}/bpf-linker-x86_64-unknown-linux-musl.tar.zst" -o /tmp/bl.tar.zst
+          echo "${BPF_LINKER_SHA256}  /tmp/bl.tar.zst" | sha256sum -c -
           sudo tar --zstd -xf /tmp/bl.tar.zst -C /usr/local/bin bpf-linker
           bpf-linker --version
       # Build the eBPF object from source and refuse the vendored fallback, so a
       # stale hermian-ebpf/prebuilt/hermian-ebpf.o fails CI instead of shipping.
-      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo clippy --all-targets -- -D warnings
-      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release
+      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo clippy --all-targets --locked -- -D warnings
+      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked
       - name: nft accepts the isolation ruleset
         run: |
           sudo apt-get install -y nftables
-          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release -p hermian --no-run --message-format=json \
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked -p hermian --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
           test -n "$BIN"
           sudo "$BIN" --ignored --exact isolate::tests::nft_accepts_the_ruleset
-      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release
+      - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
       - name: Vendored eBPF object is current
         run: |
           OBJ=$(find target/release/build -path '*/ebpf-target/bpfel-unknown-none/release/hermian-ebpf' | head -1)
@@ -101,11 +110,11 @@ jobs:
       # kernel's verifier and checks the LD_PRELOAD scan end to end.
       - name: Load the eBPF object (verifier + live exec event)
         run: |
-          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release -p hermian --no-run --message-format=json \
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked -p hermian --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
           test -n "$BIN"
           sudo "$BIN" --ignored --test-threads=1 ebpf::tests::
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hermian-linux-amd64
           path: |
