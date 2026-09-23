@@ -160,58 +160,156 @@ const CONTAINER_RUNTIMES: &[&str] = &[
     "systemd-nspawn",
 ];
 
+/// Tools that are scripts, so their exe is the interpreter and only comm
+/// names them. (Debian's adduser is Perl; dnf, ansible and friends are Python.)
+const SCRIPT_TOOLS: &[&str] = &[
+    "adduser",
+    "deluser",
+    "addgroup",
+    "delgroup",
+    "unattended-upgrade",
+    "yum",
+    "dnf",
+    "ansible",
+    "ansible-playbook",
+    "salt-minion",
+    "salt-call",
+    "cloud-init",
+    "puppet",
+    "chef-client",
+    "chef-solo",
+];
+
+const SCRIPT_INTERPRETERS: &[&str] = &[
+    "python", "python2", "python3", "perl", "ruby", "sh", "bash", "dash",
+];
+
+const CRON_DAEMONS: &[&str] = &["cron", "crond", "anacron", "atd"];
+const INIT: &[&str] = &["systemd", "init"];
+const KERNEL_THREADS: &[&str] = &["kthreadd", "rcu_sched", "migration"];
+
+/// Root-owned install locations. Only a binary installed here can claim a
+/// role that exempts it from detection.
+const TRUSTED_EXE_DIRS: &[&str] = &[
+    "/usr/bin/",
+    "/usr/sbin/",
+    "/bin/",
+    "/sbin/",
+    "/usr/lib/",
+    "/usr/lib64/",
+    "/usr/libexec/",
+    "/lib/",
+    "/lib64/",
+    "/usr/local/bin/",
+    "/usr/local/sbin/",
+    "/usr/local/lib/",
+    "/opt/",
+    "/snap/",
+    "/nix/store/",
+];
+
+/// Whether `exe` is an intact binary in a root-owned install location.
+pub fn is_trusted_exe(exe: &str) -> bool {
+    !exe.ends_with(" (deleted)")
+        && !exe.contains("/../")
+        && !exe.contains("/./")
+        && !exe.contains("//")
+        && TRUSTED_EXE_DIRS.iter().any(|d| exe.starts_with(d))
+}
+
+fn exe_basename(exe: &str) -> &str {
+    exe.trim_end_matches(" (deleted)")
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// Is this process one of the tools in `names`, judged in a way a local user
+/// can't fake?
+///
+/// `comm` is just the binary's file name (or whatever `prctl` set), so a copy
+/// of anything at `/tmp/dpkg` has comm "dpkg". When the exe is known it must
+/// sit in a root-owned directory and either be named like the tool or be a
+/// script interpreter running a known script tool. With no exe (the process
+/// vanished before /proc was read) we fall back to comm.
+pub fn is_system_tool(comm: &str, exe: &str, names: &[&str]) -> bool {
+    let c = comm.trim();
+    if exe.is_empty() {
+        return comm_matches(c, names);
+    }
+    if !is_trusted_exe(exe) {
+        return false;
+    }
+    let base = exe_basename(exe);
+    if comm_matches(base, names) {
+        return true;
+    }
+    comm_matches(base, SCRIPT_INTERPRETERS)
+        && comm_matches(c, names)
+        && comm_matches(c, SCRIPT_TOOLS)
+}
+
 pub fn role_of(comm: &str, exe: &str) -> Role {
     let c = comm.trim();
-    if comm_matches(c, WEB_SERVERS) || exe_contains(exe, &["php-fpm"]) {
+    let base = exe_basename(exe);
+    // Roles that add suspicion match comm *or* exe name: renaming a copied
+    // shell mustn't hide it.
+    let named = |set: &[&str]| comm_matches(c, set) || comm_matches(base, set);
+    // Roles that exempt a process from detection need a trusted exe.
+    let tool = |set: &[&str]| is_system_tool(c, exe, set);
+    if named(WEB_SERVERS) || exe_contains(exe, &["php-fpm"]) {
         return Role::WebServer;
     }
-    if comm_matches(c, DATABASES) {
+    if named(DATABASES) {
         return Role::Database;
     }
-    if c == "sshd" || c == "sshd-session" {
+    if tool(&["sshd", "sshd-session"]) {
         return Role::Sshd;
     }
-    if comm_matches(c, SHELLS) {
-        return Role::Shell;
-    }
-    if comm_matches(c, DOWNLOADERS) {
-        return Role::Downloader;
-    }
-    if comm_matches(c, INTERPRETERS) || exe_contains(exe, &["/php"]) {
-        return Role::Interpreter;
-    }
-    if comm_matches(c, PACKAGE_MANAGERS) {
+    // Tools before shells/interpreters: dnf or adduser's exe *is* python/perl.
+    if tool(PACKAGE_MANAGERS) {
         return Role::PackageManager;
     }
-    if comm_matches(c, CONFIG_MANAGERS) {
+    if tool(CONFIG_MANAGERS) {
         return Role::ConfigManager;
     }
-    if comm_matches(c, DEBUGGERS) {
+    if tool(DEBUGGERS) {
         return Role::Debugger;
     }
-    if comm_matches(c, USER_MGMT) {
+    if tool(USER_MGMT) {
         return Role::UserMgmt;
     }
-    if matches!(c, "cron" | "crond" | "anacron" | "atd") {
+    if tool(CRON_DAEMONS) {
         return Role::Cron;
     }
-    if matches!(
-        c,
-        "systemd" | "init" | "kthreadd" | "rcu_sched" | "migration"
-    ) {
+    // Kernel threads have no exe at all.
+    if tool(INIT) || (exe.is_empty() && comm_matches(c, KERNEL_THREADS)) {
         return Role::System;
+    }
+    if named(SHELLS) {
+        return Role::Shell;
+    }
+    if named(DOWNLOADERS) {
+        return Role::Downloader;
+    }
+    if named(INTERPRETERS) || exe_contains(exe, &["/php"]) {
+        return Role::Interpreter;
     }
     Role::Unknown
 }
 
 /// Match `comm` against a set, tolerating versioned or annotated names such as
-/// `python3.11`, `nginx: worker`, `php-fpm8.2`.
+/// `python3.11`, `nginx: worker`, `php-fpm8.2`, and the kernel's 15-char comm
+/// truncation (`unattended-upgr`).
 fn comm_matches(c: &str, set: &[&str]) -> bool {
     if c.is_empty() {
         return false;
     }
     set.iter().any(|k| {
         if *k == c {
+            return true;
+        }
+        if c.len() == 15 && k.len() > 15 && k.starts_with(c) {
             return true;
         }
         match c.strip_prefix(k) {
@@ -228,21 +326,47 @@ fn exe_contains(exe: &str, needles: &[&str]) -> bool {
     !exe.is_empty() && needles.iter().any(|n| exe.contains(n))
 }
 
-pub fn is_session_daemon(comm: &str) -> bool {
-    comm_matches(comm, SESSION_DAEMONS)
+pub fn is_session_daemon(comm: &str, exe: &str) -> bool {
+    is_system_tool(comm, exe, SESSION_DAEMONS)
 }
 
-pub fn is_container_runtime(comm: &str) -> bool {
-    comm_matches(comm, CONTAINER_RUNTIMES)
+pub fn is_container_runtime(comm: &str, exe: &str) -> bool {
+    is_system_tool(comm, exe, CONTAINER_RUNTIMES)
 }
 
-pub fn is_user_mgmt_tool(comm: &str) -> bool {
-    comm_matches(comm, USER_MGMT)
+pub fn is_user_mgmt_tool(comm: &str, exe: &str) -> bool {
+    is_system_tool(comm, exe, USER_MGMT)
 }
+
+/// Whether `exe` is under a directory where installed software lives, as
+/// opposed to somewhere a payload would be dropped.
+pub fn is_system_exe_path(exe: &str) -> bool {
+    const DIRS: &[&str] = &[
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/lib/",
+        "/lib64/",
+        "/snap/",
+        "/nix/store/",
+    ];
+    !exe.contains("/../") && DIRS.iter().any(|d| exe.starts_with(d))
+}
+
+/// How long an exited process stays in the tree: long enough to attribute a
+/// write that inotify reports after the writer is gone, and to keep ancestry
+/// for alerts on its children.
+pub const EXIT_GRACE_SECS: i64 = 300;
 
 #[derive(Debug, Default)]
 pub struct ProcessTree {
     procs: HashMap<u32, ProcInfo>,
+    /// When a tracked pid was seen to exit. Exited processes don't count as
+    /// live sessions, and a new exec on the pid is a new process.
+    exited: HashMap<u32, DateTime<Utc>>,
+    /// When the current image was exec'd, for processes we saw start.
+    /// (`ProcInfo::start` mixes units: exec time vs. /proc clock ticks.)
+    exec_at: HashMap<u32, DateTime<Utc>>,
 }
 
 impl ProcessTree {
@@ -251,7 +375,41 @@ impl ProcessTree {
     }
 
     pub fn upsert(&mut self, info: ProcInfo) {
+        self.exited.remove(&info.pid);
         self.procs.insert(info.pid, info);
+    }
+
+    pub fn is_exited(&self, pid: u32) -> bool {
+        self.exited.contains_key(&pid)
+    }
+
+    /// Reconcile with the set of pids that exist right now: mark the missing
+    /// ones as exited and drop those that exited more than
+    /// [`EXIT_GRACE_SECS`] ago, unless a live process still descends from
+    /// them (its chain would lose them otherwise).
+    pub fn reap(&mut self, alive: &std::collections::HashSet<u32>, now: DateTime<Utc>) {
+        for pid in self.procs.keys() {
+            if !alive.contains(pid) {
+                self.exited.entry(*pid).or_insert(now);
+            }
+        }
+        self.exited.retain(|pid, _| !alive.contains(pid));
+        let cutoff = now - chrono::Duration::seconds(EXIT_GRACE_SECS);
+        let parents_of_live: std::collections::HashSet<u32> = self
+            .procs
+            .values()
+            .filter(|p| !self.exited.contains_key(&p.pid))
+            .map(|p| p.ppid)
+            .collect();
+        let expired: Vec<u32> = self
+            .exited
+            .iter()
+            .filter(|(pid, at)| **at < cutoff && !parents_of_live.contains(pid))
+            .map(|(pid, _)| *pid)
+            .collect();
+        for pid in expired {
+            self.remove(pid);
+        }
     }
 
     /// Maximum re-exec history retained per PID.
@@ -260,7 +418,11 @@ impl ProcessTree {
     pub fn upsert_exec(&mut self, ev: &ExecEvent) {
         // Same PID re-exec'ing (exec in a shell, wrappers, `env`, setuid
         // helpers): keep the prior image so the chain still shows the shell.
+        // The old holder of this pid exited: this is a new process (PID
+        // reuse), not a re-exec, so it inherits nothing.
+        let reused = self.exited.remove(&ev.pid).is_some();
         let previous = match self.procs.get(&ev.pid) {
+            _ if reused => Vec::new(),
             // Different parent = PID reuse by an unrelated process: start fresh.
             Some(old) if old.ppid != ev.ppid => Vec::new(),
             // Same image again (re-running the same binary): keep history as is.
@@ -294,6 +456,7 @@ impl ProcessTree {
             previous,
         };
         self.procs.insert(ev.pid, info);
+        self.exec_at.insert(ev.pid, ev.ts);
     }
 
     /// Refresh `seen_at` for a live process so pruning does not drop it.
@@ -309,6 +472,8 @@ impl ProcessTree {
 
     pub fn remove(&mut self, pid: u32) {
         self.procs.remove(&pid);
+        self.exited.remove(&pid);
+        self.exec_at.remove(&pid);
     }
 
     pub fn len(&self) -> usize {
@@ -389,49 +554,63 @@ impl ProcessTree {
             return true;
         }
         if let Some(p) = self.procs.get(&pid) {
-            if is_session_daemon(&p.comm) {
+            if is_session_daemon(&p.comm, &p.exe) {
                 return true;
             }
         }
         self.ancestors_of(pid)
             .iter()
-            .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm))
+            .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm, &p.exe))
     }
 
     /// True if any known process on the host is part of an interactive session.
     /// Used as the fallback when a file writer cannot be identified.
     pub fn any_interactive_session(&self) -> bool {
+        // Only live processes: a session that ended an hour ago doesn't make
+        // an unattended write look operator-driven.
+        let live = || self.procs.values().filter(|p| !self.is_exited(p.pid));
         // A TTY-attached process that is not a getty waiting for login.
-        if self
-            .procs
-            .values()
+        if live()
             .any(|p| p.tty_nr != 0 && !p.comm.starts_with("agetty") && !p.comm.starts_with("getty"))
         {
             return true;
         }
         // A session daemon (sshd, su, sudo, tmux...) that has spawned something:
         // the bare sshd listener has no children of its own.
-        self.procs.values().any(|child| {
+        live().any(|child| {
             child.ppid != 0
+                && !self.is_exited(child.ppid)
                 && self
                     .procs
                     .get(&child.ppid)
                     .map(|parent| {
-                        is_session_daemon(&parent.comm)
+                        is_session_daemon(&parent.comm, &parent.exe)
                             && parent.comm != "systemd-logind"
-                            && !is_session_daemon(&child.comm)
+                            && !is_session_daemon(&child.comm, &child.exe)
                     })
                     .unwrap_or(false)
         })
     }
 
     pub fn prune(&mut self, cutoff: DateTime<Utc>) {
-        self.procs.retain(|_, v| v.seen_at >= cutoff);
+        let stale: Vec<u32> = self
+            .procs
+            .values()
+            .filter(|v| v.seen_at < cutoff)
+            .map(|v| v.pid)
+            .collect();
+        for pid in stale {
+            self.remove(pid);
+        }
     }
 
-    /// Any process matching `pred` that started (or was last seen) within
-    /// `window` of `now`. Used to attribute atomic-rename writes, where the
-    /// writer has already closed the file, to the tool that just ran.
+    /// Any process matching `pred` that was exec'd or exited within `window`
+    /// of `now`. Used to attribute atomic-rename writes, where the writer has
+    /// already closed the file, to the tool that just ran.
+    ///
+    /// Not `seen_at`: that's refreshed by every connect, so a long-running
+    /// daemon with a matching role (snapd, nix-daemon) would look "recent"
+    /// forever and excuse any write.
     pub fn recent_process(
         &self,
         now: DateTime<Utc>,
@@ -439,10 +618,20 @@ impl ProcessTree {
         pred: impl Fn(&ProcInfo) -> bool,
     ) -> Option<&ProcInfo> {
         let cutoff = now - window;
+        let activity = |p: &ProcInfo| {
+            let started = self.exec_at.get(&p.pid).copied();
+            let ended = self.exited.get(&p.pid).copied();
+            started
+                .into_iter()
+                .chain(ended)
+                .filter(|t| *t >= cutoff)
+                .max()
+        };
         self.procs
             .values()
-            .filter(|p| p.seen_at >= cutoff && pred(p))
-            .max_by_key(|p| p.seen_at)
+            .filter_map(|p| activity(p).filter(|_| pred(p)).map(|t| (t, p)))
+            .max_by_key(|(t, _)| *t)
+            .map(|(_, p)| p)
     }
 }
 
@@ -486,6 +675,52 @@ mod tests {
         // No false prefix matches.
         assert_eq!(role_of("shred", ""), Role::Unknown);
         assert_eq!(role_of("nodemon", ""), Role::Unknown);
+    }
+
+    #[test]
+    fn exempt_roles_need_a_trusted_exe() {
+        // A copy at /tmp/dpkg has comm "dpkg" but isn't a package manager.
+        assert_eq!(role_of("dpkg", "/tmp/dpkg"), Role::Unknown);
+        assert_eq!(role_of("dpkg", "/usr/bin/dpkg"), Role::PackageManager);
+        assert_eq!(role_of("gdb", "/dev/shm/gdb"), Role::Unknown);
+        assert_eq!(role_of("gdb", "/usr/bin/gdb"), Role::Debugger);
+        assert_eq!(role_of("usermod", "/home/x/usermod"), Role::Unknown);
+        assert_eq!(role_of("sshd", "/var/tmp/sshd"), Role::Unknown);
+        assert_eq!(role_of("systemd", "/tmp/systemd"), Role::Unknown);
+        // Deleted or path-trick binaries aren't trusted either.
+        assert_eq!(role_of("dpkg", "/usr/bin/dpkg (deleted)"), Role::Unknown);
+        assert_eq!(role_of("dpkg", "/usr/bin/../../tmp/dpkg"), Role::Unknown);
+        // Script tools: exe is the interpreter.
+        assert_eq!(role_of("dnf", "/usr/bin/python3.9"), Role::PackageManager);
+        assert_eq!(
+            role_of("unattended-upgr", "/usr/bin/python3.12"),
+            Role::PackageManager
+        );
+        assert_eq!(role_of("adduser", "/usr/bin/perl"), Role::UserMgmt);
+        // ...but only known script tools.
+        assert_eq!(role_of("dpkg", "/usr/bin/python3"), Role::Interpreter);
+        // Kernel threads have no exe.
+        assert_eq!(role_of("kthreadd", ""), Role::System);
+        assert_eq!(role_of("kthreadd", "/tmp/kthreadd"), Role::Unknown);
+    }
+
+    #[test]
+    fn renamed_shells_keep_their_role() {
+        assert_eq!(role_of("x", "/var/www/uploads/bash"), Role::Shell);
+        assert_eq!(role_of("kworker", "/tmp/curl"), Role::Downloader);
+    }
+
+    #[test]
+    fn fake_session_daemon_is_not_interactive() {
+        let mut t = ProcessTree::new();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(400, 1, "cron"));
+        let mut fake = info(401, 400, "tmux");
+        fake.exe = "/tmp/tmux".into();
+        t.upsert(fake);
+        t.upsert(info(402, 401, "bash"));
+        assert!(!t.has_interactive_session(402, 0));
+        assert!(!t.any_interactive_session());
     }
 
     #[test]
@@ -545,6 +780,98 @@ mod tests {
         fresh.ppid = 1;
         t.upsert_exec(&fresh);
         assert_eq!(t.chain_of(200).len(), 2);
+    }
+
+    fn exec_ev(pid: u32, ppid: u32, comm: &str, ts: DateTime<Utc>) -> ExecEvent {
+        ExecEvent {
+            ts,
+            pid,
+            ppid,
+            uid: 0,
+            gid: 0,
+            comm: comm.into(),
+            exe: format!("/usr/bin/{}", comm),
+            argv0: comm.into(),
+            ld_preload: false,
+            deleted_exe: false,
+            tty_nr: 0,
+            container: false,
+            container_id: None,
+        }
+    }
+
+    #[test]
+    fn ended_sessions_stop_counting() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(100, 1, "sshd"));
+        t.upsert(info(200, 100, "sshd"));
+        t.upsert(info(300, 200, "bash"));
+        assert!(t.any_interactive_session());
+        // The session's processes exit; only systemd and the listener remain.
+        let alive: std::collections::HashSet<u32> = [1, 100].into_iter().collect();
+        t.reap(&alive, now);
+        assert!(!t.any_interactive_session());
+        // Still in the tree during the grace period...
+        assert!(t.get(300).is_some());
+        // ...and gone after it.
+        t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
+        assert!(t.get(300).is_none() && t.get(200).is_none());
+        assert!(t.get(100).is_some());
+    }
+
+    #[test]
+    fn exited_ancestors_of_live_processes_are_kept() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(100, 1, "nginx"));
+        t.upsert(info(200, 100, "bash"));
+        t.upsert(info(300, 200, "implant"));
+        // The shell exited but its child keeps running.
+        let alive: std::collections::HashSet<u32> = [1, 100, 300].into_iter().collect();
+        t.reap(&alive, now);
+        t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
+        let comms: Vec<String> = t.chain_of(300).iter().map(|p| p.comm.clone()).collect();
+        assert_eq!(comms, vec!["systemd", "nginx", "bash", "implant"]);
+    }
+
+    #[test]
+    fn exec_on_an_exited_pid_is_a_new_process() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert_exec(&exec_ev(500, 1, "bash", now));
+        t.reap(&[1].into_iter().collect(), now);
+        // Same pid, same parent, different program: reuse, not re-exec.
+        t.upsert_exec(&exec_ev(500, 1, "cron", now));
+        let comms: Vec<String> = t.chain_of(500).iter().map(|p| p.comm.clone()).collect();
+        assert_eq!(comms, vec!["systemd", "cron"]);
+        assert!(!t.is_exited(500));
+    }
+
+    #[test]
+    fn a_busy_daemon_is_not_a_recent_process() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        // snapd was already running at startup and keeps making connections.
+        t.upsert(info(700, 1, "snapd"));
+        t.touch(700, now);
+        let is_pm = |p: &ProcInfo| p.comm == "snapd" || p.comm == "useradd";
+        assert!(t
+            .recent_process(now, chrono::Duration::seconds(8), is_pm)
+            .is_none());
+        // A tool that just ran does count, including right after it exits.
+        t.upsert_exec(&exec_ev(701, 1, "useradd", now));
+        assert!(t
+            .recent_process(now, chrono::Duration::seconds(8), is_pm)
+            .is_some());
+        let later = now + chrono::Duration::seconds(30);
+        t.reap(&[1, 700].into_iter().collect(), later);
+        assert!(t
+            .recent_process(later, chrono::Duration::seconds(8), is_pm)
+            .is_some());
     }
 
     #[test]

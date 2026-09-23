@@ -10,15 +10,15 @@ const INFRA_PORTS: &[u16] = &[53, 123, 67, 68, 5353];
 
 pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
     let mut findings = Vec::new();
-    if INFRA_PORTS.contains(&ev.dport) {
-        return findings;
-    }
+    // chain.first() is PID 1 on a real host (the daemon seeds the tree from
+    // /proc), so it can't stand in for "who connected". Use the nearest web
+    // server in the chain, and the connecting process itself as the connector.
     let chain = ctx.tree.chain_of(ev.pid);
-    let root = chain.first();
-    let root_role = root
-        .map(|p| role_of(&p.comm, &p.exe))
-        .unwrap_or(Role::Unknown);
-    let connector_key = connector_key(root.map(|p| p.exe.as_str()).unwrap_or(&ev.comm), ev.uid);
+    let web_server = chain
+        .iter()
+        .rev()
+        .find(|p| role_of(&p.comm, &p.exe) == Role::WebServer);
+    let connector_key = connector_key(&connector_exe(ctx.tree, ev.pid, &ev.comm), ev.uid);
     let is_external = !is_private_ip(ev.daddr);
     let dest_allowed = ctx.allowlist.destination_allowed(ev.daddr);
     let dest = format!("{}:{}", ev.daddr, ev.dport);
@@ -55,11 +55,15 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
         return findings;
     }
 
-    if root_role == Role::WebServer
-        && is_external
-        && ctx.baseline.can_judge_novelty()
-        && !ctx.baseline.dest_is_known(ev.daddr)
-    {
+    // Only skip infra ports after the flagged-chain check: a web shell
+    // calling out to attacker:53 is exactly the case we mustn't drop.
+    if INFRA_PORTS.contains(&ev.dport) {
+        return findings;
+    }
+
+    if let Some(web) = web_server.filter(|_| {
+        is_external && ctx.baseline.can_judge_novelty() && !ctx.baseline.dest_is_known(ev.daddr)
+    }) {
         findings.push(
             Finding::new(
                 DetectionId::D5,
@@ -68,9 +72,9 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 &format!("d5|web-new-dest|{}", ev.daddr),
             )
             .what(format!(
-                "{} connected to {}, a destination never observed during the baseline period.",
-                root.map(|p| p.comm.as_str()).unwrap_or(&ev.comm),
-                dest
+                "{} (under {}) connected to {}, a destination never observed during the \
+                 baseline period.",
+                ev.comm, web.comm, dest
             ))
             .chain(ctx.chain_nodes(ev.pid))
             .fact("Destination", &dest)
@@ -87,7 +91,9 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
         return findings;
     }
 
-    if ctx.baseline.can_judge_novelty() && !ctx.baseline.connector_is_known(&connector_key) {
+    if ctx.baseline.can_judge_connectors(ctx.now)
+        && !ctx.baseline.connector_is_known(&connector_key)
+    {
         let severity = if is_external {
             Severity::Low
         } else {
@@ -102,7 +108,7 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
             )
             .what(format!(
                 "{} ({}) made its first observed outbound connection, to {}.",
-                root.map(|p| p.comm.as_str()).unwrap_or(&ev.comm),
+                ev.comm,
                 ctx.user_name(ev.uid).unwrap_or("unknown user"),
                 dest
             ))
@@ -124,6 +130,16 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
 
 pub fn connector_key(exe: &str, uid: u32) -> String {
     format!("{}|{}", exe, uid)
+}
+
+/// The connecting process's own executable, or its comm if the tree doesn't
+/// know it. See [`crate::baseline::CONNECTOR_SCHEME`].
+pub fn connector_exe(tree: &crate::proctree::ProcessTree, pid: u32, comm: &str) -> String {
+    tree.get(pid)
+        .map(|p| p.exe.as_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or(comm)
+        .to_string()
 }
 
 pub fn evaluate_listener(ev: &ListenerEvent, ctx: &Ctx) -> Vec<Finding> {
