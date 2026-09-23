@@ -163,6 +163,9 @@ HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
 ```
 
 `HERMIAN_EBPF_PREBUILT=/path/to/object` selects an explicit object instead.
+If a BPF toolchain is installed but the source fails to compile, the build
+fails rather than quietly using the vendored object; set
+`HERMIAN_EBPF_FROM_SOURCE=0` to use the vendored object on purpose.
 Linux CI rebuilds from source and compares against the vendored object.
 
 ## Testing and next steps
