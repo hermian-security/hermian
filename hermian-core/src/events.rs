@@ -268,6 +268,17 @@ impl Event {
             Event::Listener(e) => e.ts,
         }
     }
+
+    pub fn set_ts(&mut self, ts: DateTime<Utc>) {
+        match self {
+            Event::Exec(e) => e.ts = ts,
+            Event::Connect(e) => e.ts = ts,
+            Event::Ptrace(e) => e.ts = ts,
+            Event::File(e) => e.ts = ts,
+            Event::Auth(e) => e.ts = ts,
+            Event::Listener(e) => e.ts = ts,
+        }
+    }
 }
 
 const TRANSIENT_DIRS: &[&str] = &["/tmp", "/dev/shm", "/var/tmp"];
