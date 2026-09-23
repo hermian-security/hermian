@@ -5,6 +5,8 @@
 # Usage: run_attack.sh <scenario> <title-pattern>
 # Requires a fresh matching JSON alert within 30 seconds after the simulation.
 # Deduplicated repeats do not pass: wait out the dedup window before rerunning.
+# Run it through run_suite.sh (or systemd-run) rather than straight from a
+# login shell: commands started from a session count as operator activity.
 # The scenario's artifacts are removed on exit, pass or fail.
 set -eu
 
