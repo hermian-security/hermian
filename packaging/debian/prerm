@@ -4,6 +4,11 @@ set -e
 case "$1" in
     remove|deconfigure)
         systemctl disable --now hermian.service >/dev/null 2>&1 || true
+        # Never leave a host isolated by a tool that's about to disappear
+        # (hermian uninstall does the same). Upgrades keep isolation as is.
+        if command -v nft >/dev/null 2>&1; then
+            nft delete table inet hermian >/dev/null 2>&1 || true
+        fi
     ;;
 esac
 

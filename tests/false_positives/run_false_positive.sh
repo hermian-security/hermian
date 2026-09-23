@@ -5,9 +5,26 @@
 # Usage: run_false_positive.sh <environment> <duration-seconds>
 set -eu
 
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "usage: $0 <environment> [duration-seconds]" >&2
+    exit 2
+fi
+
 ENV="$1"
 DURATION="${2:-300}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+
+. "$DIR/../helpers/disposable_host.sh"
+require_disposable_host
+
+cleanup() {
+    rm -f /etc/cron.d/hermian-fp-test /tmp/hermian-fp-installer.sh
+    sed -i '/HERMIAN_FP/d' /root/.bashrc 2>/dev/null || true
+    [ -n "${NGINX_PID:-}" ] && kill "$NGINX_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 END=$(( $(date +%s) + DURATION ))

@@ -71,6 +71,44 @@ pub fn read_file(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Largest file [`read_regular_file`] will return.
+const MAX_WATCHED_READ: u64 = 1024 * 1024;
+
+/// Read a watched file that an unprivileged user may control (dotfiles,
+/// `authorized_keys`, spool files) without letting them steer a root read.
+///
+/// Refuses symlinks (final component and parent directories), FIFOs, devices
+/// and sockets. `O_NONBLOCK` keeps a FIFO swapped in after the check from
+/// hanging the caller.
+pub fn read_regular_file(path: &str) -> Option<String> {
+    let (f, _) = open_regular(path)?;
+    let mut buf = Vec::new();
+    f.take(MAX_WATCHED_READ).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Open `path` read-only if, and only if, it's a regular file reached without
+/// following any symlink. See [`read_regular_file`].
+pub fn open_regular(path: &str) -> Option<(fs::File, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let p = std::path::Path::new(path);
+    // A symlinked parent (e.g. ~/.ssh -> /root/.ssh) would redirect the read.
+    let parent = p.parent()?;
+    if fs::canonicalize(parent).ok()? != parent {
+        return None;
+    }
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(p)
+        .ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    Some((f, meta))
+}
+
 pub fn exe_of(pid: u32) -> Option<(String, bool)> {
     let link = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
     let raw = link.to_string_lossy().into_owned();
@@ -125,9 +163,18 @@ pub fn stat_of(pid: u32) -> Option<(u32, i64, u64)> {
 }
 
 pub fn uid_of(pid: u32) -> Option<u32> {
+    status_id(pid, "Uid:")
+}
+
+pub fn gid_of(pid: u32) -> Option<u32> {
+    status_id(pid, "Gid:")
+}
+
+/// The real id from a `Uid:`/`Gid:` line of /proc/<pid>/status.
+fn status_id(pid: u32, key: &str) -> Option<u32> {
     let content = read_file(&format!("/proc/{}/status", pid))?;
     content.lines().find_map(|l| {
-        l.strip_prefix("Uid:")
+        l.strip_prefix(key)
             .and_then(|v| v.split_whitespace().next())
             .and_then(|s| s.parse::<u32>().ok())
     })
@@ -182,6 +229,11 @@ fn proc_pids() -> Vec<u32> {
         .flatten()
         .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
         .collect()
+}
+
+/// Every pid that exists right now.
+pub fn live_pids() -> std::collections::HashSet<u32> {
+    proc_pids().into_iter().collect()
 }
 
 pub fn proc_info(pid: u32, now: chrono::DateTime<chrono::Utc>) -> Option<ProcInfo> {
@@ -383,9 +435,10 @@ pub fn has_file_capabilities(path: &str) -> bool {
     let Ok(cpath) = std::ffi::CString::new(path) else {
         return false;
     };
+    // lgetxattr: don't follow a user-planted symlink to some capability binary.
     // SAFETY: valid C strings; null buffer with size 0 queries the attribute length.
     let rc = unsafe {
-        libc::getxattr(
+        libc::lgetxattr(
             cpath.as_ptr(),
             c"security.capability".as_ptr(),
             std::ptr::null_mut(),
@@ -397,8 +450,9 @@ pub fn has_file_capabilities(path: &str) -> bool {
 
 pub fn is_suid_or_sgid(path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .map(|m| m.permissions().mode() & (libc::S_ISUID | libc::S_ISGID) != 0)
+    // symlink_metadata: a symlink to /usr/bin/sudo isn't a new setuid file.
+    fs::symlink_metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & (libc::S_ISUID | libc::S_ISGID) != 0)
         .unwrap_or(false)
 }
 
@@ -426,4 +480,62 @@ pub fn file_in_package_database(path: &str) -> Option<bool> {
 
 pub fn current_exe_path() -> Result<PathBuf> {
     fs::read_link("/proc/self/exe").context("failed to resolve own binary path")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hermian-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // temp_dir itself may be a symlink (macOS-style setups); use the real path.
+        fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn regular_file_is_read() {
+        let dir = scratch("regular");
+        let f = dir.join(".bashrc");
+        fs::write(&f, "export A=1\n").unwrap();
+        assert_eq!(
+            read_regular_file(f.to_str().unwrap()).as_deref(),
+            Some("export A=1\n")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fifo_does_not_block_or_read() {
+        let dir = scratch("fifo");
+        let f = dir.join(".bashrc");
+        let c = std::ffi::CString::new(f.to_str().unwrap()).unwrap();
+        // SAFETY: valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        // A blocking open would hang this test forever.
+        assert!(read_regular_file(f.to_str().unwrap()).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn symlinks_are_not_followed() {
+        let dir = scratch("symlink");
+        let secret = dir.join("secret");
+        fs::write(&secret, "root:$6$hash:::\n").unwrap();
+        let link = dir.join(".bashrc");
+        symlink(&secret, &link).unwrap();
+        assert!(read_regular_file(link.to_str().unwrap()).is_none());
+        assert!(!is_suid_or_sgid(link.to_str().unwrap()));
+
+        // Symlinked parent directory: ~/.ssh -> somewhere else.
+        let real = dir.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("authorized_keys"), "ssh-ed25519 AAAA\n").unwrap();
+        let ssh = dir.join(".ssh");
+        symlink(&real, &ssh).unwrap();
+        assert!(read_regular_file(ssh.join("authorized_keys").to_str().unwrap()).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
