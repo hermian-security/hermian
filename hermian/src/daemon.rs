@@ -304,6 +304,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             }
             _ = ticker.tick() => {
                 let now = Utc::now();
+                engine.reap_exited(&procsrc::live_pids(), now);
                 for a in engine.tick(now) {
                     notifier.send(a);
                 }
