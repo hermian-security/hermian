@@ -35,6 +35,23 @@ if ! command -v hermian >/dev/null 2>&1; then
     exit 1
 fi
 
+# The scenarios simulate unattended attacks. Run from a login shell, every
+# command the suite starts looks like operator activity to HERMIAN, which
+# rightly downgrades unknown-writer file changes then. Re-run ourselves as a
+# transient systemd unit, outside the session, unless already done.
+if [ -z "${HERMIAN_SUITE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&1; then
+    exec systemd-run --quiet --wait --pipe --collect \
+        --setenv=HERMIAN_SUITE_DETACHED=1 \
+        --setenv=HERMIAN_DISPOSABLE_HOST="${HERMIAN_DISPOSABLE_HOST:-}" \
+        sh "$DIR/run_suite.sh" "$@"
+fi
+if [ -n "${HERMIAN_SUITE_DETACHED:-}" ]; then
+    # Starting the suite was itself operator activity (HERMIAN looks back 15s).
+    # Let that pass so the first file-based scenario is judged as unattended.
+    echo "(waiting 20s so launching the suite doesn't count as operator activity)"
+    sleep 20
+fi
+
 # Safety net: each attack cleans up after itself, but make sure nothing is
 # left behind if the suite is interrupted.
 cleanup() {
