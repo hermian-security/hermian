@@ -193,5 +193,6 @@ and low false-positive rates are goals, not guarantees. The 20-second privilege
 sweep alone rules out a blanket five-second detection promise.
 
 Next: fix collector and attribution gaps, run the wider
-[burn-in matrix](docs/ROADMAP-BURN-IN.md), and add log rotation/alert pruning.
-Broader packaging can wait until that coverage is tested.
+[burn-in matrix](docs/ROADMAP-BURN-IN.md), add log rotation/alert pruning, and
+publish a signed APT repository on GitHub Pages so updates arrive through
+`apt upgrade`. RPM and other packaging can wait until that coverage is tested.

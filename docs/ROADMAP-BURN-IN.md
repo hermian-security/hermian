@@ -80,19 +80,14 @@ builds run on `ubuntu-22.04` for this reason.
 1. Builds the eBPF object from source; fails if it differs from the vendored one.
 2. Builds `amd64` and `arm64` on Ubuntu 22.04 runners.
 3. Runs core tests and `hermian test` on the built binary.
-4. Produces `.deb` + `.tar.gz` per arch, `SHA256SUMS`, and **Sigstore
-   keyless signatures** (`*.sigstore` bundles) bound to the repository's
-   workflow identity - no long-lived GPG key to protect.
-5. Publishes a GitHub pre-release (tags containing `-`) or release.
+4. Produces `.deb` + `.tar.gz` per arch, `SHA256SUMS`, **Sigstore keyless
+   signatures** (`*.sigstore` bundles) and **GitHub build attestations**, both
+   bound to the repository's workflow identity - no long-lived key to protect.
+5. Publishes a GitHub pre-release (tags containing `-`) or release, with the
+   CHANGELOG section for that version as the notes.
 
-To cut a release:
-
-```bash
-git tag -a v0.1.0-beta.2 -m "..." && git push origin v0.1.0-beta.2
-```
-
-**Untested:** the `arm64` runner and the Sigstore step have not been run
-yet; expect one iteration on the first tag.
+The release procedure itself is in [CONTRIBUTING.md](../CONTRIBUTING.md#versioning-and-releases).
+arm64 and Sigstore have run on every tag since beta.2.
 
 ### 1.4 What PROJECT.md asked for and what we ship
 
@@ -104,9 +99,41 @@ For the beta:
 | `.deb` (amd64, arm64) | **yes** | Target users are overwhelmingly Debian/Ubuntu VPS |
 | Signed tarball + `install.sh` | **yes** | Distro-agnostic fallback |
 | Sigstore instead of GPG | **yes** | Same guarantee, no key custody problem for a solo maintainer; GPG can be added later |
+| Signed apt repository | **next** | The only path that gets fixes onto hosts without anyone checking; see §1.5 |
 | `.rpm` | Phase 3 | Needs a Fedora/RHEL burn-in first (§3 below) |
 | AUR | Phase 3 | After `.rpm` |
-| apt repository | later | A bare `.deb` download + verification is fine for a beta |
+
+### 1.5 Signed APT repository on GitHub Pages (planned)
+
+Goal: `sudo apt install hermian` once, then updates arrive with `apt upgrade`.
+
+- **Hosting:** GitHub Pages from a dedicated `gh-pages` branch
+  (`https://hermian-security.github.io/hermian/apt`), later behind
+  `apt.hermian.me` if wanted. Pages is static, which is all an apt repo needs.
+- **Layout:** `dists/stable` and `dists/beta` (prereleases), component `main`,
+  `binary-amd64` and `binary-arm64`, pool of the `.deb` files already built by
+  `release.yml`. Generated with `apt-ftparchive` (or `reprepro`) in a new
+  release job that runs after "Sign and publish".
+- **Signing:** a dedicated repository GPG key (apt verifies `InRelease`
+  itself; Sigstore isn't understood by apt). Private key as an Actions secret
+  available only to that job, ideally a signing subkey with the primary kept
+  offline. Public key published in the repo and on the Pages site.
+- **User setup** (the shape to document once it exists):
+
+  ```bash
+  curl -fsSL https://hermian-security.github.io/hermian/apt/hermian.gpg \
+    | sudo tee /usr/share/keyrings/hermian.gpg >/dev/null
+  echo "deb [signed-by=/usr/share/keyrings/hermian.gpg] https://hermian-security.github.io/hermian/apt beta main" \
+    | sudo tee /etc/apt/sources.list.d/hermian.list
+  sudo apt update && sudo apt install hermian
+  ```
+
+  Users should check the key fingerprint against the README before trusting it.
+- **Open questions:** key custody and rotation plan, keeping old versions in
+  the pool for rollback, Pages size limits (fine for years at ~10 MB/release),
+  and whether prereleases go to `beta` only.
+- **Done when:** a fresh Debian 12 and Ubuntu 22.04 host install from the repo,
+  `apt upgrade` picks up the next tag, and the README leads with it.
 
 ---
 
@@ -121,30 +148,19 @@ systemctl is-active auditd                # if active, the audit fallback is ski
 sysctl fs.inotify.max_user_watches        # hermian enable raises this to 524288 if lower
 ```
 
-### 2.2 Install (`.deb`)
+### 2.2 Install
 
-```bash
-VER=v0.1.0-beta.4
-ARCH=$(dpkg --print-architecture)
-cd /tmp
-curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/SHA256SUMS"
-DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
-FILE=$(printf '%s' "$DEB" | tr '~' '.')
-curl -fsSLO "https://github.com/hermian-security/hermian/releases/download/$VER/$FILE"
-[ -e "$DEB" ] || cp "$FILE" "$DEB"
-sha256sum -c SHA256SUMS --ignore-missing
-sudo apt install "./$FILE"
-sudo hermian status
-```
+Follow the [README install steps](../README.md#install) (Debian/Ubuntu or
+tarball), including the origin check. They're kept in one place on purpose.
 
-Expected within 10 seconds: `PROTECTED`, all five rows `on`, `Kernel ... eBPF`.
+Expected within 10 seconds of `sudo hermian status`: `PROTECTED`, all five rows `on`, `Kernel ... eBPF`.
 If you see `reduced: no eBPF`, read `journalctl -u hermian -n 20`; the two
 causes met so far were both fixed in the unit (`LimitMEMLOCK`,
 `MemoryDenyWriteExecute`) - anything new is a bug to report.
 
 ### 2.3 Wire a notification channel (do this before walking away)
 
-See README "Getting notified". Minimum for a beta host:
+See README "Get notified". Minimum for a beta host:
 
 ```toml
 [notifications]
@@ -166,9 +182,9 @@ history worth learning, `sudo hermian enable --no-baseline`.
 
 ### 2.5 Upgrade
 
-```bash
-sudo apt install ./hermian_<new>_amd64.deb   # postinst re-runs enable, restarts the daemon
-```
+Rerun the README install steps with the new `VER`; the package's postinst
+re-runs `enable` and restarts the daemon. Read the release notes first for
+one-time steps.
 
 Verified: reinstall over a running daemon keeps state, alerts, baseline and
 the soak clock; the binary hash is refreshed so no false integrity alert.
@@ -259,7 +275,8 @@ All of the following, with evidence linked from the release notes:
 - [ ] Attack matrix 13/13 on every host, < 5 s each.
 - [ ] CPU avg < 1 %, p99 < 5 %, RSS < 80 MB on every host.
 - [ ] `docs/fp-log.md` published; every entry closed.
-- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS` on a clean machine.
+- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS`, `gh attestation verify` and `cosign verify-blob` on a clean machine.
+- [ ] Signed APT repository live; `apt upgrade` delivered a release to a test host.
 - [ ] `hermian uninstall` leaves nothing on every distro.
 - [ ] Two hosts the maintainer depends on have run the release build for 30 days.
 
@@ -273,7 +290,7 @@ When the boxes are ticked, retag as `v0.1.0`.
 |---|---|
 | 1 | Push tag, fix the release workflow until green. Provision B, F, G. Run §3.1 on each. Fix what breaks. |
 | 2 | C, D, E, H. Start `fp-log.md`. Implement `hermian dismiss/ack` (see next section). |
-| 3-4 | Let soaks run. Address FP log. Add log rotation for `alerts.log` and pruning of `alerts/*.json`. |
+| 3-4 | Let soaks run. Address FP log. Add log rotation for `alerts.log` and pruning of `alerts/*.json`. Stand up the signed APT repository (§1.5). |
 | 5 | Review evidence against §4. Retag or extend. |
 
 ---

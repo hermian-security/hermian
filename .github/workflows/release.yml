@@ -144,8 +144,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write   # Sigstore keyless signing, only for the publishing job
+      id-token: write       # Sigstore keyless signing and build attestations
+      attestations: write   # gh attestation verify
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: dist-*
@@ -160,29 +162,40 @@ jobs:
             cosign sign-blob --yes "$f" --bundle "$f.sigstore"
           done
           ls -la
+      # Provenance for every file in SHA256SUMS, checked with
+      # `gh attestation verify <file> --repo <owner>/<repo>`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+      # Install commands live only in the README at this tag; the notes are
+      # the CHANGELOG section for this version plus a pointer there.
+      - name: Release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          VERSION=${TAG#v}
+          awk -v v="$VERSION" '
+            index($0, "## " v " ") == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for $VERSION"
+            exit 1
+          fi
+          {
+            echo
+            echo "## Install"
+            echo
+            echo "Follow the [install steps for this release](https://github.com/$REPO/blob/$TAG/README.md#install)"
+            echo "with \`VER=$TAG\`. They cover Debian/Ubuntu, other systemd distros,"
+            echo "checking where the files came from (\`gh\` or \`cosign\`), and upgrading."
+          } >> notes.md
+          cat notes.md
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
           files: dist/*
-          body: |
-            ## Install
-
-            Use `/tmp` (needs to be writable). Pin this tag.
-
-            ```bash
-            VER=${{ github.ref_name }}
-            ARCH=$(dpkg --print-architecture)
-            cd /tmp
-            curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/SHA256SUMS"
-            DEB=$(awk -v a="_${ARCH}.deb" '$2 ~ a"$" { print $2; exit }' SHA256SUMS)
-            FILE=$(printf '%s' "$DEB" | tr '~' '.')
-            curl -fsSLO "https://github.com/${{ github.repository }}/releases/download/$VER/$FILE"
-            [ -e "$DEB" ] || cp "$FILE" "$DEB"
-            sha256sum -c SHA256SUMS --ignore-missing
-            sudo apt install "./$FILE"
-            sudo hermian status
-            ```
-
-            Other systemd distros: fetch the tarball named in SHA256SUMS, check
-            it, extract, `sudo sh install.sh`.
+          body_path: notes.md
