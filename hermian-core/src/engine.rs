@@ -1044,6 +1044,39 @@ mod tests {
 
     #[test]
     fn dns_connects_are_ignored() {
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline,
+            "h".into(),
+        );
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(
+            t,
+            150,
+            1,
+            101,
+            "resolved",
+            "/usr/lib/systemd/resolved",
+        ));
+        let alerts = eng.process(Event::Connect(ConnectEvent {
+            ts: t,
+            pid: 150,
+            uid: 101,
+            daddr: "1.1.1.1".parse().unwrap(),
+            dport: 53,
+            comm: "resolved".into(),
+            container: false,
+        }));
+        assert!(alerts.is_empty(), "{:?}", alerts);
+    }
+
+    #[test]
+    fn flagged_chain_to_dns_port_still_fires() {
+        // A reverse shell to attacker:53 must not hide behind the infra-port skip.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
@@ -1052,12 +1085,16 @@ mod tests {
             ts: t,
             pid: 200,
             uid: 33,
-            daddr: "1.1.1.1".parse().unwrap(),
+            daddr: "198.51.100.42".parse().unwrap(),
             dport: 53,
             comm: "bash".into(),
             container: false,
         }));
-        assert!(alerts.is_empty(), "{:?}", alerts);
+        assert!(
+            has(&alerts, DetectionId::D5, Severity::High),
+            "{:?}",
+            alerts
+        );
     }
 
     #[test]

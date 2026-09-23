@@ -10,9 +10,6 @@ const INFRA_PORTS: &[u16] = &[53, 123, 67, 68, 5353];
 
 pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
     let mut findings = Vec::new();
-    if INFRA_PORTS.contains(&ev.dport) {
-        return findings;
-    }
     let chain = ctx.tree.chain_of(ev.pid);
     let root = chain.first();
     let root_role = root
@@ -52,6 +49,12 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 "Investigate the chain end to end.",
             ]),
         );
+        return findings;
+    }
+
+    // Only skip infra ports after the flagged-chain check: a web shell
+    // calling out to attacker:53 is exactly the case we mustn't drop.
+    if INFRA_PORTS.contains(&ev.dport) {
         return findings;
     }
 
