@@ -6,6 +6,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.4 - 2026-09-23
+
 ### Security
 
 - Watched files are read with `O_NOFOLLOW|O_NONBLOCK` and must be regular
