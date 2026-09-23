@@ -64,8 +64,11 @@ so a script with such a name run by that interpreter can still pass.
 
 inotify doesn't identify the writer. The daemon tries to find an open file
 descriptor; some rules also look for a recent admin tool. If the writer is
-unknown, session presence is a fallback. That's a heuristic, not proof of who
-changed a file, and it can downgrade an unrelated write.
+unknown, recent operator activity is the fallback: something started from an
+interactive session in the last 15 seconds, or an editor running in one. An
+idle SSH or tmux session doesn't count. That's a heuristic, not proof of who
+changed a file, and it can still downgrade an unrelated write made while an
+operator is typing.
 
 The default baseline learns SSH sources, destination IPs, and connector identities
 for 24 hours, then freezes those sets. Destination IPs are host-wide, not

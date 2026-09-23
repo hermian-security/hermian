@@ -33,7 +33,11 @@ fn pam_config_loads_module(content: &str) -> bool {
         .any(|l| !l.starts_with('#') && l.contains("pam_hermian.so"))
 }
 
-pub fn spawn_pam_listener(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn spawn_pam_listener(
+    tx: mpsc::Sender<Event>,
+    shutdown: Arc<AtomicBool>,
+    forward_attempts: bool,
+) -> Result<()> {
     let dir = paths::run_dir();
     std::fs::create_dir_all(&dir)?;
     // The PAM module runs as root inside sshd; keep the dir private but the
@@ -47,8 +51,13 @@ pub fn spawn_pam_listener(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) ->
 
     std::thread::Builder::new()
         .name("hermian-pam".to_string())
-        .spawn(move || pam_listener_loop(sock, tx, shutdown))?;
+        .spawn(move || pam_listener_loop(sock, tx, shutdown, forward_attempts))?;
     Ok(())
+}
+
+/// Whether a PAM event should reach the engine. See `spawn_pam_listener`.
+fn keep_event(ev: &AuthEvent, forward_attempts: bool) -> bool {
+    forward_attempts || ev.result != AuthResult::Attempt
 }
 
 /// Larger than any datagram the module sends. The username is chosen by the
@@ -56,12 +65,19 @@ pub fn spawn_pam_listener(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) ->
 /// parse and the attempt vanished, so long usernames hid brute force.
 const MAX_DATAGRAM: usize = 64 * 1024;
 
-fn pam_listener_loop(sock: UnixDatagram, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
+fn pam_listener_loop(
+    sock: UnixDatagram,
+    tx: mpsc::Sender<Event>,
+    shutdown: Arc<AtomicBool>,
+    forward_attempts: bool,
+) {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     while !shutdown.load(Ordering::Relaxed) {
         match sock.recv(&mut buf) {
             Ok(n) if n > 0 => {
-                if let Some(ev) = parse_pam_payload(&String::from_utf8_lossy(&buf[..n])) {
+                let parsed = parse_pam_payload(&String::from_utf8_lossy(&buf[..n]))
+                    .filter(|ev| keep_event(ev, forward_attempts));
+                if let Some(ev) = parsed {
                     if tx.blocking_send(Event::Auth(ev)).is_err() {
                         break;
                     }
@@ -147,6 +163,15 @@ mod tests {
         assert!(pam_config_loads_module(
             "auth    optional    /usr/lib/security/pam_hermian.so\n"
         ));
+    }
+
+    #[test]
+    fn attempts_are_dropped_when_logs_cover_failures() {
+        let attempt = parse_pam_payload(r#"{"result":"attempt","user":"x"}"#).unwrap();
+        let success = parse_pam_payload(r#"{"result":"success","user":"x"}"#).unwrap();
+        assert!(!keep_event(&attempt, false));
+        assert!(keep_event(&success, false));
+        assert!(keep_event(&attempt, true));
     }
 
     #[test]

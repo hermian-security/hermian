@@ -211,15 +211,20 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         paths::config_path(),
         shutdown.clone(),
     )?);
-    if let Err(e) = pamsock::spawn_pam_listener(event_tx.clone(), shutdown.clone()) {
-        log_daemon(Severity::Low, &format!("PAM socket unavailable: {:#}", e));
-    }
     match authlog::spawn_authlog_tailer(event_tx.clone(), shutdown.clone()) {
         Ok(src) => sources.auth = src,
         Err(e) => log_daemon(
             Severity::Low,
             &format!("auth log source unavailable: {:#}", e),
         ),
+    }
+    // The PAM module reports an "attempt" for every authentication, before
+    // the outcome is known. With a log source already reporting failures,
+    // counting attempts too would double every failure and count successful
+    // logins as failures, so they're only used when there's no log source.
+    let pam_attempts = sources.auth == authlog::AuthSource::None;
+    if let Err(e) = pamsock::spawn_pam_listener(event_tx.clone(), shutdown.clone(), pam_attempts) {
+        log_daemon(Severity::Low, &format!("PAM socket unavailable: {:#}", e));
     }
     if sources.auth == authlog::AuthSource::None && !sources.pam {
         log_daemon(
@@ -538,7 +543,7 @@ fn reload_config(
                 "Changing a security daemon's configuration at runtime is how an attacker blinds a host. If this was you, no action is needed.",
                 &["Confirm the change was yours.", "Review the active configuration with 'hermian status'."],
                 &[("Trigger", trigger), ("Changes", &diff.summary), ("Config hash", &new_hash)],
-                "selfprotect|config-reload",
+                &reload_signature(functional, &new_hash),
             );
             // If alerts are being repointed, the old destinations must hear
             // about it too: otherwise the notice goes only to whoever did it.
@@ -589,6 +594,19 @@ fn notify_old_destinations(alert: Alert, old: hermian_core::config::Notification
                 }
             }
         });
+}
+
+/// Dedup signature for the reload alert. Each distinct functional config gets
+/// its own, so a second change within the dedup window still pages: with one
+/// fixed signature, a harmless edit followed by the real one within five
+/// minutes left the second silent (seen on the test VM when auto_isolate was
+/// switched on). No-op reloads share one signature, they're only INFO.
+fn reload_signature(functional: bool, config_hash: &str) -> String {
+    if functional {
+        format!("selfprotect|config-reload|{}", config_hash)
+    } else {
+        "selfprotect|config-reload-noop".to_string()
+    }
 }
 
 fn emit_self(notifier: &notify::Notifier, alert: Option<Alert>) {
@@ -759,6 +777,7 @@ fn line(enabled: bool, source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hermian_core::{Allowlist, Baseline};
 
     #[test]
     fn auth_label_names_every_source() {
@@ -767,5 +786,42 @@ mod tests {
         assert_eq!(auth_source_label(true, Journal), "PAM + journald + inotify");
         assert_eq!(auth_source_label(true, None), "PAM + inotify");
         assert_eq!(auth_source_label(false, None), "inotify only");
+    }
+
+    fn engine() -> Engine {
+        Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            Baseline::default(),
+            "t".into(),
+        )
+    }
+
+    fn reload(eng: &mut Engine, functional: bool, hash: &str) -> Option<Alert> {
+        let sev = if functional {
+            Severity::Critical
+        } else {
+            Severity::Info
+        };
+        let f = Finding::new(
+            DetectionId::Self_,
+            sev,
+            "reload",
+            &reload_signature(functional, hash),
+        );
+        eng.alert_from(f, Utc::now())
+    }
+
+    #[test]
+    fn every_distinct_config_change_pages() {
+        let mut eng = engine();
+        assert!(reload(&mut eng, true, "aaa").is_some());
+        // A second, different change a moment later must not be deduped away.
+        assert!(reload(&mut eng, true, "bbb").is_some());
+        // The same config again (e.g. a re-save) is.
+        assert!(reload(&mut eng, true, "bbb").is_none());
+        // No-op reloads stay collapsed.
+        assert!(reload(&mut eng, false, "c1").is_some());
+        assert!(reload(&mut eng, false, "c2").is_none());
     }
 }

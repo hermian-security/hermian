@@ -10,10 +10,22 @@ use crate::cli::{severity_filter, AlertsArgs, ShowArgs};
 use crate::paths;
 use crate::ui::{ago, Style};
 
+/// Alerts are root-only; say so rather than "no alerts" or "no such alert".
+fn needs_root(e: &std::io::Error) -> Option<anyhow::Error> {
+    (e.kind() == std::io::ErrorKind::PermissionDenied)
+        .then(|| anyhow::anyhow!("alerts are root-only; re-run with sudo"))
+}
+
 fn load_all() -> Result<Vec<Alert>> {
     let dir = paths::alerts_dir();
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Ok(Vec::new());
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            if let Some(err) = needs_root(&e) {
+                return Err(err);
+            }
+            return Ok(Vec::new());
+        }
     };
     let mut alerts: Vec<Alert> = entries
         .flatten()
@@ -138,13 +150,19 @@ pub fn load_alert(ref_id: &str) -> Result<Alert> {
         )
     })?;
     let path = paths::alerts_dir().join(format!("{}.json", ref_id));
-    let text = fs::read_to_string(&path).with_context(|| {
-        format!(
-            "no alert {} (looked in {})",
-            ref_id,
-            paths::alerts_dir().display()
-        )
-    })?;
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(err) = needs_root(&e) {
+                return Err(err);
+            }
+            return Err(anyhow::Error::new(e).context(format!(
+                "no alert {} (looked in {})",
+                ref_id,
+                paths::alerts_dir().display()
+            )));
+        }
+    };
     serde_json::from_str::<Alert>(&text)
         .map(Alert::sanitized)
         .context("alert file is corrupt")
@@ -163,6 +181,14 @@ pub fn cmd_show(args: &ShowArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_errors_say_to_use_sudo() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = needs_root(&denied).unwrap().to_string();
+        assert!(msg.contains("sudo"), "{}", msg);
+        assert!(needs_root(&std::io::Error::from(std::io::ErrorKind::NotFound)).is_none());
+    }
 
     #[test]
     fn refs_cannot_escape_the_alerts_dir() {
