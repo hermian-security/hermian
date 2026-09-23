@@ -462,7 +462,10 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     .iter()
     .any(|s| ev.path.ends_with(s));
     let is_enable_link = ev.path.contains(".wants/") || ev.path.contains(".requires/");
-    if !is_unit && !is_enable_link {
+    // `x.service.d/override.conf` can replace ExecStart= of an existing,
+    // package-owned service: the quietest way to persist through systemd.
+    let is_dropin = is_systemd_dropin(&ev.path);
+    if !is_unit && !is_enable_link && !is_dropin {
         return None;
     }
     if ev.managed_by_package == Some(true) || writer_is_installer(ev, ctx) {
@@ -477,20 +480,20 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         }
     }
     let attribution = ctx.attribute(ev);
-    let exec_line = ev
-        .content
-        .as_deref()
-        .and_then(|c| c.lines().find_map(|l| l.trim().strip_prefix("ExecStart=")))
-        .map(str::to_string);
-    let suspicious_exec = exec_line
-        .as_deref()
-        .map(|e| {
-            e.contains("/tmp/")
-                || e.contains("/dev/shm/")
-                || e.contains("/var/tmp/")
-                || looks_like_staging(e)
-        })
-        .unwrap_or(false);
+    let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
+    let is_suspicious = |e: &str| {
+        e.contains("/tmp/")
+            || e.contains("/dev/shm/")
+            || e.contains("/var/tmp/")
+            || looks_like_staging(e)
+    };
+    // Show the suspicious command if there is one, else the first.
+    let exec_line = execs
+        .iter()
+        .find(|e| is_suspicious(e))
+        .or(execs.first())
+        .cloned();
+    let suspicious_exec = execs.iter().any(|e| is_suspicious(e));
 
     if attribution.is_interactive() && !suspicious_exec {
         return Some(
@@ -519,6 +522,10 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         severity,
         if is_enable_link {
             "systemd unit enabled outside of systemctl"
+        } else if is_dropin && suspicious_exec {
+            "systemd drop-in makes a service run from a transient directory"
+        } else if is_dropin {
+            "systemd drop-in added with no session present"
         } else if suspicious_exec {
             "systemd unit installed that runs from a transient directory"
         } else {
@@ -543,9 +550,43 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         "Identify the process that wrote the file.",
     ]);
     if let Some(e) = exec_line {
-        f = f.fact("ExecStart", e);
+        f = f.fact("Command", e);
     }
     Some(f)
+}
+
+/// `/etc/systemd/system/<unit>.d/<name>.conf`
+pub fn is_systemd_dropin(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/etc/systemd/system/") else {
+        return false;
+    };
+    match rest.split_once('/') {
+        Some((dir, file)) => dir.ends_with(".d") && !file.contains('/') && file.ends_with(".conf"),
+        None => false,
+    }
+}
+
+/// Every command a unit or drop-in runs. An empty `ExecStart=` only resets
+/// the list (the usual first line of an override), so it's skipped. systemd
+/// prefixes (`-`, `@`, `+`, `!`, `:`) are stripped.
+fn unit_exec_lines(content: &str) -> Vec<String> {
+    const KEYS: &[&str] = &[
+        "ExecStart=",
+        "ExecStartPre=",
+        "ExecStartPost=",
+        "ExecStop=",
+        "ExecStopPost=",
+        "ExecReload=",
+        "ExecCondition=",
+    ];
+    content
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| KEYS.iter().find_map(|k| l.strip_prefix(k)))
+        .map(|v| v.trim_start_matches(['-', '@', '+', '!', ':']).trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -560,6 +601,35 @@ mod tests {
         let u = "PATH=/usr/bin\n0 3 * * * /usr/bin/backup --flag=1\n@daily /home/dev/sync\n";
         let cmds = cron_commands(u, false);
         assert_eq!(cmds, vec!["/usr/bin/backup --flag=1", "/home/dev/sync"]);
+    }
+
+    #[test]
+    fn dropin_paths() {
+        assert!(is_systemd_dropin(
+            "/etc/systemd/system/ssh.service.d/override.conf"
+        ));
+        assert!(is_systemd_dropin(
+            "/etc/systemd/system/getty@.service.d/x.conf"
+        ));
+        assert!(!is_systemd_dropin("/etc/systemd/system/ssh.service"));
+        assert!(!is_systemd_dropin(
+            "/etc/systemd/system/ssh.service.d/notes.txt"
+        ));
+        assert!(!is_systemd_dropin(
+            "/etc/systemd/system/multi-user.target.wants/x.service"
+        ));
+        assert!(!is_systemd_dropin("/etc/systemd/system/a.d/b/c.conf"));
+    }
+
+    #[test]
+    fn unit_exec_extraction() {
+        let c =
+            "[Service]\nExecStart=\nExecStart=-/dev/shm/.x --daemon\nExecStartPre=+/usr/bin/true\n";
+        assert_eq!(
+            unit_exec_lines(c),
+            vec!["/dev/shm/.x --daemon", "/usr/bin/true"]
+        );
+        assert!(unit_exec_lines("[Service]\nRestart=always\n").is_empty());
     }
 
     #[test]

