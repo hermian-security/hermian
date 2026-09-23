@@ -78,6 +78,13 @@ jobs:
       # stale hermian-ebpf/prebuilt/hermian-ebpf.o fails CI instead of shipping.
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo clippy --all-targets -- -D warnings
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release
+      - name: nft accepts the isolation ruleset
+        run: |
+          sudo apt-get install -y nftables
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release -p hermian --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
+          test -n "$BIN"
+          sudo "$BIN" --ignored --exact isolate::tests::nft_accepts_the_ruleset
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release
       - name: Vendored eBPF object is current
         run: |
