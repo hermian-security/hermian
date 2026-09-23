@@ -289,7 +289,11 @@ pub fn cmd_notify_test(args: &NotifyTestArgs) -> Result<()> {
         let probe = match *ch {
             "telegram" => crate::channels::telegram::probe(&n.telegram),
             "email" => crate::channels::email::probe(&n.email),
-            "webhook" => Ok(format!("{} ({})", n.webhook.url, n.webhook.format)),
+            "webhook" => Ok(format!(
+                "{} ({})",
+                crate::notify::webhook::display_url(&n.webhook.url),
+                n.webhook.format
+            )),
             _ => Ok(String::new()),
         };
         match probe {
