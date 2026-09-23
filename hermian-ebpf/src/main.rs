@@ -8,7 +8,7 @@ use aya_ebpf::{
         bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{HashMap, PerCpuArray, PerfEventArray},
+    maps::{LruHashMap, PerCpuArray, PerfEventArray},
     programs::TracePointContext,
     EbpfContext,
 };
@@ -47,8 +47,12 @@ pub struct ExecIntent {
     pub argv0: [u8; 128],
 }
 
+/// LRU: an intent is only consumed by a *successful* exec, so failed execs
+/// (execvp walking PATH, or a loop of execve("/nonexistent") in short-lived
+/// processes) used to fill a plain hash map until every later insert failed
+/// and argv0/LD_PRELOAD went missing for good. LRU evicts the stale ones.
 #[map]
-static EXEC_INTENT: HashMap<u32, ExecIntent> = HashMap::with_max_entries(4096, 0);
+static EXEC_INTENT: LruHashMap<u32, ExecIntent> = LruHashMap::with_max_entries(4096, 0);
 
 #[map]
 static INTENT_SCRATCH: PerCpuArray<ExecIntent> = PerCpuArray::with_max_entries(1, 0);

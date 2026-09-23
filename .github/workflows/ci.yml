@@ -94,7 +94,7 @@ jobs:
           BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release -p hermian --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
           test -n "$BIN"
-          sudo "$BIN" --ignored --exact ebpf::tests::ebpf_object_loads_and_sees_ld_preload
+          sudo "$BIN" --ignored --test-threads=1 ebpf::tests::
       - uses: actions/upload-artifact@v4
         with:
           name: hermian-linux-amd64
