@@ -17,6 +17,26 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - Auto-isolation ignores CRITICALs whose web server or database isn't
   installed in a root-owned location. Any local user could otherwise run a
   program called `nginx` and cut the host off. The alert still pages.
+- Tool exemptions are harder to borrow:
+  - A script named like a tool (`/tmp/dnf`, python renamed to `dnf`) isn't
+    the package manager; the script's own path has to be trusted.
+  - LD_PRELOAD under `make`, `cargo` and friends is INFO only when that build
+    tool is really installed, not just named so.
+  - Running `visudo -c` or `passwd -S` from a cron job or service no longer
+    excuses a direct sudoers/shadow write a moment later. The tool has to
+    come from an operator session or a package/config manager.
+  - A ptrace from a process we never saw exec (a forked child calling itself
+    `gdb`) isn't treated as a debugger; the daemon now reads it from /proc.
+  - A TTY or `sudo` under a web server, database or cron isn't an operator
+    session (`pty.spawn` from a web shell no longer downgrades alerts).
+- The real `crontab` installing a download-and-run job is CRITICAL, and every
+  cron line is checked (only the first four were). A package manager writing
+  a unit that runs from `/tmp` is reported too.
+
+### Changed
+
+- User management run from cron or a plain service (not a session, package
+  or config manager) is now reported when it rewrites `/etc/shadow`.
 
 ## 0.1.0-beta.5 - 2026-09-23
 

@@ -59,11 +59,18 @@ isn't. File rules also distinguish operator edits from unattended writes.
 Roles that exempt a process (package and config managers, user tools,
 debuggers, session daemons) need its executable in a root-owned system
 directory; a binary merely named `dpkg` doesn't count. Script tools such as
-dnf or Debian's adduser are identified by name under a system interpreter,
-so a script with such a name run by that interpreter can still pass.
+dnf or Debian's adduser run under an interpreter, so the script's own path
+(from the command line) has to be in such a directory. Build tools that
+excuse LD_PRELOAD (make, cargo, fakeroot...) follow the same rule. A TTY or
+`sudo` doesn't count as an operator under a web server, database or cron.
+Content checks come before tool exemptions: the real `crontab` installing a
+`curl | sh` job, or a package manager writing a unit that runs from `/tmp`,
+is still reported.
 
 inotify doesn't identify the writer. The daemon tries to find an open file
-descriptor; some rules also look for a recent admin tool. If the writer is
+descriptor; some rules also look for a recent admin tool, which only counts if
+an operator session or a package/config manager started it (so `visudo -c`
+from a cron job doesn't excuse a direct sudoers write). If the writer is
 unknown, recent operator activity is the fallback: something started from an
 interactive session in the last 15 seconds, or an editor running in one. An
 idle SSH or tmux session doesn't count. That's a heuristic, not proof of who

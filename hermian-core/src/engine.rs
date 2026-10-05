@@ -1308,6 +1308,7 @@ mod tests {
             DetectionId::D4,
             Severity::High
         ));
+        eng.process(exec(t, 501, 1, 1000, "gdb", "/usr/bin/gdb"));
         assert!(eng.process(mk(501, "gdb", 16)).is_empty());
         // Non-attach requests are ignored.
         assert!(eng.process(mk(502, "weird", 3)).is_empty());
@@ -1327,7 +1328,8 @@ mod tests {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
-        eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron")); // no session anywhere
+        // Run by a package install (no session anywhere).
+        eng.process(exec(t, 400, 1, 0, "apt-get", "/usr/bin/apt-get"));
         eng.process(exec(t, 500, 400, 0, "useradd", "/usr/sbin/useradd"));
         let alerts = eng.process(Event::File(file(
             t + Duration::seconds(1),

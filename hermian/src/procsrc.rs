@@ -134,6 +134,37 @@ pub fn cmdline_of(pid: u32) -> Option<String> {
     }
 }
 
+/// The raw argument vector from `/proc/<pid>/cmdline` (at most 64 args).
+pub fn argv_of(pid: u32) -> Vec<String> {
+    let Ok(f) = fs::File::open(format!("/proc/{}/cmdline", pid)) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if f.take(64 * 1024).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf.split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .take(64)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// The exe the engine's trust checks should see for `pid`. Normally `exe`
+/// unchanged; for a script tool (`dnf`, `adduser`...) the script's own path,
+/// so a shell script at `/tmp/dnf` isn't trusted as the package manager.
+/// See [`hermian_core::proctree::script_tool_exe`].
+pub fn judged_exe(pid: u32, comm: &str, exe: &str) -> String {
+    let unchanged = hermian_core::proctree::script_tool_exe(comm, exe, &[]);
+    if unchanged == exe {
+        // Not a script tool under an interpreter: no need to read cmdline.
+        return unchanged;
+    }
+    let argv = argv_of(pid);
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    hermian_core::proctree::script_tool_exe(comm, exe, &refs)
+}
+
 pub fn comm_of(pid: u32) -> Option<String> {
     let mut f = fs::File::open(format!("/proc/{}/comm", pid)).ok()?;
     let mut buf = [0u8; 64];
@@ -246,12 +277,12 @@ pub fn proc_info(pid: u32, now: chrono::DateTime<chrono::Utc>) -> Option<ProcInf
         pid,
         ppid,
         uid,
-        comm,
         exe: if deleted {
             format!("{} (deleted)", exe)
         } else {
-            exe
+            judged_exe(pid, &comm, &exe)
         },
+        comm,
         start,
         tty_nr,
         container,
@@ -284,6 +315,7 @@ pub fn pid_for_path(path: &str) -> Option<(u32, String, String, u32, i64)> {
             if target == path {
                 let comm = comm_of(pid).unwrap_or_default();
                 let (exe, _) = exe_of(pid).unwrap_or_default();
+                let exe = judged_exe(pid, &comm, &exe);
                 let uid = uid_of(pid).unwrap_or(0);
                 let (_ppid, tty_nr, _start) = stat_of(pid).unwrap_or((0, 0, 0));
                 return Some((pid, comm, exe, uid, tty_nr));
@@ -493,6 +525,37 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // temp_dir itself may be a symlink (macOS-style setups); use the real path.
         fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn script_named_like_a_tool_is_judged_by_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("scripttool");
+        let script = dir.join("dnf");
+        fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new(&script).spawn().unwrap();
+        let pid = child.id();
+        // Wait for the exec to land (comm switches from the test's to "dnf").
+        let mut comm = String::new();
+        for _ in 0..100 {
+            comm = comm_of(pid).unwrap_or_default();
+            if comm == "dnf" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (exe, _) = exe_of(pid).unwrap();
+        let judged = judged_exe(pid, &comm, &exe);
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(comm, "dnf");
+        assert_eq!(judged, script.to_str().unwrap(), "exe was {}", exe);
+        assert_ne!(
+            hermian_core::role_of(&comm, &judged),
+            hermian_core::Role::PackageManager
+        );
     }
 
     #[test]

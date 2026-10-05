@@ -504,6 +504,11 @@ fn emit_exec(p: PendingExec, pid: u32, tx: &mpsc::Sender<Event>) {
     } else {
         p.comm
     };
+    let exe = if deleted {
+        exe
+    } else {
+        procsrc::judged_exe(pid, &comm, &exe)
+    };
     let ev = ExecEvent {
         ts: chrono::Utc::now(),
         pid,

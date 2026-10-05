@@ -178,6 +178,10 @@ const SCRIPT_TOOLS: &[&str] = &[
     "puppet",
     "chef-client",
     "chef-solo",
+    // Build drivers (D4's LD_PRELOAD context): Debian's fakeroot is a shell
+    // script, dpkg-buildpackage is Perl.
+    "fakeroot",
+    "dpkg-buildpackage",
 ];
 
 const SCRIPT_INTERPRETERS: &[&str] = &[
@@ -247,6 +251,38 @@ pub fn is_system_tool(comm: &str, exe: &str, names: &[&str]) -> bool {
     comm_matches(base, SCRIPT_INTERPRETERS)
         && comm_matches(c, names)
         && comm_matches(c, SCRIPT_TOOLS)
+}
+
+/// The exe to record for a process that may be a script tool.
+///
+/// `dnf` or Debian's `adduser` run as `/usr/bin/python3` or `/usr/bin/perl`,
+/// so [`is_system_tool`] trusts them by comm under a system interpreter. But
+/// comm is just the script's file name (or whatever `prctl` set), so
+/// `/tmp/dnf` with a `#!/bin/sh` line, or python renaming itself to `dnf`,
+/// passed as the real package manager.
+///
+/// Given the process's argv, this returns the script's path in place of the
+/// interpreter when comm names a script tool, so the trust check applies to
+/// the script itself. If no argument names the script, it returns a marked
+/// value that no trusted-dir check accepts. Anything else gets `exe` back
+/// unchanged. Callers in the daemon use it wherever they read an exe.
+pub fn script_tool_exe(comm: &str, exe: &str, argv: &[&str]) -> String {
+    let c = comm.trim();
+    let interp = exe_basename(exe);
+    if !comm_matches(c, SCRIPT_TOOLS) || !comm_matches(interp, SCRIPT_INTERPRETERS) {
+        return exe.to_string();
+    }
+    // argv[0] is the interpreter; the script is a later argument whose file
+    // name is the comm (the kernel truncates comm to 15 bytes).
+    let script = argv.iter().skip(1).find(|a| {
+        let base = exe_basename(a);
+        !base.is_empty() && (base == c || (c.len() == 15 && base.starts_with(c)))
+    });
+    match script {
+        // A relative path can't be judged; it won't start with a trusted dir.
+        Some(s) => s.to_string(),
+        None => format!("(unverified script) {}", exe),
+    }
 }
 
 pub fn role_of(comm: &str, exe: &str) -> Role {
@@ -577,16 +613,32 @@ impl ProcessTree {
 
     /// True when `pid` (or any ancestor) has a controlling TTY or descends from a
     /// session daemon (sshd, login, sudo, tmux...).
+    ///
+    /// Not when a web server, database or cron daemon sits in the ancestry: a
+    /// TTY is trivial to get (`python -c 'import pty; pty.spawn("sh")'`,
+    /// `script`), and a web shell that upgrades to a pty, or runs `sudo`, isn't
+    /// an operator at a terminal.
     pub fn has_interactive_session(&self, pid: u32, own_tty_nr: i64) -> bool {
+        let ancestors = self.ancestors_of(pid);
+        let me = self.procs.get(&pid);
+        let unattended_origin = ancestors.iter().any(|p| {
+            matches!(
+                role_of(&p.comm, &p.exe),
+                Role::WebServer | Role::Database | Role::Cron
+            )
+        });
+        if unattended_origin {
+            return false;
+        }
         if own_tty_nr != 0 {
             return true;
         }
-        if let Some(p) = self.procs.get(&pid) {
+        if let Some(p) = me {
             if is_session_daemon(&p.comm, &p.exe) {
                 return true;
             }
         }
-        self.ancestors_of(pid)
+        ancestors
             .iter()
             .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm, &p.exe))
     }
@@ -733,6 +785,66 @@ mod tests {
         // No false prefix matches.
         assert_eq!(role_of("shred", ""), Role::Unknown);
         assert_eq!(role_of("nodemon", ""), Role::Unknown);
+    }
+
+    #[test]
+    fn script_tools_are_judged_by_the_script() {
+        let real = script_tool_exe(
+            "dnf",
+            "/usr/bin/python3.9",
+            &["/usr/bin/python3", "/usr/bin/dnf", "install"],
+        );
+        assert_eq!(real, "/usr/bin/dnf");
+        assert_eq!(role_of("dnf", &real), Role::PackageManager);
+        // `#!/bin/sh` script at /tmp/dnf.
+        let fake = script_tool_exe("dnf", "/usr/bin/dash", &["/bin/sh", "/tmp/dnf"]);
+        assert_eq!(fake, "/tmp/dnf");
+        assert_ne!(role_of("dnf", &fake), Role::PackageManager);
+        // Relative path, can't be judged.
+        let rel = script_tool_exe("adduser", "/usr/bin/perl", &["/usr/bin/perl", "./adduser"]);
+        assert_ne!(role_of("adduser", &rel), Role::UserMgmt);
+        // python renamed itself with prctl: no argument names the script.
+        let renamed = script_tool_exe("dnf", "/usr/bin/python3", &["python3", "-c", "..."]);
+        assert_ne!(role_of("dnf", &renamed), Role::PackageManager);
+        // Truncated comm.
+        let ua = script_tool_exe(
+            "unattended-upgr",
+            "/usr/bin/python3.12",
+            &["/usr/bin/python3", "/usr/bin/unattended-upgrade"],
+        );
+        assert_eq!(role_of("unattended-upgr", &ua), Role::PackageManager);
+        // Not a script tool: unchanged.
+        assert_eq!(
+            script_tool_exe("bash", "/usr/bin/bash", &["bash"]),
+            "/usr/bin/bash"
+        );
+        assert_eq!(
+            script_tool_exe("dpkg", "/usr/bin/dpkg", &["dpkg"]),
+            "/usr/bin/dpkg"
+        );
+    }
+
+    #[test]
+    fn a_tty_under_a_service_or_cron_is_not_a_session() {
+        let mut t = ProcessTree::new();
+        t.upsert(info(100, 1, "nginx"));
+        let mut sh = info(200, 100, "bash");
+        sh.exe = "/usr/bin/bash".into();
+        sh.tty_nr = 34816;
+        t.upsert(sh);
+        assert!(!t.has_interactive_session(200, 34816));
+        t.upsert(info(300, 1, "cron"));
+        let mut sudo = info(301, 300, "sudo");
+        sudo.exe = "/usr/bin/sudo".into();
+        t.upsert(sudo);
+        assert!(!t.has_interactive_session(301, 0));
+        // An SSH login with a TTY still is.
+        t.upsert(info(50, 1, "sshd"));
+        let mut login = info(60, 50, "bash");
+        login.exe = "/usr/bin/bash".into();
+        login.tty_nr = 34817;
+        t.upsert(login);
+        assert!(t.has_interactive_session(60, 34817));
     }
 
     #[test]

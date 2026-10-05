@@ -293,8 +293,15 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                         continue;
                     }
                 }
-                if let Event::Exec(e) = &ev {
-                    seed_missing_ancestors(&mut engine, e);
+                match &ev {
+                    Event::Exec(e) => seed_missing_ancestors(&mut engine, e.ppid, e.ts),
+                    // A process that forked without exec'ing (or started before
+                    // us and never exec'd since) isn't in the tree; without it
+                    // a connect or ptrace has no exe or chain, and a forked
+                    // child that calls itself "gdb" passed as a debugger.
+                    Event::Connect(c) => seed_process(&mut engine, c.pid, c.ts),
+                    Event::Ptrace(p) => seed_process(&mut engine, p.pid, p.ts),
+                    _ => {}
                 }
                 for alert in engine.process(ev) {
                     let isolate = alert.auto_isolate_eligible();
@@ -373,9 +380,8 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
 /// which is how nginx/postgres/php-fpm workers get their titles) or exec'd a
 /// new image since we last saw it. Ancestors are refreshed from /proc when the
 /// recorded comm no longer matches, so role classification uses the live name.
-fn seed_missing_ancestors(engine: &mut Engine, ev: &ExecEvent) {
-    let now = ev.ts;
-    let mut pid = ev.ppid;
+fn seed_missing_ancestors(engine: &mut Engine, ppid: u32, now: chrono::DateTime<Utc>) {
+    let mut pid = ppid;
     let mut depth = 0;
     while depth < 16 && pid > 1 {
         let known = engine.tree.get(pid).map(|p| (p.comm.clone(), p.ppid));
@@ -403,6 +409,26 @@ fn seed_missing_ancestors(engine: &mut Engine, ev: &ExecEvent) {
         }
         depth += 1;
     }
+}
+
+/// Make sure `pid` itself (and its ancestry) is in the tree, reading /proc
+/// if we never saw it exec.
+fn seed_process(engine: &mut Engine, pid: u32, now: chrono::DateTime<Utc>) {
+    if pid <= 1 {
+        return;
+    }
+    let ppid = match engine.tree.get(pid) {
+        Some(p) => p.ppid,
+        None => match procsrc::proc_info(pid, now) {
+            Some(info) => {
+                let ppid = info.ppid;
+                engine.tree.upsert(info);
+                ppid
+            }
+            None => return,
+        },
+    };
+    seed_missing_ancestors(engine, ppid, now);
 }
 
 async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sender<Event>) {
@@ -444,6 +470,11 @@ async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mps
                     })
                 };
                 let (container, container_id) = procsrc::container_info(pid);
+                let exe = if deleted {
+                    exe
+                } else {
+                    procsrc::judged_exe(pid, &comm, &exe)
+                };
                 Event::Exec(ExecEvent {
                     ts: Utc::now(),
                     pid,
