@@ -103,6 +103,11 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   normalised URL can't leak the secret path or bot token into status or
   syslog.
 - SMTP credentials aren't sent over a cleartext connection to a remote host.
+- Isolation also drops forwarded traffic (Docker, VMs), keeps cloud metadata
+  reachable, loads management CIDRs normalised from the parsed value, and
+  refuses `0.0.0.0/0` / `::/0`. New dead-man switch: `hermian isolate --for
+  <minutes>` and `response.auto_isolate_revert_mins` lift it via a systemd
+  timer.
 - A corrupt BTF blob can't panic the daemon, and `dpkg-query` isn't asked
   about file names that would act as globs.
 

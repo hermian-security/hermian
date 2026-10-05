@@ -52,6 +52,10 @@ pub enum ConfigError {
     IsolateWithoutCidrs,
     #[error("response.management_cidrs contains an invalid CIDR: '{0}'")]
     BadCidr(String),
+    #[error("response.management_cidrs entry '{0}' matches every address, so isolation would do nothing")]
+    CatchAllCidr(String),
+    #[error("response.auto_isolate_revert_mins must be at most 10080 (one week)")]
+    RevertMins,
     #[error("allowlist.{0} entry has an empty reason")]
     EmptyReason(&'static str),
 }
@@ -266,7 +270,14 @@ impl NotificationsCfg {
 pub struct ResponseCfg {
     pub auto_isolate: bool,
     pub management_cidrs: Vec<String>,
+    /// Lift an automatic isolation after this many minutes (0 = stay
+    /// isolated until `hermian unisolate`). A dead-man switch in case the
+    /// management CIDRs turn out to be wrong.
+    pub auto_isolate_revert_mins: u32,
 }
+
+/// Upper bound for `auto_isolate_revert_mins` (one week).
+pub const MAX_REVERT_MINS: u32 = 7 * 24 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -381,9 +392,16 @@ impl Config {
             return Err(ConfigError::IsolateWithoutCidrs);
         }
         for cidr in &self.response.management_cidrs {
-            if crate::allowlist::parse_cidr(cidr).is_none() {
-                return Err(ConfigError::BadCidr(cidr.clone()));
+            match crate::allowlist::parse_cidr(cidr) {
+                None => return Err(ConfigError::BadCidr(cidr.clone())),
+                // 0.0.0.0/0 or ::/0 keeps everything reachable: isolation
+                // would silently do nothing.
+                Some((_, 0)) => return Err(ConfigError::CatchAllCidr(cidr.clone())),
+                Some(_) => {}
             }
+        }
+        if self.response.auto_isolate_revert_mins > MAX_REVERT_MINS {
+            return Err(ConfigError::RevertMins);
         }
         self.allowlist.validate()?;
         Ok(())
@@ -456,6 +474,7 @@ timeout_secs = 10
 [response]
 auto_isolate = false    # on CRITICAL, drop all traffic except management_cidrs
 management_cidrs = []   # e.g. ["203.0.113.0/24"]
+auto_isolate_revert_mins = 0  # >0 lifts an automatic isolation after this long
 
 [allowlist]
 # [[allowlist.process_chains]]
@@ -615,6 +634,20 @@ reason = "ansible"
         ));
         let cfg = Config::parse("[response]\nmanagement_cidrs = [\"not-a-cidr\"]\n").unwrap();
         assert!(matches!(cfg.validate(), Err(ConfigError::BadCidr(_))));
+        for all in ["0.0.0.0/0", "::/0"] {
+            let cfg =
+                Config::parse(&format!("[response]\nmanagement_cidrs = [\"{}\"]\n", all)).unwrap();
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::CatchAllCidr(_))),
+                "{}",
+                all
+            );
+        }
+        let cfg = Config::parse(
+            "[response]\nmanagement_cidrs = [\"203.0.113.0/24\"]\nauto_isolate_revert_mins = 99999\n",
+        )
+        .unwrap();
+        assert!(matches!(cfg.validate(), Err(ConfigError::RevertMins)));
     }
 
     #[test]

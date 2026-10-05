@@ -172,10 +172,18 @@ A CRITICAL whose web server or database isn't installed in a root-owned
 location still pages but doesn't isolate, so a local user can't trigger it by
 naming a program `nginx`.
 The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
-neighbour discovery, DNS to the resolvers in resolv.conf, and TCP to the
-notification endpoints resolved at isolation time. It isn't a complete
-network cutoff. Check your CIDRs
-and recovery access on a test host first; don't assume remote access is guaranteed.
+neighbour discovery, DNS to the resolvers in resolv.conf, cloud instance
+metadata (169.254.169.254, which some providers need for SSH logins), and TCP
+to the notification endpoints resolved at isolation time. Routed traffic
+(containers, VMs) is dropped too. It isn't a complete network cutoff.
+Catch-all CIDRs (`0.0.0.0/0`, `::/0`) are rejected since they'd make
+isolation a no-op.
+
+As a dead-man switch, `hermian isolate --for 30` lifts the isolation after 30
+minutes, and `response.auto_isolate_revert_mins` does the same for automatic
+isolation. Both use a transient systemd timer, so they work even if the
+daemon is gone. Check your CIDRs and recovery access on a test host first;
+don't assume remote access is guaranteed.
 
 `hermian uninstall` tries to lift isolation, then removes the unit, config, state,
 logs, PAM hook, and binary. Back up any alerts you want to keep.

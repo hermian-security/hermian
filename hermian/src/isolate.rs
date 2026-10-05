@@ -60,16 +60,57 @@ fn fam(ip: &IpAddr) -> &'static str {
     }
 }
 
+/// A management CIDR as nft should see it: parsed (never the raw config
+/// string) and with host bits cleared, so `203.0.113.5/24` loads as
+/// `203.0.113.0/24` instead of being rejected.
+fn normalize_cidr(cidr: &str) -> Option<String> {
+    let (ip, prefix) = hermian_core::allowlist::parse_cidr(cidr)?;
+    let net = match ip {
+        IpAddr::V4(v4) => {
+            let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+            IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & mask))
+        }
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+            IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & mask))
+        }
+    };
+    Some(format!("{}/{}", net, prefix))
+}
+
+/// Cloud instance metadata. GCE OS Login and similar agents need it for SSH
+/// itself, so cutting it can lock the operator out. It's link-local to the
+/// hypervisor, not a route to the internet.
+const METADATA: &[&str] = &["ip daddr 169.254.169.254", "ip6 daddr fd00:ec2::254"];
+
 /// Build the complete ruleset as one `nft -f -` script. It creates, deletes
 /// and recreates the table in a single transaction, so there's no window
 /// with the old rules gone and the new ones not yet loaded.
 fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
+    let cidrs: Vec<(String, &'static str)> = management_cidrs
+        .iter()
+        .filter_map(|c| normalize_cidr(c))
+        .map(|c| {
+            let fam = if c.contains(':') { "ip6" } else { "ip" };
+            (c, fam)
+        })
+        .collect();
     let mut s = String::new();
     s.push_str(&format!(
         "add table inet {t}\ndelete table inet {t}\n",
         t = TABLE
     ));
     s.push_str(&format!("table inet {t} {{\n", t = TABLE));
+    // Routed traffic (containers, VMs, a host that forwards) never passes the
+    // input/output hooks, so without this chain it wasn't isolated at all.
+    s.push_str("  chain forward {\n");
+    s.push_str("    type filter hook forward priority -10; policy drop;\n");
+    s.push_str("    ct state established,related accept\n");
+    for (cidr, fam) in &cidrs {
+        s.push_str(&format!("    {} saddr {} accept\n", fam, cidr));
+        s.push_str(&format!("    {} daddr {} accept\n", fam, cidr));
+    }
+    s.push_str("  }\n");
     for (chain, hook, iface, dir) in [
         ("input", "input", "iif", "saddr"),
         ("output", "output", "oif", "daddr"),
@@ -81,9 +122,13 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
         ));
         s.push_str(&format!("    {} lo accept\n", iface));
         s.push_str("    ct state established,related accept\n");
-        for cidr in management_cidrs {
-            let fam = if cidr.contains(':') { "ip6" } else { "ip" };
+        for (cidr, fam) in &cidrs {
             s.push_str(&format!("    {} {} {} accept\n", fam, dir, cidr));
+        }
+        if chain == "output" {
+            for m in METADATA {
+                s.push_str(&format!("    {} tcp dport 80 accept\n", m));
+            }
         }
         // Keep the link itself alive: IPv6 neighbour/router discovery and
         // DHCP lease renewal. Without them IPv6 management access breaks at
@@ -219,6 +264,18 @@ pub fn apply_isolation(management_cidrs: &[String], egress: &Egress) -> Result<(
     if management_cidrs.is_empty() {
         anyhow::bail!("isolation requires response.management_cidrs in /etc/hermian/config.toml");
     }
+    // Re-checked here: the CLI may run with a config the daemon never
+    // validated, and an unusable CIDR would mean no way back in.
+    for c in management_cidrs {
+        match hermian_core::allowlist::parse_cidr(c) {
+            None => anyhow::bail!("management CIDR '{}' is invalid", c),
+            Some((_, 0)) => anyhow::bail!(
+                "management CIDR '{}' matches everything; isolation would do nothing",
+                c
+            ),
+            Some(_) => {}
+        }
+    }
     let script = ruleset(management_cidrs, egress);
     let mut child = std::process::Command::new("nft")
         .args(["-f", "-"])
@@ -242,28 +299,93 @@ pub fn apply_isolation(management_cidrs: &[String], egress: &Egress) -> Result<(
 }
 
 pub fn remove_isolation() -> Result<()> {
+    cancel_revert();
     if !is_isolated() {
         return Ok(());
     }
     run_nft(&["delete", "table", "inet", TABLE])
 }
 
-pub fn cmd_isolate() -> Result<()> {
+/// Transient systemd timer that lifts isolation on its own.
+const REVERT_UNIT: &str = "hermian-unisolate";
+
+fn find_nft() -> Option<&'static str> {
+    ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft", "/bin/nft"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+}
+
+/// Arguments for `systemd-run` scheduling the revert.
+fn revert_args(minutes: u32, nft: &str) -> Vec<String> {
+    vec![
+        format!("--unit={}", REVERT_UNIT),
+        format!("--on-active={}m", minutes),
+        "--timer-property=AccuracySec=1s".to_string(),
+        "--description=HERMIAN: lift network isolation".to_string(),
+        nft.to_string(),
+        "delete".to_string(),
+        "table".to_string(),
+        "inet".to_string(),
+        TABLE.to_string(),
+    ]
+}
+
+/// Lift isolation after `minutes`, via a systemd timer, so it happens even
+/// if the daemon is dead and nobody can log in to undo a wrong CIDR.
+pub fn schedule_revert(minutes: u32) -> Result<()> {
+    cancel_revert();
+    let nft = find_nft().context("nft not found")?;
+    let out = std::process::Command::new("systemd-run")
+        .args(revert_args(minutes, nft))
+        .output()
+        .context("failed to run systemd-run")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "systemd-run failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn cancel_revert() {
+    let _ = std::process::Command::new("systemctl")
+        .args(["stop", &format!("{}.timer", REVERT_UNIT)])
+        .output();
+    let _ = std::process::Command::new("systemctl")
+        .args(["reset-failed", &format!("{}.service", REVERT_UNIT)])
+        .output();
+}
+
+pub fn cmd_isolate(args: &crate::cli::IsolateArgs) -> Result<()> {
     config::require_root()?;
     let st = Style::detect();
     let cfg = config::load_config()?;
     let egress = egress_for(&cfg.notifications);
     apply_isolation(&cfg.response.management_cidrs, &egress)?;
+    let revert = match args.for_mins {
+        Some(m) if m > 0 => match schedule_revert(m) {
+            Ok(()) => Some(m),
+            Err(e) => {
+                eprintln!("hermian: could not schedule the automatic revert: {:#}", e);
+                None
+            }
+        },
+        _ => None,
+    };
     println!("{}", st.warn("Host isolated."));
     println!(
         "  Reachable: loopback, established flows, {}",
         cfg.response.management_cidrs.join(", ")
     );
     println!(
-        "  Also:      {} DNS resolver(s), {} notification endpoint(s), DHCP, IPv6 ND",
+        "  Also:      {} DNS resolver(s), {} notification endpoint(s), DHCP, IPv6 ND, cloud metadata",
         egress.resolvers.len(),
         egress.notify.len()
     );
+    if let Some(m) = revert {
+        println!("  Reverts:   automatically in {} minute(s)", m);
+    }
     println!("  Recover:   sudo hermian unisolate");
     Ok(())
 }
@@ -282,6 +404,7 @@ pub fn auto_isolate_if_enabled(cfg: &hermian_core::Config) {
     }
     let cidrs = cfg.response.management_cidrs.clone();
     let notifications = cfg.notifications.clone();
+    let revert_mins = cfg.response.auto_isolate_revert_mins;
     // Everything here shells out or resolves names: keep it off the event loop.
     tokio::task::spawn_blocking(move || {
         if is_isolated() {
@@ -296,16 +419,26 @@ pub fn auto_isolate_if_enabled(cfg: &hermian_core::Config) {
             return;
         }
         let egress = egress_for(&notifications);
-        isolate_now(&cidrs, &egress)
+        isolate_now(&cidrs, &egress, revert_mins)
     });
 }
 
-fn isolate_now(cidrs: &[String], egress: &Egress) {
+fn isolate_now(cidrs: &[String], egress: &Egress, revert_mins: u32) {
     match apply_isolation(cidrs, egress) {
-        Ok(()) => crate::daemon::log_daemon(
-            hermian_core::Severity::Critical,
-            "auto-isolate triggered; host isolated (recover with: sudo hermian unisolate)",
-        ),
+        Ok(()) => {
+            crate::daemon::log_daemon(
+                hermian_core::Severity::Critical,
+                "auto-isolate triggered; host isolated (recover with: sudo hermian unisolate)",
+            );
+            if revert_mins > 0 {
+                if let Err(e) = schedule_revert(revert_mins) {
+                    crate::daemon::log_daemon(
+                        hermian_core::Severity::High,
+                        &format!("could not schedule the isolation revert: {:#}", e),
+                    );
+                }
+            }
+        }
         Err(e) => crate::daemon::log_daemon(
             hermian_core::Severity::High,
             &format!("auto-isolate failed: {:#}", e),
@@ -333,6 +466,67 @@ mod tests {
         assert!(s.contains("ip saddr 203.0.113.0/24 accept"));
         assert!(s.contains("ip6 daddr 2001:db8::/32 accept"));
         assert!(s.contains("policy drop"));
+    }
+
+    #[test]
+    fn forwarded_traffic_is_isolated_too() {
+        let s = ruleset(&["203.0.113.0/24".into()], &egress());
+        let fwd = &s[s.find("chain forward").unwrap()..s.find("chain input").unwrap()];
+        assert!(fwd.contains("hook forward"), "{}", fwd);
+        assert!(fwd.contains("policy drop"));
+        assert!(fwd.contains("ip saddr 203.0.113.0/24 accept"));
+        assert!(fwd.contains("ip daddr 203.0.113.0/24 accept"));
+    }
+
+    #[test]
+    fn management_cidrs_reach_both_directions_and_are_normalized() {
+        let s = ruleset(
+            &["203.0.113.77/24".into(), "2001:db8::5/32".into()],
+            &egress(),
+        );
+        let input = &s[s.find("chain input").unwrap()..s.find("chain output").unwrap()];
+        let output = &s[s.find("chain output").unwrap()..];
+        assert!(
+            input.contains("ip saddr 203.0.113.0/24 accept"),
+            "{}",
+            input
+        );
+        assert!(
+            output.contains("ip daddr 203.0.113.0/24 accept"),
+            "{}",
+            output
+        );
+        assert!(
+            input.contains("ip6 saddr 2001:db8::/32 accept"),
+            "{}",
+            input
+        );
+        assert!(!s.contains("203.0.113.77"));
+        // Garbage never reaches nft.
+        let s = ruleset(&["1.2.3.4/24; flush ruleset".into()], &egress());
+        assert!(!s.contains("flush"), "{}", s);
+    }
+
+    #[test]
+    fn catch_all_cidrs_are_refused() {
+        let e = apply_isolation(&["0.0.0.0/0".into()], &egress()).unwrap_err();
+        assert!(e.to_string().contains("matches everything"), "{}", e);
+    }
+
+    #[test]
+    fn cloud_metadata_stays_reachable() {
+        let s = ruleset(&["203.0.113.0/24".into()], &egress());
+        assert!(s.contains("ip daddr 169.254.169.254 tcp dport 80 accept"));
+    }
+
+    #[test]
+    fn revert_timer_deletes_only_our_table() {
+        let a = revert_args(15, "/usr/sbin/nft");
+        assert!(a.contains(&"--on-active=15m".to_string()));
+        assert_eq!(
+            &a[a.len() - 5..],
+            &["/usr/sbin/nft", "delete", "table", "inet", "hermian"]
+        );
     }
 
     #[test]

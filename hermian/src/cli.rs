@@ -36,7 +36,7 @@ pub enum Cmd {
     /// Collect a forensic context bundle for an alert
     Collect(CollectArgs),
     /// Isolate the host from the network (management CIDRs stay reachable)
-    Isolate,
+    Isolate(IsolateArgs),
     /// Remove network isolation
     Unisolate,
     /// Completely remove HERMIAN from this host
@@ -118,6 +118,14 @@ pub struct NotifyTestArgs {
 pub struct CollectArgs {
     /// Alert reference, e.g. HER-2025-0914-001
     pub ref_id: String,
+}
+
+#[derive(clap::Args)]
+pub struct IsolateArgs {
+    /// Lift the isolation automatically after this many minutes (a systemd
+    /// timer, so it works even if you can't get back in)
+    #[arg(long = "for", value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(1..=10080))]
+    pub for_mins: Option<u32>,
 }
 
 #[derive(clap::Args)]
