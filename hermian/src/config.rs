@@ -73,6 +73,42 @@ pub fn write_secure_bytes(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Replace an existing system file atomically, keeping its mode and owner.
+///
+/// For files other programs depend on, like `/etc/pam.d/sshd`: a crash or a
+/// full disk halfway through a plain `fs::write` left a truncated PAM stack,
+/// and that locks everyone out of SSH.
+pub fn replace_file_keep_mode(path: &Path, content: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.hermian-tmp{}",
+        path.file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(meta.mode() & 0o7777)
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+        std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()))?;
+        fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 pub fn write_secure_append(path: &Path, content: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .create(true)

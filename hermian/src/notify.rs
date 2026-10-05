@@ -45,9 +45,13 @@ pub struct NotifyState {
 }
 
 pub struct Notifier {
-    tx: mpsc::UnboundedSender<Msg>,
+    tx: mpsc::Sender<Msg>,
     pub state: Arc<Mutex<NotifyState>>,
 }
+
+/// Alerts waiting to be persisted and fanned out. Bounded: if persistence
+/// stalls (a hung disk) during an alert flood, memory mustn't grow forever.
+const NOTIFIER_QUEUE: usize = 8192;
 
 enum Msg {
     Alert(Alert),
@@ -88,7 +92,7 @@ pub fn syslog_msg(severity: Severity, text: &str) -> bool {
 
 impl Notifier {
     pub fn spawn(cfg: NotificationsCfg, initial: NotifyState) -> Notifier {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(NOTIFIER_QUEUE);
         let state = Arc::new(Mutex::new(initial));
         let worker_state = state.clone();
         tokio::spawn(async move {
@@ -98,11 +102,30 @@ impl Notifier {
     }
 
     pub fn send(&self, alert: Alert) {
-        let _ = self.tx.send(Msg::Alert(alert));
+        if let Err(mpsc::error::TrySendError::Full(Msg::Alert(a))) =
+            self.tx.try_send(Msg::Alert(alert))
+        {
+            // Still logged locally, so the alert isn't lost outright.
+            syslog_msg(
+                a.severity,
+                &format!("hermian: alert queue full, not persisted: {}", a.headline()),
+            );
+            if let Ok(mut s) = self.state.lock() {
+                *s.dropped_by_channel.entry("queue".to_string()).or_default() += 1;
+            }
+        }
     }
 
     pub fn reconfigure(&self, cfg: NotificationsCfg) {
-        let _ = self.tx.send(Msg::Reconfigure(cfg));
+        // In order with alerts when there's room (the reload notice must go
+        // to the new channels); config changes are rare and must not be lost,
+        // so wait for room otherwise.
+        if let Err(mpsc::error::TrySendError::Full(m)) = self.tx.try_send(Msg::Reconfigure(cfg)) {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(m).await;
+            });
+        }
     }
 
     pub fn snapshot(&self) -> NotifyState {
@@ -190,7 +213,7 @@ enum ChanMsg {
 /// Each channel runs as its own task with its own queue and backoff, so a
 /// broken or slow channel never delays the others (or local persistence).
 async fn worker(
-    mut rx: mpsc::UnboundedReceiver<Msg>,
+    mut rx: mpsc::Receiver<Msg>,
     mut cfg: NotificationsCfg,
     state: Arc<Mutex<NotifyState>>,
 ) {
@@ -199,8 +222,13 @@ async fn worker(
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Alert(alert) => {
-                let rendered_plain = hermian_core::render(&alert, Theme::Plain);
-                persist(&alert, &rendered_plain, &cfg);
+                // fsync'd file writes and syslog: off the async workers.
+                let (a, c) = (alert.clone(), cfg.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    let rendered_plain = hermian_core::render(&a, Theme::Plain);
+                    persist(&a, &rendered_plain, &c);
+                })
+                .await;
                 if alert.severity >= cfg.min_severity() && !channels.is_empty() {
                     for tx in channels.values() {
                         let _ = tx.send(ChanMsg::Alert(Box::new(alert.clone())));
@@ -495,12 +523,25 @@ fn append_alert_log(rendered: &str) -> anyhow::Result<()> {
 
 fn save_alert_json(alert: &Alert) {
     let dir = paths::alerts_dir();
-    if fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let path = dir.join(format!("{}.json", alert.ref_id));
-    if let Ok(text) = serde_json::to_string_pretty(alert) {
-        let _ = config::write_secure(&path, &text);
+    let result = (|| -> anyhow::Result<()> {
+        fs::create_dir_all(&dir)?;
+        let text = serde_json::to_string_pretty(alert)?;
+        // Never replace an existing record: if a ref id ever repeats (state
+        // lost, clock trouble), keep both.
+        let mut path = dir.join(format!("{}.json", alert.ref_id));
+        let mut n = 1;
+        while path.exists() && n < 1000 {
+            path = dir.join(format!("{}.{}.json", alert.ref_id, n));
+            n += 1;
+        }
+        config::write_secure(&path, &text)
+    })();
+    if let Err(e) = result {
+        // Was silent; `show`/`collect` would then say the alert doesn't exist.
+        syslog_msg(
+            Severity::High,
+            &format!("hermian: could not store alert {}: {:#}", alert.ref_id, e),
+        );
     }
 }
 
@@ -647,7 +688,33 @@ pub mod webhook {
         if !cfg.token.is_empty() {
             s = s.replace(&cfg.token, "<token>");
         }
-        s
+        // The library may print the URL normalised (host case, escaping), so
+        // the literal replace above can miss it: cut every URL in the text
+        // down to scheme://host as well.
+        strip_url_paths(&s)
+    }
+
+    /// `... https://host/secret/path?q ...` -> `... https://host/… ...`.
+    pub fn strip_url_paths(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("://") {
+            let (before, after) = rest.split_at(i + 3);
+            out.push_str(before);
+            let end = after
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | ','))
+                .unwrap_or(after.len());
+            let url = &after[..end];
+            let authority = url.split(['/', '?', '#']).next().unwrap_or("");
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            out.push_str(host);
+            if url.len() > authority.len() {
+                out.push_str("/…");
+            }
+            rest = &after[end..];
+        }
+        out.push_str(rest);
+        out
     }
 
     pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), SendError> {
@@ -719,6 +786,18 @@ mod tests {
             webhook::display_url("https://u:pw@ntfy.example:8443/topic?auth=x"),
             "https://ntfy.example:8443/…"
         );
+    }
+
+    #[test]
+    fn urls_in_error_text_lose_their_secret_parts() {
+        let e = "Network Error: https://Hooks.Slack.com/services/T0/B0/SECRET: connection reset";
+        let s = webhook::strip_url_paths(e);
+        assert!(!s.contains("SECRET"), "{}", s);
+        assert!(s.contains("https://Hooks.Slack.com/…"), "{}", s);
+        let e = "error (http://user:pw@10.0.0.5:8080/h?token=abc) failed";
+        let s = webhook::strip_url_paths(e);
+        assert!(!s.contains("pw") && !s.contains("abc"), "{}", s);
+        assert_eq!(webhook::strip_url_paths("no urls here"), "no urls here");
     }
 
     fn queue() -> ChannelQueue {

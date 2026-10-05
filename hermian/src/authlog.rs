@@ -82,13 +82,35 @@ fn open_log() -> Option<(BufReader<File>, &'static str)> {
     })
 }
 
+/// Whether the log at `path` is no longer the file we have open: replaced
+/// (a new inode, the usual logrotate `create` mode) or truncated in place
+/// (`copytruncate`).
+fn rotated(path: &str, open_ino: u64, pos: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(m) => m.ino() != open_ino || m.len() < pos,
+        // Gone for now (between rename and create): keep the old one.
+        Err(_) => false,
+    }
+}
+
 fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
+    use std::os::unix::fs::MetadataExt;
+    // Only the very first open starts at the end (history isn't news). After
+    // a rotation the new file is read from the start: seeking to its end
+    // dropped whatever sshd logged between the rotation and our noticing.
+    let mut from_start = false;
     while !shutdown.load(Ordering::Relaxed) {
         let Some((mut reader, path)) = open_log() else {
             std::thread::sleep(Duration::from_secs(30));
+            from_start = true;
             continue;
         };
-        let _ = reader.seek(SeekFrom::End(0));
+        let open_ino = reader.get_ref().metadata().map(|m| m.ino()).unwrap_or(0);
+        if !from_start {
+            let _ = reader.seek(SeekFrom::End(0));
+        }
+        from_start = true;
         let mut line = String::new();
         let mut idle_polls = 0u32;
         loop {
@@ -100,13 +122,12 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                 Ok(0) => {
                     std::thread::sleep(Duration::from_millis(500));
                     idle_polls += 1;
-                    // Detect rotation (file replaced or truncated) every ~10s.
-                    if idle_polls >= 20 {
+                    // Check for rotation every ~2s, only once the old file is
+                    // drained (we're at its EOF), so nothing in it is skipped.
+                    if idle_polls >= 4 {
                         idle_polls = 0;
-                        let rotated = std::fs::metadata(path)
-                            .map(|m| m.len() < reader.stream_position().unwrap_or(0))
-                            .unwrap_or(true);
-                        if rotated {
+                        let pos = reader.stream_position().unwrap_or(0);
+                        if rotated(path, open_ino, pos) {
                             break;
                         }
                     }
@@ -312,6 +333,30 @@ fn extract_rhost(msg: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_is_seen_by_inode_or_truncation() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("hermian-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("auth.log");
+        let p = log.to_str().unwrap();
+        std::fs::write(&log, "line one\nline two\n").unwrap();
+        let ino = std::fs::metadata(&log).unwrap().ino();
+        assert!(!rotated(p, ino, 18));
+        // copytruncate
+        std::fs::write(&log, "").unwrap();
+        assert!(rotated(p, ino, 18));
+        // create: renamed away, new file in its place
+        std::fs::write(&log, "x\n").unwrap();
+        let ino = std::fs::metadata(&log).unwrap().ino();
+        std::fs::rename(&log, dir.join("auth.log.1")).unwrap();
+        assert!(!rotated(p, ino, 2), "missing file isn't a rotation yet");
+        std::fs::write(&log, "new\n").unwrap();
+        assert!(rotated(p, ino, 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn accepted_and_failed_lines() {

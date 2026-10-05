@@ -30,11 +30,13 @@ pub mod telegram {
     fn redact(cfg: &TelegramCfg, e: impl std::fmt::Display) -> String {
         let s = e.to_string();
         // replace("") would insert "<token>" between every character.
-        if cfg.bot_token.is_empty() {
+        let s = if cfg.bot_token.is_empty() {
             s
         } else {
             s.replace(&cfg.bot_token, "<token>")
-        }
+        };
+        // And if the URL comes back escaped or normalised, drop its path.
+        crate::notify::webhook::strip_url_paths(&s)
     }
 
     /// Escape for Telegram's HTML parse mode.
@@ -359,7 +361,21 @@ pub mod email {
         .map_err(|e| format!("build message: {}", e))
     }
 
+    /// Credentials over a cleartext connection to another host give the
+    /// password to anyone on the path. Local relays (loopback) are fine.
+    pub fn cleartext_credentials(cfg: &EmailCfg) -> bool {
+        let local = matches!(cfg.smtp_host.as_str(), "localhost" | "127.0.0.1" | "::1")
+            || cfg.smtp_host.starts_with("127.");
+        cfg.smtp_security == "none" && !cfg.smtp_username.is_empty() && !local
+    }
+
     fn smtp(cfg: &EmailCfg) -> Result<SmtpTransport, String> {
+        if cleartext_credentials(cfg) {
+            return Err(
+                "refusing to send SMTP credentials without TLS; set smtp_security = \"starttls\" or \"tls\""
+                    .to_string(),
+            );
+        }
         let timeout = Some(Duration::from_secs(cfg.timeout_secs.clamp(5, 120)));
         let mut t = match cfg.smtp_security.as_str() {
             "tls" => {
@@ -483,6 +499,25 @@ mod tests {
         // Never a dangling entity or tag.
         assert_eq!(b.matches("<code>").count(), b.matches("</code>").count());
         assert!(!b.contains("&am\n") && !b.contains("&l\n"));
+    }
+
+    #[test]
+    fn smtp_credentials_need_tls_unless_local() {
+        let mut c = EmailCfg {
+            smtp_host: "mail.example.com".into(),
+            smtp_username: "u".into(),
+            smtp_security: "none".into(),
+            ..EmailCfg::default()
+        };
+        assert!(email::cleartext_credentials(&c));
+        c.smtp_security = "starttls".into();
+        assert!(!email::cleartext_credentials(&c));
+        c.smtp_security = "none".into();
+        c.smtp_host = "127.0.0.1".into();
+        assert!(!email::cleartext_credentials(&c));
+        c.smtp_host = "mail.example.com".into();
+        c.smtp_username.clear();
+        assert!(!email::cleartext_credentials(&c));
     }
 
     #[test]

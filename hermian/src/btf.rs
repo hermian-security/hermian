@@ -58,25 +58,32 @@ impl Btf {
         let type_len = u32_at(data, 12).ok_or_else(|| anyhow!("short BTF"))? as usize;
         let str_off = u32_at(data, 16).ok_or_else(|| anyhow!("short BTF"))? as usize;
         let str_len = u32_at(data, 20).ok_or_else(|| anyhow!("short BTF"))? as usize;
-        let types = data
-            .get(hdr_len + type_off..hdr_len + type_off + type_len)
-            .ok_or_else(|| anyhow!("BTF type section out of range"))?
-            .to_vec();
-        let strings = data
-            .get(hdr_len + str_off..hdr_len + str_off + str_len)
-            .ok_or_else(|| anyhow!("BTF string section out of range"))?
-            .to_vec();
+        let section = |off: usize, len: usize, what: &str| -> Result<Vec<u8>> {
+            let start = hdr_len
+                .checked_add(off)
+                .ok_or_else(|| anyhow!("BTF {} section out of range", what))?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| anyhow!("BTF {} section out of range", what))?;
+            Ok(data
+                .get(start..end)
+                .ok_or_else(|| anyhow!("BTF {} section out of range", what))?
+                .to_vec())
+        };
+        let types = section(type_off, type_len, "type")?;
+        let strings = section(str_off, str_len, "string")?;
         Ok(Btf { types, strings })
     }
 
+    /// The string at `off`, or "" if the offset is out of range (a corrupt or
+    /// unexpected BTF blob must not panic the daemon).
     fn name(&self, off: u32) -> &str {
         let start = off as usize;
-        let end = self.strings[start..]
-            .iter()
-            .position(|b| *b == 0)
-            .map(|p| start + p)
-            .unwrap_or(self.strings.len());
-        std::str::from_utf8(&self.strings[start..end]).unwrap_or("")
+        let Some(tail) = self.strings.get(start..) else {
+            return "";
+        };
+        let end = tail.iter().position(|b| *b == 0).unwrap_or(tail.len());
+        std::str::from_utf8(&tail[..end]).unwrap_or("")
     }
 
     /// Byte offset of `member` within `struct name`, or None.
@@ -135,4 +142,57 @@ pub fn task_struct_offsets() -> Option<(u32, u32)> {
     let parent = btf.struct_member_offset("task_struct", "real_parent")?;
     let tgid = btf.struct_member_offset("task_struct", "tgid")?;
     Some((parent, tgid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tiny BTF blob: one struct `s` with members `a` (offset 0) and
+    /// `b` (bit offset 64).
+    fn blob(name_off_b: u32) -> Vec<u8> {
+        let strings = b"\0s\0a\0b\0".to_vec();
+        let mut types = Vec::new();
+        let push = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
+        push(&mut types, 1); // name "s"
+        push(&mut types, (KIND_STRUCT << 24) | 2); // kind, vlen 2
+        push(&mut types, 16); // size
+        for (name, off) in [(3u32, 0u32), (name_off_b, 64)] {
+            push(&mut types, name);
+            push(&mut types, 0); // type
+            push(&mut types, off);
+        }
+        let mut d = Vec::new();
+        d.extend_from_slice(&BTF_MAGIC.to_le_bytes());
+        d.extend_from_slice(&[1, 0]); // version, flags
+        let push_d = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
+        push_d(&mut d, 24); // hdr_len
+        push_d(&mut d, 0); // type_off
+        push_d(&mut d, types.len() as u32);
+        push_d(&mut d, types.len() as u32); // str_off
+        push_d(&mut d, strings.len() as u32);
+        d.extend_from_slice(&types);
+        d.extend_from_slice(&strings);
+        d
+    }
+
+    #[test]
+    fn finds_member_offsets() {
+        let btf = Btf::parse(&blob(5)).unwrap();
+        assert_eq!(btf.struct_member_offset("s", "a"), Some(0));
+        assert_eq!(btf.struct_member_offset("s", "b"), Some(8));
+        assert_eq!(btf.struct_member_offset("s", "c"), None);
+    }
+
+    #[test]
+    fn corrupt_input_does_not_panic() {
+        // A member name offset far past the string table.
+        let btf = Btf::parse(&blob(0xFFFF_FF00)).unwrap();
+        assert_eq!(btf.struct_member_offset("s", "b"), None);
+        // Section lengths that overflow or run past the end.
+        let mut d = blob(5);
+        d[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Btf::parse(&d).is_err());
+        assert!(Btf::parse(&[0u8; 3]).is_err());
+    }
 }

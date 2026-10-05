@@ -91,7 +91,11 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    rt.block_on(async_main(cfg, engine))
+    let result = rt.block_on(async_main(cfg, engine));
+    // Don't hang on a blocking-pool thread (the eBPF converter, a delivery in
+    // flight) once main is done.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 struct Sources {
@@ -199,6 +203,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         watch_health: None,
     };
     let mut _ebpf_runtime: Option<ebpf::EbpfRuntime> = None;
+    let mut audit_thread: Option<std::thread::JoinHandle<()>> = None;
 
     if procsrc::kernel_supports_ebpf() {
         let (raw_tx, raw_rx) = mpsc::channel::<ebpf::RawEvent>(16384);
@@ -206,7 +211,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             Ok(runtime) => {
                 sources.ebpf = Some(runtime.attached.clone());
                 _ebpf_runtime = Some(runtime);
-                tokio::spawn(convert_ebpf_events(raw_rx, event_tx.clone()));
+                // Several /proc reads per event: on a blocking thread, not
+                // one of the runtime's two workers, so an exec storm can't
+                // stall the event loop (and back up into ring loss).
+                let tx = event_tx.clone();
+                tokio::task::spawn_blocking(move || convert_ebpf_events(raw_rx, tx));
             }
             Err(e) => {
                 // Verifier output can be thousands of lines; keep the first.
@@ -234,7 +243,10 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         fallback::spawn_proc_poller(event_tx.clone(), shutdown.clone())?;
         if auditnetlink::audit_usable() {
             match auditnetlink::spawn_audit_reader(event_tx.clone(), shutdown.clone()) {
-                Ok(()) => sources.audit = true,
+                Ok(handle) => {
+                    sources.audit = true;
+                    audit_thread = Some(handle);
+                }
                 Err(e) => log_daemon(Severity::Low, &format!("audit source unavailable: {:#}", e)),
             }
         } else {
@@ -424,6 +436,14 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     save_engine_state(&engine);
     // Give the notifier a moment to flush persisted alerts.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // Let the audit thread notice and drop its socket, which removes our
+    // exec rule; returning first left the rule (and audit enabled) behind.
+    if let Some(h) = audit_thread {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     Ok(())
 }
 
@@ -547,9 +567,10 @@ fn seed_process(engine: &mut Engine, pid: u32, now: chrono::DateTime<Utc>) {
     seed_missing_ancestors(engine, ppid, now);
 }
 
-async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sender<Event>) {
+/// Runs on a blocking thread (see the caller).
+fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sender<Event>) {
     let self_pid = std::process::id();
-    while let Some(raw) = raw_rx.recv().await {
+    while let Some(raw) = raw_rx.blocking_recv() {
         let ev = match raw {
             ebpf::RawEvent::Exec(raw) => {
                 if raw.pid == self_pid {
@@ -638,7 +659,7 @@ async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mps
                 })
             }
         };
-        if tx.send(ev).await.is_err() {
+        if tx.blocking_send(ev).is_err() {
             return;
         }
     }

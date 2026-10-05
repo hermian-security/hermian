@@ -75,12 +75,50 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   longer gives up after five quick failures. It also sets `UMask=0077`,
   `ProtectKernelLogs` and a private keyring.
 
+- More persistence surfaces are watched: `/etc/pam.d`, `/etc/environment`
+  and `pam_env.conf`, `rc.local`, udev rules, boot-time kernel modules, at
+  jobs, vendor units in `/usr/lib/systemd/system`, per-user systemd units,
+  and `.ssh` in service-account homes outside `/home` (`/var/www/.ssh`).
+  `pam_exec`, a non-system PAM module, `LD_PRELOAD` in the global
+  environment and udev `RUN+=` are CRITICAL when unattended.
+- The audit fallback only accepts netlink messages from the kernel; other
+  local sockets could inject fake exec records. Its exec rule is removed on
+  shutdown again (the daemon used to exit before the reader noticed).
+- Root reads of user-controlled files use `openat2(RESOLVE_NO_SYMLINKS)` on
+  5.6+ kernels, closing the swap-the-parent-for-a-symlink race. Symlinked
+  homes and `.ssh` dirs aren't watched.
+- `/etc/pam.d/sshd` edits (enable, uninstall) are atomic and keep the file's
+  mode and owner; a crash mid-write could leave a broken PAM stack.
+- `hermian uninstall` stops the daemon before lifting isolation, and only
+  deletes absolute paths with a `hermian` component, so an odd
+  `HERMIAN_STATE_DIR` can't point `remove_dir_all` at `/`.
+- auth.log rotation is detected by inode within ~2 s and the new file is read
+  from the start; lines logged right after a rotation used to be skipped.
+- eBPF event conversion (several /proc reads per event) and alert
+  persistence (fsync) run off the async workers; the alert queue is bounded
+  and overflow is logged and counted.
+- Alert records are never overwritten if a ref id repeats, and a failed
+  write is logged instead of dropped silently.
+- Webhook and Telegram errors have every URL cut to scheme and host, so a
+  normalised URL can't leak the secret path or bot token into status or
+  syslog.
+- SMTP credentials aren't sent over a cleartext connection to a remote host.
+- A corrupt BTF blob can't panic the daemon, and `dpkg-query` isn't asked
+  about file names that would act as globs.
+
 ### Changed
 
 - Expect a HIGH "HERMIAN is stopping" notice on every stop, including
   package upgrades.
 - User management run from cron or a plain service (not a session, package
   or config manager) is now reported when it rewrites `/etc/shadow`.
+- Email with `smtp_security = "none"` and a username now fails (with a clear
+  error in `status`) unless the SMTP host is loopback.
+
+### Upgrade
+
+- If you send email through a remote SMTP server with `smtp_security =
+  "none"` and credentials, switch to `"starttls"` or `"tls"`.
 
 ## 0.1.0-beta.5 - 2026-09-23
 

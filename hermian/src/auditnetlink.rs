@@ -147,12 +147,18 @@ impl Drop for AuditSource {
     }
 }
 
-pub fn spawn_audit_reader(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) -> Result<()> {
+/// Starts the reader thread. The handle lets shutdown wait for it, so the
+/// socket's Drop removes the exec rule instead of leaving it in the kernel
+/// after the process is gone.
+pub fn spawn_audit_reader(
+    tx: mpsc::Sender<Event>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<std::thread::JoinHandle<()>> {
     let source = open_audit_socket()?;
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("hermian-audit".to_string())
         .spawn(move || audit_loop(source, tx, shutdown))?;
-    Ok(())
+    Ok(handle)
 }
 
 fn open_audit_socket() -> Result<AuditSource> {
@@ -254,10 +260,51 @@ fn send_msg<T: Copy>(fd: libc::c_int, kind: u16, payload: T) -> Result<()> {
     Ok(())
 }
 
+/// `recv`, but only messages the kernel sent (netlink port id 0).
+///
+/// Other local sockets can address ours, and a plain `recv` took whatever
+/// arrived: a forged exec record could put a fake web-shell chain (and a
+/// CRITICAL that may auto-isolate) into the engine. Anything not from the
+/// kernel is discarded and counted. Errors come back as `Err` (EAGAIN on
+/// timeout, as with `recv`).
+fn recv_from_kernel(fd: libc::c_int, buf: &mut [u8]) -> std::io::Result<usize> {
+    for _ in 0..64 {
+        // SAFETY: sockaddr_nl is plain data.
+        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        // SAFETY: valid fd, buffer and address storage of the stated size.
+        let n = unsafe {
+            libc::recvfrom(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                &mut addr as *mut libc::sockaddr_nl as *mut libc::sockaddr,
+                &mut len,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if addr.nl_pid == 0 {
+            return Ok(n as usize);
+        }
+        SPOOFED.fetch_add(1, Ordering::Relaxed);
+    }
+    Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+}
+
+/// Netlink messages from something other than the kernel, discarded.
+pub static SPOOFED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn set_rcv_timeout(fd: libc::c_int, secs: i64) {
+    set_rcv_timeout_ms(fd, secs * 1000);
+}
+
+fn set_rcv_timeout_ms(fd: libc::c_int, ms: i64) {
     let tv = libc::timeval {
-        tv_sec: secs as libc::time_t,
-        tv_usec: 0,
+        tv_sec: (ms / 1000) as libc::time_t,
+        tv_usec: ((ms % 1000) * 1000) as libc::suseconds_t,
     };
     // SAFETY: valid fd and timeval.
     unsafe {
@@ -276,12 +323,10 @@ fn expect_ack(fd: libc::c_int) -> Result<()> {
     set_rcv_timeout(fd, 2);
     let mut buf = [0u8; 8192];
     for _ in 0..8 {
-        // SAFETY: valid fd and buffer.
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n <= 0 {
-            return Err(anyhow!("no ack from audit subsystem (is auditd running?)"));
-        }
-        let n = n as usize;
+        let n = match recv_from_kernel(fd, &mut buf) {
+            Ok(n) if n > 0 => n,
+            _ => return Err(anyhow!("no ack from audit subsystem (is auditd running?)")),
+        };
         let mut offset = 0;
         while offset + std::mem::size_of::<NlMsgHdr>() <= n {
             // SAFETY: bounds checked above.
@@ -331,7 +376,9 @@ struct PendingExec {
 
 fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     let fd = source.fd;
-    set_rcv_timeout(fd, 1);
+    // Short, so shutdown notices quickly and Drop removes the rule before
+    // the process exits.
+    set_rcv_timeout_ms(fd, 200);
     let mut buf = [0u8; 65536];
     // Keyed by audit serial number, which ties SYSCALL/EXECVE/EOE records together.
     let mut pending: HashMap<u64, (u32, PendingExec)> = HashMap::new();
@@ -339,10 +386,15 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
-        // SAFETY: valid fd and buffer.
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        let received = recv_from_kernel(fd, &mut buf);
+        let n: isize = match &received {
+            Ok(n) => *n as isize,
+            Err(_) => -1,
+        };
         if n <= 0 {
-            let err = std::io::Error::last_os_error();
+            let err = received
+                .err()
+                .unwrap_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN));
             match err.raw_os_error() {
                 // Timeout or signal: the normal idle path.
                 Some(libc::EAGAIN) | Some(libc::EINTR) => {}

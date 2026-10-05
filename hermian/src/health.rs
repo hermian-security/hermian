@@ -26,6 +26,10 @@ pub fn snapshot() -> BTreeMap<String, u64> {
             INOTIFY_OVERFLOWS.load(Ordering::Relaxed),
         ),
         ("audit overflows", AUDIT_OVERFLOWS.load(Ordering::Relaxed)),
+        (
+            "forged audit messages",
+            crate::auditnetlink::SPOOFED.load(Ordering::Relaxed),
+        ),
     ] {
         if v > 0 {
             out.insert(name.to_string(), v);

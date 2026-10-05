@@ -177,7 +177,7 @@ fn enable_pam_module() -> Result<()> {
     if !content.contains("pam_hermian.so") {
         let _ = fs::copy(sshd_pam, "/etc/pam.d/sshd.hermian-bak");
     }
-    fs::write(sshd_pam, new_content)?;
+    config::replace_file_keep_mode(sshd_pam, &new_content)?;
     Ok(())
 }
 

@@ -92,21 +92,62 @@ pub fn read_regular_file(path: &str) -> Option<String> {
 pub fn open_regular(path: &str) -> Option<(fs::File, fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
     let p = std::path::Path::new(path);
-    // A symlinked parent (e.g. ~/.ssh -> /root/.ssh) would redirect the read.
-    let parent = p.parent()?;
-    if fs::canonicalize(parent).ok()? != parent {
-        return None;
-    }
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
-        .open(p)
-        .ok()?;
+    let f = match open_no_symlinks(path) {
+        Ok(f) => f,
+        // Kernels before 5.6 (or a seccomp filter) lack openat2: fall back
+        // to checking the parent, then O_NOFOLLOW on the last component.
+        // That leaves a small race (the parent can be swapped for a symlink
+        // in between), which openat2 closes.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) => {
+            // A symlinked parent (e.g. ~/.ssh -> /root/.ssh) would redirect the read.
+            let parent = p.parent()?;
+            if fs::canonicalize(parent).ok()? != parent {
+                return None;
+            }
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+                )
+                .open(p)
+                .ok()?
+        }
+        Err(_) => return None,
+    };
     let meta = f.metadata().ok()?;
     if !meta.file_type().is_file() {
         return None;
     }
     Some((f, meta))
+}
+
+/// Open read-only with no symlink anywhere in the path, atomically
+/// (`openat2` with `RESOLVE_NO_SYMLINKS`, Linux 5.6+).
+fn open_no_symlinks(path: &str) -> std::io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    let c = std::ffi::CString::new(path)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: open_how is plain data; zeroed is a valid value.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags =
+        (libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+            as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
+    // SAFETY: valid C string and open_how of the size passed.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just returned this fd and nothing else owns it.
+    Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) })
 }
 
 pub fn exe_of(pid: u32) -> Option<(String, bool)> {
@@ -160,7 +201,16 @@ pub fn judged_exe(pid: u32, comm: &str, exe: &str) -> String {
         // Not a script tool under an interpreter: no need to read cmdline.
         return unchanged;
     }
-    let argv = argv_of(pid);
+    // Mid-exec, comm is already the new one while the argument area isn't
+    // set up yet and cmdline reads empty. Give it a moment.
+    let mut argv = argv_of(pid);
+    for _ in 0..5 {
+        if !argv.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        argv = argv_of(pid);
+    }
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     hermian_core::proctree::script_tool_exe(comm, exe, &refs)
 }
@@ -491,6 +541,11 @@ pub fn is_suid_or_sgid(path: &str) -> bool {
 /// Whether `path` is owned by an installed package. `None` when no package
 /// manager could answer.
 pub fn file_in_package_database(path: &str) -> Option<bool> {
+    // `dpkg-query -S` takes a glob: a file named `x*` or `[a]` could match
+    // some packaged file and pass as package-owned. Don't ask about those.
+    if path.contains(['*', '?', '[', ']', '\\']) {
+        return None;
+    }
     for (cmd, args) in [
         ("dpkg-query", vec!["-S"]),
         ("rpm", vec!["-qf"]),
@@ -536,11 +591,12 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut child = std::process::Command::new(&script).spawn().unwrap();
         let pid = child.id();
-        // Wait for the exec to land (comm switches from the test's to "dnf").
+        // Wait for the exec to land: comm switches to "dnf", then the new
+        // argument area appears.
         let mut comm = String::new();
-        for _ in 0..100 {
+        for _ in 0..200 {
             comm = comm_of(pid).unwrap_or_default();
-            if comm == "dnf" {
+            if comm == "dnf" && argv_of(pid).len() >= 2 {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));

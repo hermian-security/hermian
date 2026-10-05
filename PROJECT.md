@@ -44,7 +44,7 @@ are the detailed rule reference, including exemptions and severity choices.
 | --- | --- |
 | [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (direct or through other programs), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
 | [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
-| [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron, shell profiles, SSH keys, and systemd changes |
+| [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron and at jobs, shell profiles, SSH keys, systemd units (admin, vendor, per-user), PAM, global environment, rc.local, udev rules, and boot-time modules |
 | [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
 | [D5: network](hermian-core/src/detect/d5.rs) | Connections linked to flagged chains, baseline novelty, and new listeners |
 
