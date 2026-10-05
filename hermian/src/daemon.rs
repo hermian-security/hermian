@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     auditnetlink, authlog, config, configdiff, ebpf, fallback, health, isolate, notify, pamsock,
-    paths, procsrc, selfprotect, status, watchers,
+    paths, procsrc, retention, selfprotect, status, watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -307,6 +307,8 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     let mut applied_hash = integrity.config_hash.clone();
     let mut dropped_seen = health::snapshot();
     let mut compat_seen: HashMap<String, bool> = HashMap::new();
+    // First pass shortly after start, then hourly.
+    let mut next_retention = std::time::Instant::now() + Duration::from_secs(60);
     let mut hotplug_reported: Vec<u32> = Vec::new();
     let started_at = Utc::now();
     let config_path = paths::config_path();
@@ -404,6 +406,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                     report_unmonitored_cpus(&mut engine, &notifier, &unmonitored);
                 }
                 hotplug_reported = unmonitored;
+                if std::time::Instant::now() >= next_retention {
+                    next_retention = std::time::Instant::now() + Duration::from_secs(3600);
+                    let days = current_cfg.general.alert_retention_days;
+                    tokio::task::spawn_blocking(move || retention::run(days));
+                }
                 let _ = config::save_baseline(&engine.baseline);
                 save_engine_state(&engine);
 

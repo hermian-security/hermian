@@ -58,6 +58,8 @@ pub enum ConfigError {
     RevertMins,
     #[error("allowlist.{0} entry has an empty reason")]
     EmptyReason(&'static str),
+    #[error("general.alert_retention_days must be at most 3650 (0 keeps alerts forever)")]
+    RetentionDays,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,9 @@ pub enum ConfigError {
 pub struct General {
     pub hostname: String,
     pub log_level: String,
+    /// Stored alert records and collect bundles older than this are deleted
+    /// (0 keeps them forever). `alerts.log` is rotated by size regardless.
+    pub alert_retention_days: u32,
 }
 
 impl Default for General {
@@ -72,9 +77,13 @@ impl Default for General {
         General {
             hostname: String::new(),
             log_level: "info".to_string(),
+            alert_retention_days: 90,
         }
     }
 }
+
+/// Upper bound for `general.alert_retention_days` (ten years).
+pub const MAX_RETENTION_DAYS: u32 = 3650;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -312,6 +321,9 @@ impl Config {
         if !(1..=MAX_BASELINE_HOURS).contains(&self.baseline.duration_hours) {
             return Err(ConfigError::BaselineDuration);
         }
+        if self.general.alert_retention_days > MAX_RETENTION_DAYS {
+            return Err(ConfigError::RetentionDays);
+        }
         if !(1..=10_000).contains(&self.ssh.failed_burst_count) {
             return Err(ConfigError::BurstCount);
         }
@@ -416,6 +428,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# HERMIAN configuration
 
 [general]
 hostname = ""           # empty = use the system hostname
+alert_retention_days = 90  # delete stored alerts/collect bundles older than this; 0 = keep
 
 [baseline]
 enabled = true          # learn SSH sources / network peers before alerting on novelty

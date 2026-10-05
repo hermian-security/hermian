@@ -119,7 +119,9 @@ was done to the target's memory. There's no cross-host correlation either.
 
 Alerts include the rule, evidence, process chain when available, and suggested
 next steps. JSON records live in `/var/lib/hermian/alerts/`; `show` and `collect`
-read them back.
+read them back. Records and collect bundles older than
+`general.alert_retention_days` (default 90, 0 keeps them) are deleted hourly,
+and `alerts.log` rotates at 50 MB, keeping three old copies.
 
 - **INFO:** context for later.
 - **LOW:** worth a look, usually not urgent.
@@ -233,6 +235,5 @@ and low false-positive rates are goals, not guarantees. The 20-second privilege
 sweep alone rules out a blanket five-second detection promise.
 
 Next: fix collector and attribution gaps, run the wider
-[burn-in matrix](docs/ROADMAP-BURN-IN.md), add log rotation/alert pruning, and
-publish a signed APT repository on GitHub Pages so updates arrive through
+[burn-in matrix](docs/ROADMAP-BURN-IN.md), and publish a signed APT repository on GitHub Pages so updates arrive through
 `apt upgrade`. RPM and other packaging can wait until that coverage is tested.

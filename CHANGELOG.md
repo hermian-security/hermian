@@ -6,6 +6,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Added
+
+- Alert retention: stored alerts and collect bundles older than
+  `general.alert_retention_days` (default 90; 0 keeps them) are deleted
+  hourly, and `alerts.log` rotates at 50 MB with three old copies kept.
+
 ### Security
 
 - A web or database shell started through another program (`nginx -> perl

@@ -17,6 +17,7 @@ mod notify;
 mod pamsock;
 mod paths;
 mod procsrc;
+mod retention;
 mod selfprotect;
 mod status;
 mod ui;
