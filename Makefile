@@ -8,7 +8,8 @@
 CARGO   ?= cargo
 PROFILE ?= release
 VERSION := $(shell sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
-DIST    := dist/hermian-$(VERSION)-linux-amd64
+ARCH    ?= $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+DIST    := dist/hermian-$(VERSION)-linux-$(ARCH)
 
 build:
 	$(CARGO) build --$(PROFILE)
@@ -27,8 +28,11 @@ fmt-check:
 
 check: fmt-check lint test
 
+# Same tool and layout as the release workflow (there's no debian/ dir;
+# packaging/debian holds the maintainer scripts cargo-deb uses).
+# Needs: cargo install cargo-deb --version 3.8.0 --locked
 deb: build
-	dpkg-buildpackage -us -uc -b
+	$(CARGO) deb -p hermian --no-build -o dist/
 
 release: build
 	rm -rf dist
@@ -37,8 +41,8 @@ release: build
 	if [ -f target/release/libpam_hermian.so ]; then cp target/release/libpam_hermian.so $(DIST)/; fi
 	cp packaging/install.sh $(DIST)/
 	cp LICENSE README.md $(DIST)/
-	cd dist && tar czf hermian-$(VERSION)-linux-amd64.tar.gz hermian-$(VERSION)-linux-amd64/
-	@echo "release tarball: dist/hermian-$(VERSION)-linux-amd64.tar.gz"
+	cd dist && tar czf hermian-$(VERSION)-linux-$(ARCH).tar.gz hermian-$(VERSION)-linux-$(ARCH)/
+	@echo "release tarball: dist/hermian-$(VERSION)-linux-$(ARCH).tar.gz"
 
 install: build
 	install -D -m 0755 target/release/hermian /usr/local/bin/hermian

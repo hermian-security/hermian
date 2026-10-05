@@ -15,6 +15,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # The vendored eBPF object is compared byte for byte with a fresh build, so
+  # the toolchain that builds it is pinned. Bump together with bpf-linker and
+  # commit the rebuilt object in the same PR (see PROJECT.md).
+  HERMIAN_EBPF_NIGHTLY: nightly-2026-09-17
 
 jobs:
   harness:
@@ -22,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.8'
@@ -47,6 +53,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
@@ -61,13 +69,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
-          toolchain: nightly
+          toolchain: ${{ env.HERMIAN_EBPF_NIGHTLY }}
           components: rust-src
       - run: rustup default stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -121,3 +131,34 @@ jobs:
           path: |
             target/release/hermian
             target/release/libpam_hermian.so
+
+  # Advisory for now: not in the required-check set (that's a repository
+  # setting). Known vulnerabilities, yanked crates, licenses, sources.
+  supply-chain:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny --locked check
+
+  # The declared rust-version must keep building.
+  msrv:
+    name: msrv (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.91"
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - run: HERMIAN_EBPF_FROM_SOURCE=0 cargo check --workspace --all-targets --locked

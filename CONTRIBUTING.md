@@ -82,7 +82,13 @@ Main requires these GitHub Actions checks:
 - daemon + eBPF (linux)
 
 Keep these job names stable. A rename must be coordinated with the required-check
-settings or PRs will remain blocked waiting for the old name.
+settings or PRs will remain blocked waiting for the old name. The release
+workflow checks the same five names on the tagged commit.
+
+Two more jobs run but aren't required yet: `supply chain (cargo-deny)`
+(advisories, yanked crates, licenses, sources; see `deny.toml`) and
+`msrv (1.91)`, which keeps `rust-version` honest. Making them required is a
+repository setting for the maintainer.
 
 Run relevant checks locally before opening a PR:
 
@@ -94,7 +100,8 @@ python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v
 ```
 
 On Linux with the required toolchains, also run the daemon tests and the
-source-built eBPF checks used by .github/workflows/ci.yml. On Windows, python may
+source-built eBPF checks used by .github/workflows/ci.yml, and `cargo deny
+check` if you changed dependencies. On Windows, python may
 be the Python command, and Linux-specific verification must be delegated to CI.
 
 The scripts under tests/attacks and tests/false_positives modify real system files.
@@ -160,7 +167,9 @@ Release procedure:
 2. Open `release/x.y.z` with the version bump, changelog move, and README
    `VER=` pins (Install section).
 3. Merge it through the normal PR checks.
-4. Wait for CI on that `main` commit. A green PR build isn't enough.
+4. Wait for CI on that `main` commit. A green PR build isn't enough, and the
+   release workflow refuses a tag whose commit doesn't have all five required
+   checks green.
 5. Tag `v` + that exact version on that commit and push only that tag.
 6. Watch `release.yml`, then check the published files as the README describes
    (`sha256sum -c`, `gh attestation verify`, `cosign verify-blob`). Don't move a

@@ -126,6 +126,18 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- Releases need green CI: the release workflow checks the five required
+  checks on the tagged commit before building. Release builds also run
+  clippy and the full test suite on both amd64 and arm64.
+- The eBPF build is pinned to `nightly-2026-09-17` (with bpf-linker
+  v0.11.1, it reproduces the vendored object exactly), so a new nightly can't
+  break the byte-for-byte check.
+- New CI jobs: `cargo deny` (advisories, yanked crates, licenses, sources)
+  and an MSRV check. `rust-version = "1.91"` is declared; the docs' old 1.79
+  claim didn't build. A yanked `yoke-derive` was updated.
+- Checkouts don't keep credentials; `make deb` uses cargo-deb like the
+  release (it called `dpkg-buildpackage` with no `debian/` dir), and the
+  Makefile picks the host arch.
 - Expect a HIGH "HERMIAN is stopping" notice on every stop, including
   package upgrades.
 - User management run from cron or a plain service (not a session, package

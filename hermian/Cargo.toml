@@ -2,10 +2,13 @@
 name = "hermian"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Silent by default. Loud when it matters. Lightweight defensive security daemon for Linux."
 homepage = "https://hermian.me"
 repository = "https://github.com/hermian-security/hermian"
+# Shipped as release tarballs and .debs, never to crates.io.
+publish = false
 
 [[bin]]
 name = "hermian"
@@ -30,7 +33,8 @@ inotify = "0.11"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "sendmail-transport", "rustls-tls", "builder"] }
 
-# `cargo deb -p hermian` builds the Debian/Ubuntu package (see docs/RELEASE.md).
+# `cargo deb -p hermian` builds the Debian/Ubuntu package (`make deb`; the
+# release workflow does the same, see CONTRIBUTING.md).
 [package.metadata.deb]
 name = "hermian"
 maintainer = "HERMIAN Security <contact@hermian.me>"

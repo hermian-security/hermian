@@ -9,6 +9,9 @@ resolver = "2"
 version = "0.1.0-beta.5"
 edition = "2021"
 license = "Apache-2.0"
+# Oldest stable that builds the locked dependency tree (cargo-platform needs
+# 1.91). CI checks it; raise it on purpose, not by accident.
+rust-version = "1.91"
 
 [profile.release]
 opt-level = 3

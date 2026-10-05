@@ -13,15 +13,21 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Same pin as ci.yml; the release rebuilds and compares the vendored object.
+  HERMIAN_EBPF_NIGHTLY: nightly-2026-09-17
 
 jobs:
   validate:
     name: Validate release tag
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read          # read CI results for the tagged commit
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
@@ -40,6 +46,43 @@ jobs:
           PY
       - name: Require a commit on main
         run: git merge-base --is-ancestor HEAD origin/main
+      # Being on main isn't enough: the commit's own CI run (the push to main)
+      # must have passed every required check. A tag pushed before CI
+      # finished, or on a red commit, stops here.
+      - name: Require green CI on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh api --paginate "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+            --jq '.check_runs[] | [.name, .status, (.conclusion // ""), .completed_at // ""] | @tsv' > runs.tsv
+          python3 - <<'PY'
+          import csv, sys
+          required = [
+              "validation harness (non-root)",
+              "core (ubuntu-latest)",
+              "core (macos-latest)",
+              "core (windows-latest)",
+              "daemon + eBPF (linux)",
+          ]
+          latest = {}
+          with open("runs.tsv") as fh:
+              for name, status, conclusion, done in csv.reader(fh, delimiter="\t"):
+                  # Keep the most recent run per name (reruns).
+                  if name not in latest or done > latest[name][2]:
+                      latest[name] = (status, conclusion, done)
+          bad = []
+          for name in required:
+              status, conclusion, _ = latest.get(name, ("missing", "", ""))
+              if status != "completed" or conclusion != "success":
+                  bad.append(f"{name}: {status} {conclusion}".strip())
+          if bad:
+              print("::error::CI isn't green on this commit; wait for it (or fix it) before tagging")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("all required checks passed")
+          PY
 
   ebpf:
     name: Build eBPF object from source
@@ -47,9 +90,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
-          toolchain: nightly
+          toolchain: ${{ env.HERMIAN_EBPF_NIGHTLY }}
           components: rust-src
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -92,10 +137,13 @@ jobs:
             runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+          components: clippy
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ebpf
@@ -107,7 +155,9 @@ jobs:
           HERMIAN_EBPF_PREBUILT: ${{ github.workspace }}/hermian-ebpf.o
         run: |
           cargo build --release --locked --target ${{ matrix.target }}
-          cargo test  --release --locked --target ${{ matrix.target }} -p hermian-core
+          # The shipped crates, on the shipped arch (arm64 gets no other CI).
+          cargo clippy --release --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+          cargo test  --release --locked --target ${{ matrix.target }}
           ./target/${{ matrix.target }}/release/hermian --version
           HERMIAN_COLOR=never ./target/${{ matrix.target }}/release/hermian test
       - name: Package .deb
@@ -148,6 +198,8 @@ jobs:
       attestations: write   # gh attestation verify
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: dist-*
