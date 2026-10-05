@@ -14,8 +14,8 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    auditnetlink, authlog, config, configdiff, ebpf, fallback, isolate, notify, pamsock, paths,
-    procsrc, selfprotect, status, watchers,
+    auditnetlink, authlog, config, configdiff, ebpf, fallback, health, isolate, notify, pamsock,
+    paths, procsrc, selfprotect, status, watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -155,6 +155,38 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             ),
         );
     }
+    let missing: Vec<&str> = [
+        (integrity.binary_record_missing, "binary"),
+        (integrity.config_record_missing, "configuration"),
+    ]
+    .iter()
+    .filter(|(m, _)| *m)
+    .map(|(_, n)| *n)
+    .collect();
+    if !missing.is_empty() {
+        emit_self(
+            &notifier,
+            self_alert(
+                &mut engine,
+                Severity::High,
+                "HERMIAN integrity record missing",
+                &format!(
+                    "The stored hash for the {} was missing at startup, so it couldn't be checked. The current value has been recorded.",
+                    missing.join(" and ")
+                ),
+                "'hermian enable' records these hashes before the first start. A missing one means it was deleted (deleting it and swapping the binary would otherwise go unnoticed) or an upgrade skipped 'hermian enable'.",
+                &[
+                    "If you just upgraded from a tarball without 'hermian enable', re-run it.",
+                    "Otherwise verify the binary against the release checksums and review the config.",
+                ],
+                &[
+                    ("Binary hash", &integrity.binary_hash),
+                    ("Config hash", &integrity.config_hash),
+                ],
+                "selfprotect|record-missing",
+            ),
+        );
+    }
 
     // --- Event sources ---------------------------------------------------
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(16384);
@@ -257,6 +289,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     let mut last_cpu = procsrc::self_cpu_sample();
     let mut first_tick = true;
     let mut current_cfg = initial_cfg;
+    // Hash of the config actually in effect. Reloads compare against this,
+    // not config.sha256: writing that file first, then the config, used to
+    // make the change skip both the reload and its alert.
+    let mut applied_hash = integrity.config_hash.clone();
+    let mut dropped_seen = health::snapshot();
     let started_at = Utc::now();
     let config_path = paths::config_path();
 
@@ -296,7 +333,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                 let Some(ev) = maybe else { break };
                 if let Event::File(f) = &ev {
                     if std::path::Path::new(&f.path) == config_path {
-                        reload_config(&mut engine, &notifier, &mut current_cfg, "file change");
+                        reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "file change");
                         continue;
                     }
                 }
@@ -339,6 +376,12 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                 for a in engine.tick(now) {
                     notifier.send(a);
                 }
+                let dropped_now = health::snapshot();
+                let grown = health::grown(&dropped_seen, &dropped_now);
+                if !grown.is_empty() {
+                    report_dropped_events(&mut engine, &notifier, &grown, &dropped_now);
+                }
+                dropped_seen = dropped_now;
                 let _ = config::save_baseline(&engine.baseline);
                 save_engine_state(&engine);
 
@@ -360,16 +403,18 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             }
             _ = sigterm.recv() => {
                 log_daemon(Severity::Info, "SIGTERM received; shutting down");
+                announce_stop(&mut engine, &notifier, "SIGTERM").await;
                 break;
             }
             _ = sigint.recv() => {
+                announce_stop(&mut engine, &notifier, "SIGINT").await;
                 break;
             }
             _ = sighup.recv() => {
-                reload_config(&mut engine, &notifier, &mut current_cfg, "SIGHUP");
+                reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "SIGHUP");
             }
             _ = sigusr2.recv() => {
-                reload_config(&mut engine, &notifier, &mut current_cfg, "SIGUSR2");
+                reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "SIGUSR2");
             }
         }
     }
@@ -381,6 +426,69 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
     Ok(())
 }
+
+/// Page when telemetry was dropped since the last tick. The engine's dedup
+/// window keeps a sustained loss to one alert per source every few minutes.
+fn report_dropped_events(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    grown: &[(String, u64)],
+    totals: &std::collections::BTreeMap<String, u64>,
+) {
+    for (source, n) in grown {
+        let total = totals.get(source).copied().unwrap_or(*n).to_string();
+        let recent = n.to_string();
+        emit_self(
+            notifier,
+            self_alert(
+                engine,
+                Severity::High,
+                "HERMIAN dropped telemetry",
+                &format!(
+                    "{} {} lost in the last interval ({} since start). Activity in that window may not have been seen.",
+                    recent, source, total
+                ),
+                "Buffers overflow under bursts of activity. A fork/exec or file-change flood is also a cheap way to slip something past a monitor, so losses are reported rather than just logged.",
+                &[
+                    "Check what was running at the time (load, a build, a backup, or something unexpected).",
+                    "Review 'hermian status' and recent alerts for that window.",
+                ],
+                &[("Source", source.as_str()), ("Lost", &recent), ("Since start", &total)],
+                &format!("selfprotect|dropped|{}", source),
+            ),
+        );
+    }
+}
+
+/// Tell the alert channels the daemon is stopping, and give delivery a few
+/// seconds. A clean `systemctl stop` used to be silent remotely; that's the
+/// simplest way to blind a host. (A SIGKILL still can't be reported.)
+async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal: &str) {
+    let alert = self_alert(
+        engine,
+        Severity::High,
+        "HERMIAN is stopping",
+        &format!("The daemon received {} and is shutting down. Nothing is monitored until it starts again.", signal),
+        "Package upgrades and planned maintenance stop the daemon briefly. An unexplained stop means monitoring was switched off, which is often the first thing an intruder does.",
+        &[
+            "If this wasn't planned, check who stopped it: journalctl -u hermian, and your auth logs.",
+            "Start it again with 'systemctl start hermian'.",
+        ],
+        &[("Signal", signal)],
+        &format!("selfprotect|stop|{}", Utc::now().timestamp()),
+    );
+    if let Some(a) = alert {
+        let ref_id = a.ref_id.clone();
+        notifier.send(a);
+        notifier
+            .wait_delivered(&ref_id, Duration::from_secs(STOP_NOTICE_WAIT_SECS))
+            .await;
+    }
+}
+
+/// How long shutdown waits for the stop notice. The unit's TimeoutStopSec
+/// must be comfortably above this.
+const STOP_NOTICE_WAIT_SECS: u64 = 6;
 
 /// Walk up from `ev.ppid` and make sure every ancestor is present and current.
 ///
@@ -541,6 +649,7 @@ fn reload_config(
     engine: &mut Engine,
     notifier: &notify::Notifier,
     current_cfg: &mut Config,
+    applied_hash: &mut String,
     trigger: &str,
 ) {
     let path = paths::config_path();
@@ -564,7 +673,9 @@ fn reload_config(
         }
     };
     let new_hash = selfprotect::sha256_hex(text.as_bytes());
-    if new_hash == selfprotect::stored_config_hash().unwrap_or_default() {
+    // Compared with what's in effect, not with config.sha256 on disk, which
+    // anyone who can write the config can also rewrite first.
+    if new_hash == *applied_hash {
         // Touched but unchanged (editor re-save, SIGHUP with no edit).
         return;
     }
@@ -606,6 +717,7 @@ fn reload_config(
             notifier.reconfigure(new_cfg.notifications.clone());
             *current_cfg = new_cfg;
             let _ = selfprotect::update_config_hash(&new_hash);
+            *applied_hash = new_hash.clone();
             emit_self(notifier, alert);
         }
         Err(e) => {
@@ -795,6 +907,8 @@ fn write_status_snapshot(
         pending_notifications: ns.pending,
         last_notify_error: ns.last_error.clone(),
         delivered_per_channel: ns.per_channel.clone(),
+        dropped_per_channel: ns.dropped_by_channel.clone(),
+        events_dropped: health::snapshot(),
         config_hash: integrity.config_hash.clone(),
         binary_hash: integrity.binary_hash.clone(),
         integrity_ok: integrity.binary_ok && integrity.config_ok,

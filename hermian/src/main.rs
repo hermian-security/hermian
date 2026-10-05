@@ -11,6 +11,7 @@ mod daemon;
 mod ebpf;
 mod enable;
 mod fallback;
+mod health;
 mod isolate;
 mod notify;
 mod pamsock;

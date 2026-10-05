@@ -348,6 +348,7 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
                 Some(libc::EAGAIN) | Some(libc::EINTR) => {}
                 // The kernel dropped audit records for us.
                 Some(libc::ENOBUFS) => {
+                    crate::health::AUDIT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
                     crate::daemon::log_daemon(
                         hermian_core::Severity::High,
                         "audit receive buffer overflowed; exec events were lost",

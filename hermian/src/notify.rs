@@ -108,6 +108,28 @@ impl Notifier {
     pub fn snapshot(&self) -> NotifyState {
         self.state.lock().map(|s| s.clone()).unwrap_or_default()
     }
+
+    /// Wait until `ref_id` has reached at least one notifying channel (or
+    /// was persisted locally, if it's below `min_severity` or no channel is
+    /// set up), up to `timeout`. Returns whether it got there.
+    pub async fn wait_delivered(&self, ref_id: &str, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let prefix = format!("{} ", ref_id);
+        loop {
+            let done = self
+                .state
+                .lock()
+                .map(|s| s.last_delivery_note.starts_with(&prefix))
+                .unwrap_or(false);
+            if done {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// Alerts waiting for one notifying channel to accept them.

@@ -40,6 +40,10 @@ pub struct StatusState {
     pub pending_notifications: usize,
     pub last_notify_error: String,
     pub delivered_per_channel: BTreeMap<String, u64>,
+    /// Alerts a notifying channel gave up on, by channel.
+    pub dropped_per_channel: BTreeMap<String, u64>,
+    /// Telemetry lost since start, by source (eBPF ring, inotify, audit).
+    pub events_dropped: BTreeMap<String, u64>,
     pub config_hash: String,
     pub binary_hash: String,
     pub integrity_ok: bool,
@@ -76,6 +80,8 @@ impl Default for StatusState {
             pending_notifications: 0,
             last_notify_error: String::new(),
             delivered_per_channel: BTreeMap::new(),
+            dropped_per_channel: BTreeMap::new(),
+            events_dropped: BTreeMap::new(),
             config_hash: String::new(),
             binary_hash: String::new(),
             integrity_ok: true,
@@ -124,7 +130,12 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
             .unwrap_or(false)
     {
         st.bad("DEGRADED: FILE WATCHERS DOWN")
-    } else if state.failures > 0 || state.pending_notifications > 0 || state.watches_failed > 0 {
+    } else if state.failures > 0
+        || state.pending_notifications > 0
+        || state.watches_failed > 0
+        || !state.events_dropped.is_empty()
+        || !state.dropped_per_channel.is_empty()
+    {
         st.warn("DEGRADED")
     } else {
         st.ok("PROTECTED")
@@ -203,6 +214,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     };
     out.push_str(&st.row("File watches", &watches));
     out.push('\n');
+    if !state.events_dropped.is_empty() {
+        out.push_str(&st.row(
+            "Events dropped",
+            &st.warn(&join_counts(&state.events_dropped)),
+        ));
+        out.push('\n');
+    }
     out.push_str(&st.row(
         "Overhead",
         &format!(
@@ -236,6 +254,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
             .map(|(k, v)| format!("{} {}", k, v))
             .collect();
         out.push_str(&st.row("Delivered", &st.dim(&parts.join(" \u{00B7} "))));
+        out.push('\n');
+    }
+    if !state.dropped_per_channel.is_empty() {
+        out.push_str(&st.row(
+            "Dropped",
+            &st.warn(&join_counts(&state.dropped_per_channel)),
+        ));
         out.push('\n');
     }
     if state.pending_notifications > 0 {
@@ -272,6 +297,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     }
     out.push('\n');
     out
+}
+
+fn join_counts(m: &BTreeMap<String, u64>) -> String {
+    m.iter()
+        .map(|(k, v)| format!("{} {}", k, v))
+        .collect::<Vec<_>>()
+        .join(" \u{00B7} ")
 }
 
 fn short_hash(h: &str) -> String {

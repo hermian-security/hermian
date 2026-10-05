@@ -61,8 +61,24 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   attacker-chosen paths or rotating IPv6 sources can't grow memory without
   bound. Far-past event timestamps are clamped like future ones.
 
+- Self-protection gaps:
+  - A missing `binary.sha256` or `config.sha256` pages HIGH at startup
+    instead of being quietly re-created (delete it, swap the binary, and
+    nothing used to fire).
+  - Config reloads compare against the config in effect, so writing the
+    hash file before the config no longer skips both the reload and its
+    alert.
+  - A clean stop pages HIGH and waits a few seconds for delivery.
+  - Dropped telemetry (eBPF ring loss, inotify overflow, audit ENOBUFS) pages
+    HIGH; `status` shows those totals and alerts a channel gave up on.
+- The unit restarts after any exit not requested through systemctl and no
+  longer gives up after five quick failures. It also sets `UMask=0077`,
+  `ProtectKernelLogs` and a private keyring.
+
 ### Changed
 
+- Expect a HIGH "HERMIAN is stopping" notice on every stop, including
+  package upgrades.
 - User management run from cron or a plain service (not a session, package
   or config manager) is now reported when it rewrites `/etc/shadow`.
 

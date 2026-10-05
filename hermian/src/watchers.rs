@@ -427,6 +427,7 @@ fn watcher_loop(
         // snapshot and queue those, rather than silently missing them.
         if overflowed {
             overflows += 1;
+            crate::health::INOTIFY_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
             let fresh = snapshot(&w);
             let changes = snapshot_changes(&known, &fresh);
             let now = Instant::now();

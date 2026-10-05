@@ -144,11 +144,18 @@ for collection. `PrivateTmp` stays off so monitoring can see the host's `/tmp`.
 See [the unit template](packaging/systemd/hermian.service) for the full settings.
 
 A validated config change that actually alters detections, channels, or the
-allowlist pages CRITICAL. Invalid TOML keeps the last good config and logs LOW.
+allowlist pages CRITICAL. Reloads compare against the config in effect, not
+the hash file on disk. Invalid TOML keeps the last good config and logs LOW.
 Startup hash checks still flag binary/config changes made while the daemon was
-stopped. Local hashes aren't protection against someone who already controls
-root. Nothing auto-updates. A stopped daemon can't report, and there's no
-independent tamper monitor.
+stopped, and a missing hash record pages HIGH instead of being silently
+re-created. Local hashes aren't protection against someone who already
+controls root. Nothing auto-updates.
+
+A clean stop (`systemctl stop`, SIGTERM) pages HIGH before exiting, so package
+upgrades send one too. The unit restarts the daemon after any other exit and
+never gives up. A SIGKILL can't be reported, and there's no independent
+tamper monitor or heartbeat. Dropped telemetry (full eBPF rings, inotify
+overflows, audit ENOBUFS) pages HIGH and shows in `status`.
 
 PAM integration is opt-in via `hermian enable --with-pam`. The module sends auth
 metadata, doesn't read passwords, and returns `PAM_IGNORE`.

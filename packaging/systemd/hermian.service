@@ -3,17 +3,22 @@ Description=HERMIAN defensive security daemon
 Documentation=https://github.com/hermian-security/hermian
 After=network-online.target local-fs.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Never give up restarting: a start limit left the unit failed (and the host
+# unmonitored, silently) after five quick crashes.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=%EXEC% run
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# Any exit not requested through systemctl brings it back. A manual
+# `systemctl stop` still stops it (and the daemon pages that it's stopping).
+Restart=always
 RestartSec=5
 KillSignal=SIGTERM
-TimeoutStopSec=15
+# Leaves room for the stop notice (the daemon waits up to 6 s for delivery).
+TimeoutStopSec=20
+UMask=0077
 # eBPF maps and perf ring buffers are locked memory; the 64 KiB default makes
 # the perf mmap fail with EPERM on multi-core hosts.
 LimitMEMLOCK=infinity
@@ -41,7 +46,9 @@ NoNewPrivileges=true
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+KeyringMode=private
 ProtectClock=true
 ProtectHostname=true
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
