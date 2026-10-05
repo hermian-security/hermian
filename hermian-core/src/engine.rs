@@ -15,8 +15,8 @@ use crate::detect::{self, BurstTracker, Ctx, FileSnapshots, FlaggedChain};
 use crate::events::{AuthResult, DetectionId, Event, Severity};
 use crate::proctree::ProcessTree;
 
-/// How long a D1 flag keeps escalating related activity.
-const FLAG_TTL_SECS: i64 = 600;
+/// How long a D1 flag is kept (the longest window any rule asks about).
+const FLAG_TTL_SECS: i64 = detect::FLAG_WINDOW_SECS;
 /// Processes not seen for this long are dropped from the tree.
 const TREE_RETENTION_HOURS: i64 = 48;
 /// Idle auth sources are forgotten after this long.

@@ -15,6 +15,12 @@ use crate::config::Config;
 use crate::events::{DetectionId, FileEvent, Severity, WriterInfo};
 use crate::proctree::ProcessTree;
 
+/// How long a D1 flag escalates related activity in its chain (connects,
+/// listeners, transient-dir execs). Two minutes was beaten by a `sleep 130`
+/// before the callback; flags no longer cover the service itself, so a
+/// longer window doesn't taint unrelated requests.
+pub const FLAG_WINDOW_SECS: i64 = 600;
+
 /// A process chain that a prior detection flagged; later detections use this to
 /// escalate related activity (e.g. a connect from a flagged web-shell chain).
 #[derive(Debug, Clone)]

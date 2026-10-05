@@ -483,16 +483,28 @@ impl ProcessTree {
         }
         self.exited.retain(|pid, _| !alive.contains(pid));
         let cutoff = now - chrono::Duration::seconds(EXIT_GRACE_SECS);
-        let parents_of_live: std::collections::HashSet<u32> = self
+        // Every ancestor of a live process is kept, not just its parent: a
+        // web shell's own parent exiting (double fork, `setsid`) used to drop
+        // the grandparent, and with it the web server from the chain that
+        // later rules (and exemptions) look at.
+        let mut ancestors_of_live: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        for p in self
             .procs
             .values()
             .filter(|p| !self.exited.contains_key(&p.pid))
-            .map(|p| p.ppid)
-            .collect();
+        {
+            let mut cur = p.ppid;
+            let mut depth = 0;
+            while cur > 1 && depth < 32 && ancestors_of_live.insert(cur) {
+                cur = self.procs.get(&cur).map(|a| a.ppid).unwrap_or(0);
+                depth += 1;
+            }
+        }
         let expired: Vec<u32> = self
             .exited
             .iter()
-            .filter(|(pid, at)| **at < cutoff && !parents_of_live.contains(pid))
+            .filter(|(pid, at)| **at < cutoff && !ancestors_of_live.contains(pid))
             .map(|(pid, _)| *pid)
             .collect();
         for pid in expired {
@@ -1044,6 +1056,23 @@ mod tests {
         t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
         let comms: Vec<String> = t.chain_of(300).iter().map(|p| p.comm.clone()).collect();
         assert_eq!(comms, vec!["systemd", "nginx", "bash", "implant"]);
+    }
+
+    #[test]
+    fn exited_grandparents_of_live_processes_are_kept() {
+        let mut t = ProcessTree::new();
+        let now = Utc::now();
+        t.upsert(info(1, 0, "systemd"));
+        t.upsert(info(100, 1, "nginx"));
+        t.upsert(info(200, 100, "sh"));
+        t.upsert(info(250, 200, "setsid"));
+        t.upsert(info(300, 250, "implant"));
+        // Both the shell and setsid exited; only the implant remains.
+        let alive: std::collections::HashSet<u32> = [1, 300].into_iter().collect();
+        t.reap(&alive, now);
+        t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
+        let comms: Vec<String> = t.chain_of(300).iter().map(|p| p.comm.clone()).collect();
+        assert_eq!(comms, vec!["systemd", "nginx", "sh", "setsid", "implant"]);
     }
 
     #[test]

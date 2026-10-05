@@ -8,7 +8,6 @@ use crate::events::{
 };
 use crate::proctree::{is_container_runtime, is_system_tool, is_user_mgmt_tool, role_of, Role};
 
-const PTRACE_TRACEME: u64 = 0;
 const PTRACE_ATTACH: u64 = 16;
 const PTRACE_SEIZE: u64 = 0x4206;
 
@@ -18,7 +17,7 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
     if ev.request != PTRACE_ATTACH && ev.request != PTRACE_SEIZE {
         return Vec::new();
     }
-    if ev.request == PTRACE_TRACEME || ev.target_pid == ev.pid {
+    if ev.target_pid == ev.pid {
         return Vec::new();
     }
     // The exe comes from the tree: a binary merely named gdb isn't a debugger.
@@ -171,10 +170,18 @@ fn suid_in_transient(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !ev.is_suid || !is_user_owned_location(&ev.path) {
         return None;
     }
+    // Vendor software installs setuid helpers under /opt (Chrome's
+    // chrome-sandbox): still worth a page, but not a CRITICAL that can
+    // auto-isolate the host.
+    let severity = if ev.path.starts_with("/opt/") {
+        Severity::High
+    } else {
+        Severity::Critical
+    };
     Some(
         Finding::new(
             DetectionId::D4,
-            Severity::Critical,
+            severity,
             "setuid binary created outside system directories",
             &format!("d4|suid|{}", ev.path),
         )

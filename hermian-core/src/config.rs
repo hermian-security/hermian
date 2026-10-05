@@ -496,6 +496,13 @@ auto_isolate_revert_mins = 0  # >0 lifts an automatic isolation after this long
 # user   = "deploy"
 # reason = "CI/CD deployment pipeline"
 #
+# PHP's mail() runs `sh -c sendmail ...`, which looks like a web shell:
+# [[allowlist.process_chains]]
+# parent = "php-fpm8.2"
+# child  = "sh"
+# user   = "www-data"
+# reason = "PHP mail() via sendmail"
+#
 # [[allowlist.persistence]]
 # path   = "/var/spool/cron/crontabs/deploy"
 # reason = "Managed by Ansible"

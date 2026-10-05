@@ -10,15 +10,13 @@ pub fn evaluate(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     let chain = ctx.tree.chain_of(ev.pid);
     let roles: Vec<Role> = chain.iter().map(|p| role_of(&p.comm, &p.exe)).collect();
 
-    // Container entrypoints are `PID 1`-parented inside their namespace and
-    // routinely run `sh -c`; they are not web-to-shell RCE.
-    let container_entrypoint = ev.container && ev.ppid == 1;
-
-    if !container_entrypoint {
-        findings.extend(service_to_shell(ev, ctx, &roles, Role::WebServer));
-        findings.extend(service_to_shell(ev, ctx, &roles, Role::Database));
-        findings.extend(web_shell_downloader_exec(ev, ctx, &roles));
-    }
+    // (A container entrypoint's `sh -c` has the runtime's shim as its parent,
+    // not a web server, so it never matches these. The old "ppid == 1 in a
+    // container" check compared a host ppid with a namespace one and never
+    // fired.)
+    findings.extend(service_to_shell(ev, ctx, &roles, Role::WebServer));
+    findings.extend(service_to_shell(ev, ctx, &roles, Role::Database));
+    findings.extend(web_shell_downloader_exec(ev, ctx, &roles));
 
     findings.extend(exec_from_transient_dir(ev, ctx));
     findings.extend(exec_from_deleted_inode(ev, ctx));
@@ -380,7 +378,7 @@ fn exec_from_transient_dir(ev: &ExecEvent, ctx: &Ctx) -> Option<Finding> {
     }
 
     let chain = ctx.tree.chain_of(ev.pid);
-    let in_flagged = ctx.has_recent_flag(ev.pid, 120, None);
+    let in_flagged = ctx.has_recent_flag(ev.pid, crate::detect::FLAG_WINDOW_SECS, None);
     let interactive = ctx.tree.has_interactive_session(ev.pid, ev.tty_nr);
     let from_installer = chain.iter().any(|p| {
         matches!(

@@ -55,6 +55,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - A known port bound again on another address (`127.0.0.1:8080` then
   `0.0.0.0:8080`) is a new listener.
 - `ExecStart = x` (spaces around `=`) is parsed.
+- Exited ancestors of a live process are all kept in the tree, not just its
+  parent, so a double-forked implant keeps the web server in its chain.
+- D1 flags escalate related connects, listeners and `/tmp` execs for ten
+  minutes (was two, beaten by a `sleep 130`).
+- A setuid file under `/opt` (vendor helpers like chrome-sandbox) is HIGH,
+  not CRITICAL. The default config shows how to allowlist PHP `mail()`.
 
 ### Fixed
 

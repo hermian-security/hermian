@@ -27,7 +27,11 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
         return findings;
     }
 
-    let flagged = ctx.has_recent_flag(ev.pid, 120, Some(DetectionId::D1));
+    let flagged = ctx.has_recent_flag(
+        ev.pid,
+        crate::detect::FLAG_WINDOW_SECS,
+        Some(DetectionId::D1),
+    );
     if flagged {
         findings.push(
             Finding::new(
@@ -37,7 +41,7 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 &format!("d5|connect-flagged|{}|{}", ev.comm, ev.daddr),
             )
             .what(format!(
-                "{} (pid {}) connected to {} within two minutes of its chain being flagged by D1.",
+                "{} (pid {}) connected to {} within ten minutes of its chain being flagged by D1.",
                 ev.comm, ev.pid, dest
             ))
             .chain(ctx.chain_nodes(ev.pid))
@@ -149,7 +153,12 @@ pub fn connector_exe(tree: &crate::proctree::ProcessTree, pid: u32, comm: &str) 
 }
 
 pub fn evaluate_listener(ev: &ListenerEvent, ctx: &Ctx) -> Vec<Finding> {
-    let flagged = ev.pid != 0 && ctx.has_recent_flag(ev.pid, 300, Some(DetectionId::D1));
+    let flagged = ev.pid != 0
+        && ctx.has_recent_flag(
+            ev.pid,
+            crate::detect::FLAG_WINDOW_SECS,
+            Some(DetectionId::D1),
+        );
     let owner_role = ctx
         .tree
         .get(ev.pid)
