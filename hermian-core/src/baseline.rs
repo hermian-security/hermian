@@ -32,6 +32,11 @@ pub struct Baseline {
 /// Current `known_connectors` key scheme: the connecting process's own exe.
 pub const CONNECTOR_SCHEME: u8 = 1;
 
+/// Most entries learned per set. A busy host (or a hostile one, during the
+/// learning window) could otherwise grow these, and baseline.json, without
+/// limit. Past the cap, unseen values are simply novel.
+pub const MAX_LEARNED: usize = 50_000;
+
 impl Default for Baseline {
     fn default() -> Self {
         Baseline {
@@ -88,6 +93,9 @@ impl Baseline {
 
     /// Record a successful root login; returns true if the source was new.
     pub fn observe_root_source(&mut self, ip: IpAddr) -> bool {
+        if self.root_sources.len() >= MAX_LEARNED {
+            return false;
+        }
         self.root_sources.insert(ip)
     }
 
@@ -136,21 +144,23 @@ impl Baseline {
 
     pub fn observe_ssh_source(&mut self, ip: IpAddr, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete {
+        if !self.complete && self.known_ssh_sources.len() < MAX_LEARNED {
             self.known_ssh_sources.insert(ip);
         }
     }
 
     pub fn observe_dest(&mut self, ip: IpAddr, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete {
+        if !self.complete && self.known_dests.len() < MAX_LEARNED {
             self.known_dests.insert(ip);
         }
     }
 
     pub fn observe_connector(&mut self, key: &str, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete || self.relearning_connectors(now) {
+        if (!self.complete || self.relearning_connectors(now))
+            && self.known_connectors.len() < MAX_LEARNED
+        {
             self.known_connectors.insert(key.to_string());
         }
     }

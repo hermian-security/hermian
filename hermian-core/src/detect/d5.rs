@@ -56,8 +56,14 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
     }
 
     // Only skip infra ports after the flagged-chain check: a web shell
-    // calling out to attacker:53 is exactly the case we mustn't drop.
-    if INFRA_PORTS.contains(&ev.dport) {
+    // calling out to attacker:53 is exactly the case we mustn't drop. And
+    // only to the LAN or to servers seen while learning: "port 53 to
+    // anywhere" was a free pass for DNS-port C2 to a fresh address.
+    if INFRA_PORTS.contains(&ev.dport)
+        && (!is_external
+            || !ctx.baseline.can_judge_novelty()
+            || ctx.baseline.dest_is_known(ev.daddr))
+    {
         return findings;
     }
 
@@ -178,7 +184,10 @@ pub fn evaluate_listener(ev: &ListenerEvent, ctx: &Ctx) -> Vec<Finding> {
         DetectionId::D5,
         severity,
         title,
-        &format!("d5|listener|{}|{}|{}", ev.proto, ev.port, ev.comm),
+        &format!(
+            "d5|listener|{}|{}|{}|{}",
+            ev.proto, ev.addr, ev.port, ev.comm
+        ),
     )
     .what(format!(
         "{} (pid {}) started listening on {} ({}).",

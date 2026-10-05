@@ -4,7 +4,7 @@ pub mod d3;
 pub mod d4;
 pub mod d5;
 
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
@@ -36,6 +36,8 @@ pub struct Ctx<'a> {
     pub flags: &'a VecDeque<FlaggedChain>,
     pub user_names: &'a HashMap<u32, String>,
     pub now: DateTime<Utc>,
+    /// The host's local UTC offset, for off-hours judgments.
+    pub local_offset: FixedOffset,
 }
 
 /// How confident we are that a file change was made by an operator sitting at a
@@ -62,8 +64,10 @@ impl Attribution {
 }
 
 impl<'a> Ctx<'a> {
+    /// Off-hours in the host's local time (the config's hours are what an
+    /// operator would write: 22-6 local, not UTC).
     pub fn is_off_hours(&self, now: DateTime<Utc>) -> bool {
-        let hour = now.hour();
+        let hour = now.with_timezone(&self.local_offset).hour();
         let start = self.cfg.ssh.off_hours_start;
         let end = self.cfg.ssh.off_hours_end;
         if start == end {
@@ -140,12 +144,34 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Short, stable tag for some content, for dedup signatures.
+///
+/// A signature like `d4|sudoers|<path>` folded a second, different change to
+/// the same file within the dedup window into the first ("new user mallory",
+/// then "mallory added to sudo" a minute later was silent). Rules that
+/// report on content add this tag so only identical content is deduplicated.
+/// FNV-1a: not a security boundary, just a cheap fingerprint.
+pub fn content_tag(content: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in content.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:016x}", h)
+}
+
 pub fn writer_label(writer: Option<&WriterInfo>) -> String {
     match writer {
         Some(w) => format!("{} (pid {})", w.comm, w.pid),
         None => "an unidentified process".to_string(),
     }
 }
+
+/// Most auth sources tracked at once.
+pub const MAX_BURST_SOURCES: usize = 20_000;
+/// Most attempt timestamps kept per source: one past the largest allowed
+/// `ssh.failed_burst_count`, so the threshold can always be reached.
+const MAX_ATTEMPTS_PER_SOURCE: usize = 10_001;
 
 /// Sliding-window counter keyed by source address.
 #[derive(Debug, Default)]
@@ -166,10 +192,28 @@ impl BurstTracker {
         window_secs: i64,
         user: &str,
     ) -> usize {
+        // Sources are attacker-chosen (an IPv6 scanner can rotate through a
+        // /64): bound the map by dropping the quietest source.
+        if !self.counts.contains_key(&ip) && self.counts.len() >= MAX_BURST_SOURCES {
+            let oldest = self
+                .counts
+                .iter()
+                .min_by_key(|(_, q)| q.back().copied())
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                self.counts.remove(&k);
+                self.users.remove(&k);
+            }
+        }
         let q = self.counts.entry(ip).or_default();
         q.push_back(now);
         let cutoff = now - Duration::seconds(window_secs);
         while q.front().map(|t| *t < cutoff).unwrap_or(false) {
+            q.pop_front();
+        }
+        // Only the count matters past the threshold; don't keep a timestamp
+        // per attempt of a flood.
+        while q.len() > MAX_ATTEMPTS_PER_SOURCE {
             q.pop_front();
         }
         if !user.is_empty() {
@@ -273,6 +317,7 @@ mod tests {
             flags,
             user_names: users,
             now,
+            local_offset: FixedOffset::east_opt(0).unwrap(),
         }
     }
 
@@ -294,6 +339,42 @@ mod tests {
         disabled.ssh.off_hours_end = 0;
         let c = ctx(&disabled, &tree, &baseline, &allowlist, &flags, &users, t);
         assert!(!c.is_off_hours(t));
+    }
+
+    #[test]
+    fn off_hours_follow_local_time() {
+        let cfg = Config::default(); // 22-6
+        let tree = ProcessTree::new();
+        let baseline = Baseline::default();
+        let allowlist = Allowlist::default();
+        let flags = VecDeque::new();
+        let users = HashMap::new();
+        // 20:00 UTC is 23:00 at UTC+3: off-hours there, not in UTC.
+        let t = Utc::now().with_hour(20).unwrap();
+        let mut c = ctx(&cfg, &tree, &baseline, &allowlist, &flags, &users, t);
+        assert!(!c.is_off_hours(t));
+        c.local_offset = FixedOffset::east_opt(3 * 3600).unwrap();
+        assert!(c.is_off_hours(t));
+    }
+
+    #[test]
+    fn content_tags_differ_by_content() {
+        assert_eq!(content_tag("a"), content_tag("a"));
+        assert_ne!(
+            content_tag("eve ALL=(ALL) ALL"),
+            content_tag("eve ALL=(ALL) NOPASSWD: ALL")
+        );
+    }
+
+    #[test]
+    fn burst_sources_are_bounded() {
+        let mut b = BurstTracker::default();
+        let t = Utc::now();
+        for i in 0..(MAX_BURST_SOURCES as u32 + 10) {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(i));
+            b.record(ip, t + Duration::milliseconds(i64::from(i)), 60);
+        }
+        assert_eq!(b.len(), MAX_BURST_SOURCES);
     }
 
     #[test]

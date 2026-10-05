@@ -131,7 +131,7 @@ pub fn spawn_proc_poller(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) -> 
 
 pub fn spawn_listener_poller(
     tx: mpsc::Sender<Event>,
-    closed_tx: mpsc::Sender<(String, u16)>,
+    closed_tx: mpsc::Sender<ListenerKey>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     std::thread::Builder::new()
@@ -181,16 +181,21 @@ fn proc_poller_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     }
 }
 
+/// `(proto, local address, port)`. The address is part of it: a second bind
+/// of a known port on another address (`127.0.0.1:8080`, then
+/// `0.0.0.0:8080`) is a new exposure.
+pub type ListenerKey = (String, std::net::IpAddr, u16);
+
 fn listener_poller_loop(
     tx: mpsc::Sender<Event>,
-    closed_tx: mpsc::Sender<(String, u16)>,
+    closed_tx: mpsc::Sender<ListenerKey>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let snapshot = || -> HashSet<(String, u16)> {
+    let snapshot = || -> HashSet<ListenerKey> {
         procsrc::read_tcp_tables()
             .into_iter()
             .filter(|e| e.state == procsrc::TCP_LISTEN)
-            .map(|e| (e.proto.to_string(), e.local_port))
+            .map(|e| (e.proto.to_string(), e.local_addr, e.local_port))
             .collect()
     };
     let mut known = snapshot();
@@ -200,14 +205,14 @@ fn listener_poller_loop(
             .into_iter()
             .filter(|e| e.state == procsrc::TCP_LISTEN)
             .collect();
-        let current: HashSet<(String, u16)> = entries
+        let current: HashSet<ListenerKey> = entries
             .iter()
-            .map(|e| (e.proto.to_string(), e.local_port))
+            .map(|e| (e.proto.to_string(), e.local_addr, e.local_port))
             .collect();
 
         let new_entries: Vec<_> = entries
             .iter()
-            .filter(|e| !known.contains(&(e.proto.to_string(), e.local_port)))
+            .filter(|e| !known.contains(&(e.proto.to_string(), e.local_addr, e.local_port)))
             .collect();
         if !new_entries.is_empty() {
             let inodes: Vec<u64> = new_entries.iter().map(|e| e.inode).collect();

@@ -307,6 +307,16 @@ fn day_key(now: DateTime<Utc>) -> String {
     now.format("%Y-%m%d").to_string()
 }
 
+/// `YYYY-MMDD`, as written by [`day_key`].
+fn is_day_key(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 9
+        && b[4] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || c.is_ascii_digit())
+}
+
 impl RefGen {
     pub fn new(now: DateTime<Utc>) -> Self {
         RefGen {
@@ -315,11 +325,16 @@ impl RefGen {
         }
     }
 
-    /// Resume from a persisted `(day, seq)` pair; ignored if the day differs.
+    /// Resume from a persisted `(day, seq)` pair. An older day starts fresh;
+    /// today's, or a later one (the clock went back), carries on so no id
+    /// is issued twice.
     pub fn resume(now: DateTime<Utc>, day: &str, seq: u32) -> Self {
         let today = day_key(now);
-        if day == today {
-            RefGen { day: today, seq }
+        if day >= today.as_str() && is_day_key(day) {
+            RefGen {
+                day: day.to_string(),
+                seq,
+            }
         } else {
             RefGen::new(now)
         }
@@ -327,7 +342,10 @@ impl RefGen {
 
     pub fn next(&mut self, now: DateTime<Utc>) -> String {
         let day = day_key(now);
-        if day != self.day {
+        // Only move forward. A clock stepped back across midnight would
+        // otherwise restart yesterday's (or today's) sequence and reissue ids
+        // that name existing alert files. The key sorts as a date.
+        if day > self.day {
             self.day = day;
             self.seq = 0;
         }
@@ -843,6 +861,25 @@ mod tests {
 
         let mut stale = RefGen::resume(t2, "1999-0101", 40);
         assert_eq!(stale.next(t2), format!("HER-{}-001", t2.format("%Y-%m%d")));
+    }
+
+    #[test]
+    fn refgen_never_reissues_an_id_when_the_clock_goes_back() {
+        let t2 = Utc::now();
+        let t1 = t2 - chrono::Duration::days(1);
+        let mut g = RefGen::new(t2);
+        let a = g.next(t2);
+        // A late event or a clock step back to yesterday.
+        let b = g.next(t1);
+        assert_ne!(a, b);
+        assert!(b.ends_with("-002"), "{}", b);
+        // Restart with yesterday's clock but today's persisted state.
+        let (day, seq) = g.state();
+        let mut r = RefGen::resume(t1, day, seq);
+        assert!(r.next(t1).ends_with("-003"));
+        // Garbage in the state file is ignored.
+        let mut junk = RefGen::resume(t1, "zzzz", 5);
+        assert!(junk.next(t1).ends_with("-001"));
     }
 
     #[test]

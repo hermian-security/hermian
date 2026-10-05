@@ -1,7 +1,7 @@
 //! D4 - Privilege escalation indicators.
 
 use crate::alert::Finding;
-use crate::detect::{writer_label, Ctx};
+use crate::detect::{content_tag, writer_label, Ctx};
 use crate::events::{
     is_container_overlay_path, is_editor_artifact, DetectionId, ExecEvent, FileEvent, FileKind,
     PtraceEvent, Severity,
@@ -288,7 +288,11 @@ fn sudoers(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
             } else {
                 "sudoers modified outside visudo"
             },
-            &format!("d4|sudoers|{}", ev.path),
+            &format!(
+                "d4|sudoers|{}|{}",
+                ev.path,
+                content_tag(ev.content.as_deref().unwrap_or(""))
+            ),
         )
         .what(format!(
             "{} was {} by {}, not by visudo{}.",
@@ -530,6 +534,28 @@ mod tests {
         eng.process(Event::Exec(exec(t, 402, 401, "passwd", "/usr/bin/passwd")));
         let a = eng.process(file(t + Duration::seconds(1), "/etc/shadow", None));
         assert!(d4_at_least(&a, Severity::Critical), "{:?}", a);
+    }
+
+    #[test]
+    fn a_second_different_sudoers_change_is_not_deduplicated() {
+        let mut eng = engine();
+        let t = Utc::now();
+        base(&mut eng, t);
+        let first = eng.process(file(t, "/etc/sudoers.d/90-x", Some("eve ALL=(ALL) ALL\n")));
+        assert!(d4_at_least(&first, Severity::High), "{:?}", first);
+        let second = eng.process(file(
+            t + Duration::seconds(30),
+            "/etc/sudoers.d/90-x",
+            Some("eve ALL=(ALL) ALL\nmallory ALL=(ALL) ALL\n"),
+        ));
+        assert!(d4_at_least(&second, Severity::High), "{:?}", second);
+        // The identical content again is.
+        let again = eng.process(file(
+            t + Duration::seconds(40),
+            "/etc/sudoers.d/90-x",
+            Some("eve ALL=(ALL) ALL\nmallory ALL=(ALL) ALL\n"),
+        ));
+        assert!(!d4_at_least(&again, Severity::High), "{:?}", again);
     }
 
     #[test]

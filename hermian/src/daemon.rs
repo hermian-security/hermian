@@ -44,6 +44,12 @@ fn save_engine_state(engine: &Engine) {
     }
 }
 
+/// The host's current UTC offset (follows DST; refreshed every tick).
+fn local_offset() -> chrono::FixedOffset {
+    use chrono::Offset;
+    chrono::Local::now().offset().fix()
+}
+
 pub fn run() -> Result<()> {
     config::require_root()?;
     let cfg = config::load_config()?;
@@ -64,6 +70,7 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(paths::run_dir())?;
 
     let mut engine = Engine::new(cfg.clone(), allowlist, baseline, host);
+    engine.set_local_offset(local_offset());
     if let Some(st) = load_engine_state() {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
     }
@@ -232,7 +239,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             "no SSH authentication source (no auth.log, no journalctl, no PAM module); D2 auth coverage reduced",
         );
     }
-    let (listener_close_tx, mut listener_close_rx) = mpsc::channel::<(String, u16)>(256);
+    let (listener_close_tx, mut listener_close_rx) = mpsc::channel::<fallback::ListenerKey>(256);
     fallback::spawn_listener_poller(event_tx.clone(), listener_close_tx, shutdown.clone())?;
     fallback::spawn_suid_sweeper(event_tx.clone(), shutdown.clone())?;
 
@@ -322,11 +329,12 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                     }
                 }
             }
-            Some((proto, port)) = listener_close_rx.recv() => {
-                engine.forget_listener(&proto, port);
+            Some((proto, addr, port)) = listener_close_rx.recv() => {
+                engine.forget_listener(&proto, addr, port);
             }
             _ = ticker.tick() => {
                 let now = Utc::now();
+                engine.set_local_offset(local_offset());
                 engine.reap_exited(&procsrc::live_pids(), now);
                 for a in engine.tick(now) {
                     notifier.send(a);

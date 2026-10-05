@@ -1,8 +1,9 @@
 //! The detection engine: owns all state, consumes [`Event`]s, emits [`Alert`]s.
 //! Pure Rust, no I/O - everything here is unit-testable on any platform.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::IpAddr;
 
 use crate::alert::{Alert, Finding, RefGen};
 use crate::allowlist::Allowlist;
@@ -25,6 +26,8 @@ const BURST_RETENTION_SECS: i64 = 3600;
 const OPERATOR_WINDOW_SECS: i64 = 15;
 /// Event timestamps further ahead of the wall clock than this are clamped.
 pub const MAX_FUTURE_SKEW_SECS: i64 = 60;
+/// Event timestamps older than this (relative to the wall clock) are clamped.
+pub const MAX_PAST_SKEW_SECS: i64 = 86_400;
 /// Upper bound on remembered D1 flags; the oldest are dropped first.
 const MAX_FLAGS: usize = 4096;
 
@@ -70,8 +73,11 @@ pub struct Engine {
     pub flags: VecDeque<FlaggedChain>,
     pub bursts: BurstTracker,
     pub files: FileSnapshots,
-    pub listeners: HashMap<(String, u16), DateTime<Utc>>,
+    /// Known listeners by `(proto, address, port)`.
+    pub listeners: HashMap<(String, IpAddr, u16), DateTime<Utc>>,
     pub counters: Counters,
+    /// Host's local UTC offset (set by the daemon), for off-hours rules.
+    pub local_offset: FixedOffset,
 }
 
 fn day_key(now: DateTime<Utc>) -> String {
@@ -101,7 +107,13 @@ impl Engine {
             files: FileSnapshots::default(),
             listeners: HashMap::new(),
             counters,
+            local_offset: FixedOffset::east_opt(0).expect("zero offset is valid"),
         }
+    }
+
+    /// The host's local UTC offset; off-hours windows are in local time.
+    pub fn set_local_offset(&mut self, offset: FixedOffset) {
+        self.local_offset = offset;
     }
 
     /// Restore per-day state persisted by the daemon across restarts.
@@ -145,6 +157,7 @@ impl Engine {
             flags: &self.flags,
             user_names: &self.user_names,
             now,
+            local_offset: self.local_offset,
         }
     }
 
@@ -162,12 +175,18 @@ impl Engine {
     /// `wall` are clamped to `wall`.
     pub fn process_at(&mut self, mut ev: Event, wall: DateTime<Utc>) -> Vec<Alert> {
         let limit = wall + Duration::seconds(MAX_FUTURE_SKEW_SECS);
-        if ev.ts() > limit {
+        // Far-past timestamps are clamped too: window arithmetic on a date
+        // near chrono's minimum would overflow.
+        let floor = wall - Duration::seconds(MAX_PAST_SKEW_SECS);
+        if ev.ts() > limit || ev.ts() < floor {
             ev.set_ts(wall);
         }
         self.counters.record_event();
         let now = ev.ts();
-        self.counters.roll_day(&day_key(now));
+        // Daily counters and ref ids follow the wall clock, not event time: a
+        // late event just after midnight used to reset the day's sequence and
+        // reissue ref ids, overwriting earlier alert records.
+        self.counters.roll_day(&day_key(wall));
         self.prune_flags(now);
         self.baseline.check_completion(now);
 
@@ -244,6 +263,7 @@ impl Engine {
                         flags: &self.flags,
                         user_names: &self.user_names,
                         now,
+                        local_offset: self.local_offset,
                     };
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
                 }
@@ -257,7 +277,7 @@ impl Engine {
                 }
             }
             Event::Listener(e) => {
-                let key = (e.proto.clone(), e.port);
+                let key = (e.proto.clone(), e.addr, e.port);
                 if self.listeners.contains_key(&key) {
                     self.listeners.insert(key, now);
                 } else {
@@ -269,7 +289,7 @@ impl Engine {
             }
         }
 
-        self.raise(findings, now)
+        self.raise(findings, now, wall)
     }
 
     /// Periodic housekeeping; returns dedup summaries to deliver.
@@ -301,8 +321,8 @@ impl Engine {
 
     /// Forget a listener so it will alert again if it reappears (called when
     /// the daemon observes the port closing).
-    pub fn forget_listener(&mut self, proto: &str, port: u16) {
-        self.listeners.remove(&(proto.to_string(), port));
+    pub fn forget_listener(&mut self, proto: &str, addr: IpAddr, port: u16) {
+        self.listeners.remove(&(proto.to_string(), addr, port));
     }
 
     /// Build an alert for an engine-external finding (self-protection, lifecycle).
@@ -372,12 +392,17 @@ impl Engine {
         }
     }
 
-    fn raise(&mut self, findings: Vec<Finding>, now: DateTime<Utc>) -> Vec<Alert> {
+    fn raise(
+        &mut self,
+        findings: Vec<Finding>,
+        now: DateTime<Utc>,
+        wall: DateTime<Utc>,
+    ) -> Vec<Alert> {
         let mut alerts = Vec::new();
         for finding in findings {
             if let Decision::Emit = self.dedup.record(&finding.signature, now, &finding) {
                 let alert =
-                    Alert::from_finding(finding, self.refs.next(now), self.host.clone(), now);
+                    Alert::from_finding(finding, self.refs.next(wall), self.host.clone(), now);
                 self.counters.record_alert(alert.severity);
                 alerts.push(alert);
             }
@@ -1402,8 +1427,45 @@ mod tests {
     }
 
     #[test]
+    fn dns_to_a_learned_server_is_ignored_and_to_a_new_one_is_judged() {
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.known_dests.insert("1.1.1.1".parse().unwrap());
+        baseline.complete = true;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline,
+            "h".into(),
+        );
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 300, 1, 1000, "implant", "/home/eve/.cache/implant"));
+        let dns = |daddr: &str| {
+            Event::Connect(ConnectEvent {
+                ts: t,
+                pid: 300,
+                uid: 1000,
+                daddr: daddr.parse().unwrap(),
+                dport: 53,
+                comm: "implant".into(),
+                container: false,
+            })
+        };
+        assert!(eng.process(dns("1.1.1.1")).is_empty());
+        let fresh = eng.process(dns("203.0.113.99"));
+        assert!(
+            fresh
+                .iter()
+                .any(|a| a.title == "First outbound connection from a program"),
+            "{:?}",
+            fresh
+        );
+    }
+
+    #[test]
     fn dns_connects_are_ignored() {
         let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.known_dests.insert("1.1.1.1".parse().unwrap());
         baseline.complete = true;
         let mut eng = Engine::new(
             Config::default(),
@@ -1527,6 +1589,69 @@ mod tests {
     }
 
     #[test]
+    fn same_port_on_another_address_is_a_new_listener() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        let ev = |addr: &str| {
+            Event::Listener(ListenerEvent {
+                ts: t,
+                proto: "tcp".into(),
+                addr: addr.parse().unwrap(),
+                port: 8080,
+                pid: 0,
+                comm: "x".into(),
+            })
+        };
+        assert_eq!(eng.process(ev("127.0.0.1")).len(), 1);
+        assert_eq!(eng.process(ev("0.0.0.0")).len(), 1);
+        assert!(eng.process(ev("0.0.0.0")).is_empty());
+    }
+
+    #[test]
+    fn late_event_after_midnight_does_not_reuse_ref_ids() {
+        let mut eng = engine_without_baseline();
+        // Ten seconds past the coming midnight.
+        let wall = (Utc::now().date_naive() + chrono::Days::new(1))
+            .and_hms_opt(0, 0, 10)
+            .unwrap()
+            .and_utc();
+        let day = wall.format("%Y-%m%d").to_string();
+        let ev = |ts: DateTime<Utc>, port| {
+            Event::Listener(ListenerEvent {
+                ts,
+                proto: "tcp".into(),
+                addr: "0.0.0.0".parse().unwrap(),
+                port,
+                pid: 0,
+                comm: "x".into(),
+            })
+        };
+        let a = eng.process_at(ev(wall, 1), wall);
+        // An event stamped just before midnight, delivered after it.
+        let late = eng.process_at(ev(wall - Duration::seconds(20), 2), wall);
+        assert_ne!(a[0].ref_id, late[0].ref_id);
+        assert!(late[0].ref_id.contains(&day), "{}", late[0].ref_id);
+    }
+
+    #[test]
+    fn far_past_timestamps_are_clamped() {
+        let mut eng = engine_without_baseline();
+        let wall = Utc::now();
+        let a = eng.process_at(
+            Event::Listener(ListenerEvent {
+                ts: DateTime::<Utc>::MIN_UTC,
+                proto: "tcp".into(),
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 9,
+                pid: 0,
+                comm: "x".into(),
+            }),
+            wall,
+        );
+        assert_eq!(a[0].ts, wall);
+    }
+
+    #[test]
     fn listener_alerts_once_until_forgotten() {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
@@ -1542,7 +1667,7 @@ mod tests {
         };
         assert_eq!(eng.process(ev()).len(), 1);
         assert!(eng.process(ev()).is_empty());
-        eng.forget_listener("tcp", 4444);
+        eng.forget_listener("tcp", "0.0.0.0".parse().unwrap(), 4444);
         // dedup window still open, so still suppressed by dedup - advance time.
         let later = t + Duration::seconds(400);
         let alerts = at(

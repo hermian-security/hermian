@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::alert::Finding;
-use crate::detect::{writer_label, BurstTracker, Ctx};
+use crate::detect::{content_tag, writer_label, BurstTracker, Ctx};
 use crate::events::{
     is_editor_artifact, AuthEvent, AuthResult, DetectionId, FileEvent, FileKind, Severity,
 };
@@ -276,12 +276,14 @@ pub fn check_account_changes(
         Finding::new(
             DetectionId::D2,
             severity,
-            if change.privileged {
-                "Privileged group membership changed"
-            } else {
-                "System account database changed"
-            },
-            &format!("d2|account-change|{}", ev.path),
+            change.title,
+            // Keyed on what changed: a second, different change to the same
+            // file within the dedup window is its own alert.
+            &format!(
+                "d2|account-change|{}|{}",
+                ev.path,
+                content_tag(&change.summary)
+            ),
         )
         .what(format!("{}: {}", ev.path, change.summary))
         .fact("Path", &ev.path)
@@ -307,36 +309,118 @@ pub fn check_account_changes(
 pub struct AccountChange {
     pub summary: String,
     pub privileged: bool,
+    pub title: &'static str,
+}
+
+/// One /etc/passwd entry, as far as the diff cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdEntry {
+    uid: String,
+    gid: String,
+    home: String,
+    shell: String,
+}
+
+/// Numeric id 0, however it's written ("0", "00", " 0").
+fn is_zero_id(s: &str) -> bool {
+    s.trim().parse::<u64>() == Ok(0)
+}
+
+/// Shells that mean "no interactive login".
+fn is_nologin(shell: &str) -> bool {
+    let base = shell.rsplit('/').next().unwrap_or("");
+    shell.is_empty() || matches!(base, "nologin" | "false" | "sync" | "halt" | "shutdown")
+}
+
+fn parse_passwd(s: &str) -> Vec<(String, PasswdEntry)> {
+    s.lines()
+        .filter(|l| !l.trim_start().starts_with('#') && l.contains(':'))
+        .filter_map(|l| {
+            let mut it = l.split(':');
+            let name = it.next()?.to_string();
+            it.next()?;
+            let uid = it.next()?.to_string();
+            let gid = it.next().unwrap_or("").to_string();
+            it.next(); // gecos
+            let home = it.next().unwrap_or("").to_string();
+            let shell = it.next().unwrap_or("").trim().to_string();
+            Some((
+                name,
+                PasswdEntry {
+                    uid,
+                    gid,
+                    home,
+                    shell,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn diff_accounts(old: &str, new: &str) -> Option<AccountChange> {
-    let parse = |s: &str| -> Vec<(String, String)> {
-        s.lines()
-            .filter(|l| !l.trim_start().starts_with('#') && l.contains(':'))
-            .filter_map(|l| {
-                let mut it = l.split(':');
-                let name = it.next()?.to_string();
-                it.next()?;
-                let uid = it.next()?.to_string();
-                Some((name, uid))
-            })
-            .collect()
-    };
-    let old_map: HashMap<String, String> = parse(old).into_iter().collect();
-    let added: Vec<String> = parse(new)
-        .into_iter()
-        .filter(|(n, uid)| old_map.get(n.as_str()) != Some(uid))
-        .map(|(n, uid)| format!("{} (uid {})", n, uid))
-        .collect();
-    if added.is_empty() {
+    let old_map: HashMap<String, PasswdEntry> = parse_passwd(old).into_iter().collect();
+    let mut changes = Vec::new();
+    let mut privileged = false;
+    for (name, e) in parse_passwd(new) {
+        match old_map.get(&name) {
+            None => {
+                changes.push(format!("{} (uid {}) added", name, e.uid));
+                privileged |= is_zero_id(&e.uid) || is_zero_id(&e.gid);
+            }
+            Some(o) if o == &e => {}
+            Some(o) => {
+                let mut what = Vec::new();
+                if o.uid != e.uid {
+                    what.push(format!("uid {} -> {}", o.uid, e.uid));
+                    privileged |= is_zero_id(&e.uid);
+                }
+                if o.gid != e.gid {
+                    what.push(format!("gid {} -> {}", o.gid, e.gid));
+                    privileged |= is_zero_id(&e.gid);
+                }
+                if o.shell != e.shell {
+                    what.push(format!("shell {} -> {}", o.shell, e.shell));
+                    // A service account that suddenly gets a login shell is
+                    // a classic backdoor.
+                    privileged |= is_nologin(&o.shell) && !is_nologin(&e.shell);
+                }
+                if o.home != e.home {
+                    what.push(format!("home {} -> {}", o.home, e.home));
+                }
+                changes.push(format!("{} changed ({})", name, what.join(", ")));
+            }
+        }
+    }
+    if changes.is_empty() {
         return None;
     }
-    let privileged = added.iter().any(|a| a.contains("(uid 0)"));
     Some(AccountChange {
-        summary: format!("new or changed accounts: {}", added.join(", ")),
+        summary: format!("accounts: {}", changes.join("; ")),
         privileged,
+        title: if privileged {
+            "Privileged account added or changed"
+        } else {
+            "System account database changed"
+        },
     })
 }
+
+/// Groups whose members are root, or close to it: sudo/wheel/admin by
+/// policy, docker/lxd/incus/libvirt via the daemons they control, disk and
+/// shadow via raw access to block devices and password hashes.
+const PRIVILEGED_GROUPS: &[&str] = &[
+    "sudo",
+    "wheel",
+    "admin",
+    "root",
+    "docker",
+    "lxd",
+    "incus-admin",
+    "libvirt",
+    "disk",
+    "shadow",
+    "adm",
+];
 
 fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
     let parse = |s: &str| -> HashMap<String, Vec<String>> {
@@ -363,7 +447,7 @@ fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
     let new_map = parse(new);
     let mut changes = Vec::new();
     let mut privileged = false;
-    for target in ["sudo", "wheel", "admin", "root"] {
+    for target in PRIVILEGED_GROUPS.iter().copied() {
         let old_members = old_map.get(target).cloned().unwrap_or_default();
         let new_members = new_map.get(target).cloned().unwrap_or_default();
         let added: Vec<&String> = new_members
@@ -404,6 +488,11 @@ fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
         Some(AccountChange {
             summary: changes.join("; "),
             privileged,
+            title: if privileged {
+                "Privileged group membership changed"
+            } else {
+                "System account database changed"
+            },
         })
     }
 }
@@ -427,6 +516,37 @@ mod tests {
         let new = "root:x:0:0:root:/root:/bin/bash\ntoor:x:0:0::/root:/bin/bash\n";
         let diff = diff_accounts(old, new).expect("diff");
         assert!(diff.privileged);
+    }
+
+    #[test]
+    fn account_diff_flags_zero_uid_however_written() {
+        let old = "root:x:0:0:root:/root:/bin/bash\n";
+        let new = "root:x:0:0:root:/root:/bin/bash\nsvc:x:00:0::/:/bin/sh\n";
+        assert!(diff_accounts(old, new).unwrap().privileged);
+    }
+
+    #[test]
+    fn account_diff_flags_a_service_account_getting_a_shell() {
+        let old = "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n";
+        let new = "www-data:x:33:33:www-data:/var/www:/bin/bash\n";
+        let d = diff_accounts(old, new).unwrap();
+        assert!(d.privileged);
+        assert!(d.summary.contains("shell"), "{}", d.summary);
+        // Home and gid changes are reported too.
+        let moved = "www-data:x:33:0:www-data:/root:/usr/sbin/nologin\n";
+        let d = diff_accounts(old, moved).unwrap();
+        assert!(d.privileged, "gid 0");
+        assert!(d.summary.contains("home"), "{}", d.summary);
+    }
+
+    #[test]
+    fn group_diff_covers_root_equivalent_groups() {
+        for g in ["docker", "lxd", "disk", "shadow"] {
+            let old = format!("{}:x:999:\n", g);
+            let new = format!("{}:x:999:eve\n", g);
+            let d = diff_groups(&old, &new).unwrap_or_else(|| panic!("{}", g));
+            assert!(d.privileged, "{}", g);
+        }
     }
 
     #[test]

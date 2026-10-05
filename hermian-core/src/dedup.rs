@@ -32,6 +32,8 @@ pub enum Decision {
 
 /// Entries idle for this many windows are dropped to bound memory.
 const RETENTION_WINDOWS: i32 = 12;
+/// Hard cap on remembered signatures.
+pub const MAX_ENTRIES: usize = 20_000;
 
 impl Deduper {
     pub fn new(window_secs: u64) -> Self {
@@ -63,6 +65,18 @@ impl Deduper {
                 }
             }
             None => {
+                // Signatures carry attacker-influenced text (paths, comms):
+                // bound the map by forgetting the longest-idle entry.
+                if self.entries.len() >= MAX_ENTRIES {
+                    let idle = self
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, e)| e.last_seen)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = idle {
+                        self.entries.remove(&k);
+                    }
+                }
                 self.entries.insert(
                     signature.to_string(),
                     DedupEntry {
@@ -216,6 +230,21 @@ mod tests {
             );
         }
         assert!(d.tick(t0 + Duration::seconds(301)).is_empty());
+    }
+
+    #[test]
+    fn entry_count_is_bounded() {
+        let t0 = Utc::now();
+        let mut d = Deduper::new(300);
+        for i in 0..(MAX_ENTRIES + 50) {
+            let sig = format!("s{}", i);
+            d.record(
+                &sig,
+                t0 + Duration::milliseconds(i as i64),
+                &finding(&sig, Severity::Info),
+            );
+        }
+        assert_eq!(d.len(), MAX_ENTRIES);
     }
 
     #[test]

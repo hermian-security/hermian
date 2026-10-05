@@ -799,10 +799,8 @@ name = "hermian-core"
 version = "0.1.0-beta.5"
 dependencies = [
  "chrono",
- "hex",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 1.0.69",
  "toml",
 ]

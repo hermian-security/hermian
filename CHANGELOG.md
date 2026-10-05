@@ -33,6 +33,34 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   cron line is checked (only the first four were). A package manager writing
   a unit that runs from `/tmp` is reported too.
 
+- A second, different change to the same sudoers, cron, unit,
+  authorized_keys, ld.so.preload or account file within the dedup window is
+  its own alert; only identical content is folded.
+- Account diffs catch more: uid/gid 0 however written (`00`), a service
+  account getting a login shell, gid and home changes, and new members of
+  docker, lxd, incus-admin, libvirt, disk, shadow and adm.
+- ld.so.conf.d checks no longer accept `/libevil`, `/usr/../tmp` or an
+  `include` outside ld.so.conf.d.
+- DNS/NTP-port connections to a new public address are judged like any
+  other once the baseline is done; only the LAN and learned servers are
+  skipped.
+- A known port bound again on another address (`127.0.0.1:8080` then
+  `0.0.0.0:8080`) is a new listener.
+- `ExecStart = x` (spaces around `=`) is parsed.
+
+### Fixed
+
+- Ref ids follow the wall clock and never go backwards, so a late event or a
+  clock step around midnight can't reissue an id and overwrite an alert file.
+- The staging heuristic works on words: `ssh` and `flush` aren't shells (an
+  rsync cron job touching `/tmp` was CRITICAL), and a unit is only flagged
+  when the program, not an option like `--socket /tmp/x`, sits in `/tmp`.
+  `base64 -d | sh` and a cron job running a `/tmp` binary are flagged.
+- Off-hours windows are in the host's local time, not UTC.
+- Dedup signatures, auth sources and learned baseline sets are capped, so
+  attacker-chosen paths or rotating IPv6 sources can't grow memory without
+  bound. Far-past event timestamps are clamped like future ones.
+
 ### Changed
 
 - User management run from cron or a plain service (not a session, package
