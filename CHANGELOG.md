@@ -163,6 +163,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 - If you send email through a remote SMTP server with `smtp_security =
   "none"` and credentials, switch to `"starttls"` or `"tls"`.
+- Stored alerts older than 90 days are deleted within an hour of upgrading.
+  To keep them, set `general.alert_retention_days = 0` (or back up
+  `/var/lib/hermian/alerts/`) first.
 
 ## 0.1.0-beta.5 - 2026-09-23
 
