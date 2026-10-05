@@ -1,7 +1,7 @@
 //! The long-running daemon: wires event sources into the engine and alerts
 //! into the notifier.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -306,6 +306,8 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     // make the change skip both the reload and its alert.
     let mut applied_hash = integrity.config_hash.clone();
     let mut dropped_seen = health::snapshot();
+    let mut compat_seen: HashMap<String, bool> = HashMap::new();
+    let mut hotplug_reported: Vec<u32> = Vec::new();
     let started_at = Utc::now();
     let config_path = paths::config_path();
 
@@ -348,6 +350,9 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                         reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "file change");
                         continue;
                     }
+                }
+                if let (Event::Exec(e), true) = (&ev, sources.ebpf.is_some()) {
+                    check_compat_exec(&mut engine, &notifier, &mut compat_seen, e);
                 }
                 match &ev {
                     Event::Exec(e) => seed_missing_ancestors(&mut engine, e.ppid, e.ts),
@@ -394,6 +399,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                     report_dropped_events(&mut engine, &notifier, &grown, &dropped_now);
                 }
                 dropped_seen = dropped_now;
+                let unmonitored = ebpf::unmonitored_cpus();
+                if !unmonitored.is_empty() && unmonitored != hotplug_reported {
+                    report_unmonitored_cpus(&mut engine, &notifier, &unmonitored);
+                }
+                hotplug_reported = unmonitored;
                 let _ = config::save_baseline(&engine.baseline);
                 save_engine_state(&engine);
 
@@ -478,6 +488,70 @@ fn report_dropped_events(
             ),
         );
     }
+}
+
+/// Cap on remembered exe paths for the 32-bit check.
+const COMPAT_CACHE: usize = 4096;
+
+/// A 32-bit program on x86_64 uses compat syscalls, which the eBPF
+/// `sys_enter_*` hooks don't see: its connects and ptrace calls are
+/// invisible. Rare on servers, so each such program is logged once (LOW,
+/// not paged) to make the blind spot visible.
+fn check_compat_exec(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    seen: &mut HashMap<String, bool>,
+    e: &ExecEvent,
+) {
+    // Each exe is checked (and, if 32-bit, reported) once.
+    if seen.contains_key(&e.exe) {
+        return;
+    }
+    let compat = procsrc::is_compat_binary(&e.exe);
+    if seen.len() >= COMPAT_CACHE {
+        seen.clear();
+    }
+    seen.insert(e.exe.clone(), compat);
+    if !compat {
+        return;
+    }
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::Low,
+            "32-bit program started (partly unmonitored)",
+            &format!(
+                "{} (pid {}) is a 32-bit program. Its network connections and ptrace calls aren't visible to HERMIAN's eBPF hooks.",
+                e.exe, e.pid
+            ),
+            "32-bit programs make compat syscalls that the syscall tracepoints skip. Legitimate ones are rare on a 64-bit server, and attackers use them to get around syscall monitoring.",
+            &["Check what the program is and why it runs.", "Allowlist nothing here; just know its network activity isn't covered."],
+            &[("Executable", e.exe.as_str())],
+            &format!("selfprotect|compat|{}", e.exe),
+        ),
+    );
+}
+
+fn report_unmonitored_cpus(engine: &mut Engine, notifier: &notify::Notifier, cpus: &[u32]) {
+    let list = cpus
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::High,
+            "CPUs came online without eBPF monitoring",
+            &format!("CPU(s) {} came online after HERMIAN started and have no event reader.", list),
+            "Exec, connect and ptrace events on those CPUs are neither delivered nor counted as lost until the daemon restarts.",
+            &["Restart HERMIAN: systemctl restart hermian"],
+            &[("CPUs", list.as_str())],
+            &format!("selfprotect|hotplug|{}", list),
+        ),
+    );
 }
 
 /// Tell the alert channels the daemon is stopping, and give delivery a few

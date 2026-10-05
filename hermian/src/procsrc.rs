@@ -565,6 +565,27 @@ pub fn file_in_package_database(path: &str) -> Option<bool> {
     None
 }
 
+/// Whether `path` is a 32-bit ELF on a 64-bit x86 host. Such programs make
+/// compat (int 0x80 / ia32) syscalls, which the `sys_enter_*` tracepoints
+/// don't see, so their connects and ptrace calls are invisible to eBPF.
+pub fn is_compat_binary(path: &str) -> bool {
+    if !cfg!(target_arch = "x86_64") || path.is_empty() {
+        return false;
+    }
+    let Ok(f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 5];
+    if f.take(5).read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    is_elf32(&hdr)
+}
+
+fn is_elf32(hdr: &[u8; 5]) -> bool {
+    hdr[..4] == *b"\x7fELF" && hdr[4] == 1
+}
+
 pub fn current_exe_path() -> Result<PathBuf> {
     fs::read_link("/proc/self/exe").context("failed to resolve own binary path")
 }
@@ -580,6 +601,17 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // temp_dir itself may be a symlink (macOS-style setups); use the real path.
         fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn elf_class_is_read_from_the_header() {
+        assert!(is_elf32(b"\x7fELF\x01"));
+        assert!(!is_elf32(b"\x7fELF\x02"));
+        assert!(!is_elf32(b"#!/bi"));
+        // Our own binary is 64-bit.
+        let me = current_exe_path().unwrap();
+        assert!(!is_compat_binary(me.to_str().unwrap()));
+        assert!(!is_compat_binary("/nonexistent"));
     }
 
     #[test]

@@ -108,6 +108,16 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   refuses `0.0.0.0/0` / `::/0`. New dead-man switch: `hermian isolate --for
   <minutes>` and `response.auto_isolate_revert_mins` lift it via a systemd
   timer.
+- eBPF probes:
+  - The connect probe reads the address family first, then only that
+    family's bytes. A fixed 28-byte read failed (and dropped the event)
+    when a `sockaddr_in` sat at the end of a page.
+  - `LD_AUDIT` is flagged like `LD_PRELOAD`, and 64 env entries are
+    checked (was 32).
+  - Exec intents are built on the BPF stack instead of a per-CPU scratch
+    slot that a preempted syscall tracepoint could share.
+  - 32-bit programs on x86_64 (whose syscalls the hooks don't see) are
+    logged, and CPUs hot-plugged after startup page until a restart.
 - The PAM module has no JSON dependency and no panic paths left. It runs
   inside sshd under `panic = "abort"`, so a panic there would kill the login.
   Its docs show the absolute module path (a bare name never loads).

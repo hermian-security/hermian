@@ -91,7 +91,7 @@ exception. See the examples in `/etc/hermian/config.toml`.
 | --- | --- |
 | Execution | eBPF `sched_process_exec`; syscall-entry hooks collect extra exec context |
 | Parent PID | Kernel BTF offsets, with a `/proc` fallback |
-| Connect / ptrace | eBPF syscall entry: records attempts, not confirmed success |
+| Connect / ptrace | eBPF syscall entry: records attempts, not confirmed success. Not seen: 32-bit (compat) syscalls on x86_64, io_uring connects, unconnected UDP `sendto`, TCP Fast Open |
 | File changes | inotify on selected paths; 400 ms debounce, max 2.5 s hold |
 | Process metadata | `/proc` at startup and while handling events |
 | TCP listeners | `/proc/net/tcp*`, polled every 5 s |
@@ -101,6 +101,12 @@ exception. See the examples in `/etc/hermian/config.toml`.
 eBPF needs kernel 5.8+ and the required permissions. If it can't load, execution
 falls back to one-second `/proc` polling and audit when available. HERMIAN leaves
 an existing auditd alone. Short-lived processes can be missed by polling.
+
+The exec hooks check up to 64 environment entries for `LD_PRELOAD` or
+`LD_AUDIT`; more filler variables than that still hide them. A 32-bit
+program starting on x86_64 is logged (LOW) since its syscalls bypass the
+hooks, and CPUs hot-plugged after startup page HIGH until a restart gives
+them a reader.
 
 Container metadata comes from PID namespaces and cgroups. This is host-side
 monitoring, not full container or Kubernetes coverage.
@@ -196,9 +202,13 @@ install nightly Rust with `rust-src` and a suitable
 CI currently uses bpf-linker v0.11.1.
 
 ```bash
-rustup toolchain install nightly -c rust-src
-HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
+rustup toolchain install nightly-2026-09-17 -c rust-src
+HERMIAN_EBPF_NIGHTLY=nightly-2026-09-17 HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
 ```
+
+CI pins that nightly and bpf-linker v0.11.1; with both, the build reproduces
+the vendored object byte for byte. Bump them together and commit the new
+object in the same PR.
 
 `HERMIAN_EBPF_PREBUILT=/path/to/object` selects an explicit object instead.
 If a BPF toolchain is installed but the source fails to compile, the build
