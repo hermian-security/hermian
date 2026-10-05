@@ -45,9 +45,15 @@ fn nightly_available() -> bool {
 }
 
 fn nightly_has_rust_src() -> bool {
-    rustup(&["component", "list", "--installed", "--toolchain", &nightly()])
-        .map(|s| s.lines().any(|l| l.trim().starts_with("rust-src")))
-        .unwrap_or(false)
+    rustup(&[
+        "component",
+        "list",
+        "--installed",
+        "--toolchain",
+        &nightly(),
+    ])
+    .map(|s| s.lines().any(|l| l.trim().starts_with("rust-src")))
+    .unwrap_or(false)
 }
 
 fn bpf_linker_available() -> bool {
