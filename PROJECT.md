@@ -174,9 +174,11 @@ Monitoring logs and notifies by default; it doesn't kill or quarantine processes
 Isolation requires `response.management_cidrs`. Automatic isolation also needs
 `response.auto_isolate = true` and `CAP_NET_ADMIN`, which `hermian enable`
 grants only when isolation is configured; re-run it after turning isolation on.
-A CRITICAL whose web server or database isn't installed in a root-owned
-location still pages but doesn't isolate, so a local user can't trigger it by
-naming a program `nginx`.
+A CRITICAL whose web server or database doesn't look genuine still pages but
+doesn't isolate, so a local user can't trigger it by naming a program
+`nginx`. Genuine means the binary in a root-owned location is named like the
+service, or a trusted interpreter (gunicorn, puma, tomcat) runs it under a
+system account (uid < 1000).
 The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
 neighbour discovery, DNS to the resolvers in resolv.conf, cloud instance
 metadata (169.254.169.254, which some providers need for SSH logins), and TCP

@@ -253,6 +253,30 @@ pub fn is_system_tool(comm: &str, exe: &str, names: &[&str]) -> bool {
         && comm_matches(c, SCRIPT_TOOLS)
 }
 
+/// Highest uid of a system account (Debian/RHEL convention). Service
+/// accounts (www-data, postgres, nginx) sit below it; login users above.
+pub const SYSTEM_UID_MAX: u32 = 999;
+
+/// Whether a process that looks like a web server or database really is
+/// one, for decisions an unprivileged user mustn't be able to trigger.
+///
+/// The role itself comes from the name, so a trusted path isn't enough on
+/// its own: `python3 -c 'prctl(PR_SET_NAME, "nginx")'` runs from
+/// `/usr/bin/python3`. Genuine means either the installed binary is named
+/// like the service (`/usr/sbin/nginx`, `/usr/sbin/php-fpm8.2`), or it's a
+/// trusted interpreter hosting one (gunicorn, puma, tomcat) under a system
+/// account rather than a login user.
+pub fn genuine_service(exe: &str, uid: u32) -> bool {
+    if !is_trusted_exe(exe) {
+        return false;
+    }
+    let base = exe_basename(exe);
+    comm_matches(base, WEB_SERVERS)
+        || comm_matches(base, DATABASES)
+        || base.starts_with("php-fpm")
+        || uid <= SYSTEM_UID_MAX
+}
+
 /// The exe to record for a process that may be a script tool.
 ///
 /// `dnf` or Debian's `adduser` run as `/usr/bin/python3` or `/usr/bin/perl`,
@@ -785,6 +809,21 @@ mod tests {
         // No false prefix matches.
         assert_eq!(role_of("shred", ""), Role::Unknown);
         assert_eq!(role_of("nodemon", ""), Role::Unknown);
+    }
+
+    #[test]
+    fn genuine_services_need_more_than_a_name() {
+        // The real binaries.
+        assert!(genuine_service("/usr/sbin/nginx", 0));
+        assert!(genuine_service("/usr/sbin/php-fpm8.2", 33));
+        assert!(genuine_service("/usr/sbin/mysqld", 111));
+        // A login user's python renamed to "nginx" with prctl.
+        assert!(!genuine_service("/usr/bin/python3.12", 1000));
+        // A copy in a home dir.
+        assert!(!genuine_service("/home/eve/nginx", 33));
+        // gunicorn/puma/tomcat: an interpreter under a service account.
+        assert!(genuine_service("/usr/bin/python3.12", 33));
+        assert!(genuine_service("/usr/lib/jvm/java-17/bin/java", 998));
     }
 
     #[test]

@@ -14,9 +14,11 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   tools (nc, socat) anywhere under a service are HIGH too.
 - A web shell flag no longer marks the web server itself, so its other
   requests aren't escalated for the next ten minutes.
-- Auto-isolation ignores CRITICALs whose web server or database isn't
-  installed in a root-owned location. Any local user could otherwise run a
-  program called `nginx` and cut the host off. The alert still pages.
+- Auto-isolation ignores CRITICALs whose web server or database doesn't look
+  genuine: the binary must be named like the service in a root-owned
+  location, or be a trusted interpreter running as a system account. Any
+  local user could otherwise run a program called `nginx` (or rename python
+  to it) and cut the host off. The alert still pages.
 - Tool exemptions are harder to borrow:
   - A script named like a tool (`/tmp/dnf`, python renamed to `dnf`) isn't
     the package manager; the script's own path has to be trusted.

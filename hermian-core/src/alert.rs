@@ -266,14 +266,13 @@ impl Alert {
     /// by name, so any local user can run a program called `nginx` and walk
     /// it through shell -> curl -> payload. That's still worth a page, but
     /// cutting the host off the network shouldn't be something an
-    /// unprivileged user can do. A real service runs from a root-owned
-    /// install location.
+    /// unprivileged user can do. See [`crate::proctree::genuine_service`].
     pub fn auto_isolate_eligible(&self) -> bool {
-        use crate::proctree::{is_trusted_exe, role_of, Role};
+        use crate::proctree::{genuine_service, role_of, Role};
         self.severity == Severity::Critical
             && self.chain.iter().all(|n| {
                 !matches!(role_of(&n.comm, &n.exe), Role::WebServer | Role::Database)
-                    || is_trusted_exe(&n.exe)
+                    || genuine_service(&n.exe, n.uid)
             })
     }
 
