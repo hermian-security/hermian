@@ -42,7 +42,7 @@ are the detailed rule reference, including exemptions and severity choices.
 
 | Group | Looks for |
 | --- | --- |
-| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (through `env`/`setsid`-style wrappers), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
+| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (direct or through other programs), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
 | [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
 | [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron, shell profiles, SSH keys, and systemd changes |
 | [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
@@ -154,6 +154,9 @@ Monitoring logs and notifies by default; it doesn't kill or quarantine processes
 Isolation requires `response.management_cidrs`. Automatic isolation also needs
 `response.auto_isolate = true` and `CAP_NET_ADMIN`, which `hermian enable`
 grants only when isolation is configured; re-run it after turning isolation on.
+A CRITICAL whose web server or database isn't installed in a root-owned
+location still pages but doesn't isolate, so a local user can't trigger it by
+naming a program `nginx`.
 The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
 neighbour discovery, DNS to the resolvers in resolv.conf, and TCP to the
 notification endpoints resolved at isolation time. It isn't a complete

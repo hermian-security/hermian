@@ -6,6 +6,18 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Security
+
+- A web or database shell started through another program (`nginx -> perl
+  -> sh`, `awk 'BEGIN{system("sh")}'`) is HIGH like a direct one; only the
+  nearest parent used to count. Downloaders behind an interpreter and relay
+  tools (nc, socat) anywhere under a service are HIGH too.
+- A web shell flag no longer marks the web server itself, so its other
+  requests aren't escalated for the next ten minutes.
+- Auto-isolation ignores CRITICALs whose web server or database isn't
+  installed in a root-owned location. Any local user could otherwise run a
+  program called `nginx` and cut the host off. The alert still pages.
+
 ## 0.1.0-beta.5 - 2026-09-23
 
 Fixes from the first full run on a real host (Ubuntu 22.04, kernel 6.8): the

@@ -297,9 +297,20 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                     seed_missing_ancestors(&mut engine, e);
                 }
                 for alert in engine.process(ev) {
-                    let critical = alert.severity == Severity::Critical;
+                    let isolate = alert.auto_isolate_eligible();
+                    if alert.severity == Severity::Critical && !isolate
+                        && current_cfg.response.auto_isolate
+                    {
+                        log_daemon(
+                            Severity::High,
+                            &format!(
+                                "auto-isolate skipped for {}: the service in its chain isn't installed in a root-owned location",
+                                alert.ref_id
+                            ),
+                        );
+                    }
                     notifier.send(alert);
-                    if critical {
+                    if isolate {
                         isolate::auto_isolate_if_enabled(&current_cfg);
                     }
                 }

@@ -322,9 +322,10 @@ impl Engine {
             if f.detection != DetectionId::D1 || f.severity < Severity::High {
                 continue;
             }
-            // Never flag init or long-lived service roots (sshd, cron, systemd):
-            // that would taint every process on the host. Keep only the
-            // suspicious tail of the chain.
+            // Never flag init or long-lived service roots (sshd, cron, systemd,
+            // the web server or database itself): that would taint every
+            // process on the host, or every request a web server handles for
+            // the next ten minutes. Keep only the suspicious tail of the chain.
             let pids: Vec<u32> = f
                 .pids
                 .iter()
@@ -340,6 +341,8 @@ impl Engine {
                                     crate::proctree::Role::System
                                         | crate::proctree::Role::Sshd
                                         | crate::proctree::Role::Cron
+                                        | crate::proctree::Role::WebServer
+                                        | crate::proctree::Role::Database
                                 ) && p.ppid != 0
                             })
                             .unwrap_or(true)

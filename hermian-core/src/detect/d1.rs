@@ -40,13 +40,69 @@ fn is_wrapper(p: &ProcInfo) -> bool {
     WRAPPERS.contains(&p.comm.as_str()) || WRAPPERS.contains(&base)
 }
 
-/// Index of the nearest ancestor of `chain[last]` that isn't a wrapper.
-fn effective_parent(chain: &[ProcInfo], last: usize) -> Option<usize> {
-    (0..last).rev().find(|i| !is_wrapper(&chain[*i]))
+/// Where the service sits relative to the process being judged.
+struct ServiceLink {
+    /// Index of the service in the chain.
+    idx: usize,
+    /// Non-wrapper processes between the service and the judged process
+    /// (`nginx -> perl -> sh` has one: perl). Empty for a direct child.
+    via: Vec<usize>,
+}
+
+/// The nearest `service` ancestor of `chain[last]`.
+///
+/// Only the effective parent used to count, so any program in between
+/// (`nginx -> perl -> sh`, `nginx -> awk 'BEGIN{system("sh")}'`) hid a web
+/// shell completely. Now the closest service up the chain counts, unless a
+/// shell already sits in between: that shell was the one reported, and its
+/// descendants are judged by the download/exec rules instead.
+fn service_link(
+    chain: &[ProcInfo],
+    roles: &[Role],
+    last: usize,
+    service: Role,
+) -> Option<ServiceLink> {
+    let idx = (0..last).rev().find(|i| roles[*i] == service)?;
+    let via: Vec<usize> = (idx + 1..last)
+        .filter(|i| !is_wrapper(&chain[*i]))
+        .collect();
+    if via.iter().any(|i| roles[*i] == Role::Shell) {
+        return None;
+    }
+    Some(ServiceLink { idx, via })
+}
+
+/// Whether the allowlist covers this pair, either as service -> child or as
+/// the immediate (non-wrapper) parent -> child, so an expected CGI wrapper
+/// (`fcgiwrap -> sh`) can be allowed without allowing every nginx shell.
+fn link_allowed(ev: &ExecEvent, ctx: &Ctx, chain: &[ProcInfo], link: &ServiceLink) -> bool {
+    let user = ctx.user_name(ev.uid);
+    let mut parents = vec![&chain[link.idx]];
+    if let Some(i) = link.via.last() {
+        parents.push(&chain[*i]);
+    }
+    parents.iter().any(|p| {
+        ctx.allowlist
+            .chain_allowed(&p.comm, &ev.comm, Some(ev.uid), user)
+    })
+}
+
+/// " (via perl, awk)" for an indirect link, "" for a direct child.
+fn via_label(chain: &[ProcInfo], link: &ServiceLink) -> String {
+    if link.via.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = link.via.iter().map(|i| chain[*i].comm.as_str()).collect();
+    format!(" (via {})", names.join(", "))
 }
 
 /// Tools that open a raw network channel: reverse/bind shells, relays.
 const NETCAT_LIKE: &[&str] = &["nc", "ncat", "netcat", "socat", "openssl", "telnet"];
+
+fn is_netcat(ev: &ExecEvent) -> bool {
+    let base = ev.exe.rsplit('/').next().unwrap_or("");
+    NETCAT_LIKE.contains(&ev.comm.as_str()) || NETCAT_LIKE.contains(&base)
+}
 
 fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) -> Option<Finding> {
     if roles.len() < 2 {
@@ -54,25 +110,19 @@ fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) ->
     }
     let last = roles.len() - 1;
     let chain = ctx.tree.chain_of(ev.pid);
-    let parent_idx = effective_parent(&chain, last)?;
-    if roles[parent_idx] != service {
-        return None;
-    }
     // Shells always; downloaders and netcat-style tools are the next most
     // common first step. General interpreters are logged, since apps do run
     // `php artisan` or `python manage.py` legitimately.
-    let base = ev.exe.rsplit('/').next().unwrap_or("");
-    let netcat = NETCAT_LIKE.contains(&ev.comm.as_str()) || NETCAT_LIKE.contains(&base);
+    let netcat = is_netcat(ev);
     if roles[last] != Role::Shell {
-        return service_to_tool(ev, ctx, &chain, parent_idx, roles[last], netcat, service);
+        return service_to_tool(ev, ctx, &chain, roles, netcat, service);
     }
-    let parent = &chain[parent_idx];
-    if ctx
-        .allowlist
-        .chain_allowed(&parent.comm, &ev.comm, Some(ev.uid), ctx.user_name(ev.uid))
-    {
+    let link = service_link(&chain, roles, last, service)?;
+    if link_allowed(ev, ctx, &chain, &link) {
         return None;
     }
+    let parent = &chain[link.idx];
+    let via = via_label(&chain, &link);
     let (kind, why, actions): (&str, &str, [&str; 3]) = match service {
         Role::WebServer => (
             "web-shell",
@@ -107,15 +157,16 @@ fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) ->
         Finding::new(
             DetectionId::D1,
             Severity::High,
-            title,
+            &format!("{}{}", title, via),
             &format!("d1|{}|{}|{}", kind, parent.comm, parent.pid),
         )
         .what(format!(
-            "{} (pid {}) spawned the shell {} (pid {}) running as {}.",
+            "{} (pid {}) spawned the shell {} (pid {}){} running as {}.",
             parent.comm,
             parent.pid,
             ev.comm,
             ev.pid,
+            via,
             ctx.user_name(ev.uid).unwrap_or("an unknown user")
         ))
         .chain(ctx.chain_nodes(ev.pid))
@@ -129,25 +180,37 @@ fn service_to_tool(
     ev: &ExecEvent,
     ctx: &Ctx,
     chain: &[ProcInfo],
-    parent_idx: usize,
-    role: Role,
+    roles: &[Role],
     netcat: bool,
     service: Role,
 ) -> Option<Finding> {
+    let last = roles.len() - 1;
+    let role = roles[last];
+    let link = if netcat {
+        // A relay anywhere under a service is a reverse/bind shell, shell in
+        // between or not; nothing else reports it.
+        let idx = (0..last).rev().find(|i| roles[*i] == service)?;
+        let via = (idx + 1..last)
+            .filter(|i| !is_wrapper(&chain[*i]))
+            .collect();
+        ServiceLink { idx, via }
+    } else {
+        service_link(chain, roles, last, service)?
+    };
     let severity = if netcat || role == Role::Downloader {
         Severity::High
-    } else if role == Role::Interpreter {
+    } else if role == Role::Interpreter && link.via.is_empty() {
+        // An interpreter under another program is that program's business;
+        // only a direct one is logged.
         Severity::Low
     } else {
         return None;
     };
-    let parent = &chain[parent_idx];
-    if ctx
-        .allowlist
-        .chain_allowed(&parent.comm, &ev.comm, Some(ev.uid), ctx.user_name(ev.uid))
-    {
+    if link_allowed(ev, ctx, chain, &link) {
         return None;
     }
+    let parent = &chain[link.idx];
+    let via = via_label(chain, &link);
     let svc = if service == Role::WebServer {
         "Web server"
     } else {
@@ -176,15 +239,16 @@ fn service_to_tool(
         Finding::new(
             DetectionId::D1,
             severity,
-            &title,
+            &format!("{}{}", title, via),
             &format!("d1|service-tool|{}|{}|{}", parent.comm, parent.pid, ev.comm),
         )
         .what(format!(
-            "{} (pid {}) started {} (pid {}) running as {}.",
+            "{} (pid {}) started {} (pid {}){} running as {}.",
             parent.comm,
             parent.pid,
             ev.comm,
             ev.pid,
+            via,
             ctx.user_name(ev.uid).unwrap_or("an unknown user")
         ))
         .chain(ctx.chain_nodes(ev.pid))
@@ -464,4 +528,173 @@ fn shell_script_exec(ev: &ExecEvent, ctx: &Ctx, roles: &[Role]) -> Option<Findin
              becomes meaningful in combination with other detections.",
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::alert::Alert;
+    use crate::allowlist::ProcessChainRule;
+    use crate::baseline::Baseline;
+    use crate::config::Config;
+    use crate::engine::Engine;
+    use crate::events::{DetectionId, Event, ExecEvent, Severity};
+    use chrono::{DateTime, Utc};
+
+    fn engine(cfg: Config) -> Engine {
+        let allow = cfg.allowlist.clone();
+        let mut eng = Engine::new(cfg, allow, Baseline::new(false, 24, Utc::now()), "t".into());
+        eng.set_user_names([(33, "www-data".to_string())].into_iter().collect());
+        eng
+    }
+
+    fn exec(t: DateTime<Utc>, pid: u32, ppid: u32, comm: &str, exe: &str) -> Event {
+        Event::Exec(ExecEvent {
+            ts: t,
+            pid,
+            ppid,
+            uid: 33,
+            gid: 33,
+            comm: comm.into(),
+            exe: exe.into(),
+            argv0: exe.into(),
+            ld_preload: false,
+            deleted_exe: false,
+            tty_nr: 0,
+            container: false,
+            container_id: None,
+        })
+    }
+
+    fn high_d1(a: &[Alert]) -> Option<&Alert> {
+        a.iter()
+            .find(|a| a.detection == DetectionId::D1 && a.severity >= Severity::High)
+    }
+
+    fn base(eng: &mut Engine, t: DateTime<Utc>) {
+        eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, "nginx", "/usr/sbin/nginx"));
+    }
+
+    #[test]
+    fn web_shell_behind_an_interpreter_is_high() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "perl", "/usr/bin/perl"));
+        let a = eng.process(exec(t, 201, 200, "sh", "/usr/bin/dash"));
+        let alert = high_d1(&a).unwrap_or_else(|| panic!("{:?}", a));
+        assert!(alert.title.contains("via perl"), "{}", alert.title);
+    }
+
+    #[test]
+    fn web_shell_behind_an_unknown_program_is_high() {
+        // awk 'BEGIN{system("sh")}': awk has no role of its own.
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "awk", "/usr/bin/mawk"));
+        let a = eng.process(exec(t, 201, 200, "sh", "/usr/bin/dash"));
+        assert!(high_d1(&a).is_some(), "{:?}", a);
+    }
+
+    #[test]
+    fn downloader_behind_an_interpreter_is_high() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "python3", "/usr/bin/python3.12"));
+        let a = eng.process(exec(t, 201, 200, "curl", "/usr/bin/curl"));
+        assert!(high_d1(&a).is_some(), "{:?}", a);
+    }
+
+    #[test]
+    fn relay_under_a_web_shell_is_high() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "sh", "/usr/bin/dash"));
+        let a = eng.process(exec(t, 201, 200, "nc", "/usr/bin/nc.openbsd"));
+        let alert = high_d1(&a).unwrap_or_else(|| panic!("{:?}", a));
+        assert!(alert.title.contains("relay"), "{}", alert.title);
+    }
+
+    #[test]
+    fn shell_under_a_web_shell_is_not_reported_twice() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "sh", "/usr/bin/dash"));
+        let a = eng.process(exec(t, 201, 200, "bash", "/usr/bin/bash"));
+        assert!(
+            !a.iter()
+                .any(|a| a.title.starts_with("Web server spawned a shell")),
+            "{:?}",
+            a
+        );
+    }
+
+    #[test]
+    fn nested_interpreter_is_not_logged_as_a_service_child() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "php", "/usr/bin/php8.2"));
+        let a = eng.process(exec(t, 201, 200, "python3", "/usr/bin/python3.12"));
+        assert!(!a.iter().any(|a| a.detection == DetectionId::D1), "{:?}", a);
+    }
+
+    #[test]
+    fn intermediate_parent_can_be_allowlisted() {
+        let mut cfg = Config::default();
+        cfg.allowlist.process_chains.push(ProcessChainRule {
+            parent: "fcgiwrap".into(),
+            child: "sh".into(),
+            user: None,
+            reason: "CGI scripts".into(),
+        });
+        let mut eng = engine(cfg);
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "fcgiwrap", "/usr/sbin/fcgiwrap"));
+        let a = eng.process(exec(t, 201, 200, "sh", "/usr/bin/dash"));
+        assert!(high_d1(&a).is_none(), "{:?}", a);
+    }
+
+    #[test]
+    fn web_shell_flag_does_not_taint_the_web_server() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(exec(t, 200, 100, "sh", "/usr/bin/dash"));
+        let flagged: Vec<u32> = eng.flags.iter().flat_map(|f| f.pids.clone()).collect();
+        assert!(flagged.contains(&200), "{:?}", flagged);
+        assert!(!flagged.contains(&100), "{:?}", flagged);
+    }
+
+    #[test]
+    fn fake_web_server_can_page_but_not_isolate() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 100, 1, "nginx", "/home/eve/nginx"));
+        eng.process(exec(t, 200, 100, "sh", "/usr/bin/dash"));
+        eng.process(exec(t, 300, 200, "curl", "/usr/bin/curl"));
+        let a = eng.process(exec(t, 301, 200, "sh", "/usr/bin/dash"));
+        let crit = a
+            .iter()
+            .find(|a| a.severity == Severity::Critical)
+            .unwrap_or_else(|| panic!("{:?}", a));
+        assert!(!crit.auto_isolate_eligible());
+
+        let mut real = engine(Config::default());
+        base(&mut real, t);
+        real.process(exec(t, 200, 100, "sh", "/usr/bin/dash"));
+        real.process(exec(t, 300, 200, "curl", "/usr/bin/curl"));
+        let a = real.process(exec(t, 301, 200, "sh", "/usr/bin/dash"));
+        let crit = a
+            .iter()
+            .find(|a| a.severity == Severity::Critical)
+            .unwrap_or_else(|| panic!("{:?}", a));
+        assert!(crit.auto_isolate_eligible());
+    }
 }
