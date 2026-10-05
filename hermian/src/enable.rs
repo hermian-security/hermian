@@ -49,13 +49,17 @@ fn ensure_inotify_limits() -> Result<()> {
     Ok(())
 }
 
-fn render_unit(exec_path: &str, isolation_enabled: bool) -> String {
-    let caps_common = "CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_AUDIT_CONTROL CAP_AUDIT_READ";
-    let caps = if isolation_enabled {
-        format!("{} CAP_NET_ADMIN", caps_common)
-    } else {
-        caps_common.to_string()
-    };
+/// The unit for this binary. Isolation and the Telegram responses need
+/// nftables (`CAP_NET_ADMIN`); disconnecting a session needs `CAP_KILL`.
+/// Neither is granted unless configured.
+fn render_unit(exec_path: &str, isolation_enabled: bool, actions_enabled: bool) -> String {
+    let mut caps = "CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_AUDIT_CONTROL CAP_AUDIT_READ".to_string();
+    if isolation_enabled || actions_enabled {
+        caps.push_str(" CAP_NET_ADMIN");
+    }
+    if actions_enabled {
+        caps.push_str(" CAP_KILL");
+    }
     UNIT_TEMPLATE
         .replace("%EXEC%", exec_path)
         .replace("%CAP_BOUNDING%", &format!("CapabilityBoundingSet={}", caps))
@@ -88,7 +92,11 @@ pub fn run(args: &EnableArgs) -> Result<()> {
     let exe = procsrc::current_exe_path()?;
     let exe_s = exe.to_string_lossy().into_owned();
     let isolation = cfg.response.auto_isolate || !cfg.response.management_cidrs.is_empty();
-    let unit = render_unit(&exe_s, isolation);
+    let unit = render_unit(
+        &exe_s,
+        isolation,
+        cfg.notifications.telegram.actions_enabled(),
+    );
     let unit_changed = fs::read_to_string(paths::UNIT_PATH)
         .map(|c| c != unit)
         .unwrap_or(true);
@@ -258,6 +266,17 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_capabilities_only_when_configured() {
+        let plain = render_unit("/usr/bin/hermian", false, false);
+        assert!(!plain.contains("CAP_NET_ADMIN") && !plain.contains("CAP_KILL"));
+        let iso = render_unit("/usr/bin/hermian", true, false);
+        assert!(iso.contains("CAP_NET_ADMIN") && !iso.contains("CAP_KILL"));
+        let actions = render_unit("/usr/bin/hermian", false, true);
+        assert!(actions.contains("CAP_NET_ADMIN") && actions.contains("CAP_KILL"));
+        assert!(actions.contains("ExecStart=/usr/bin/hermian run"));
+    }
 
     #[test]
     fn pam_hook_uses_the_absolute_module_path() {

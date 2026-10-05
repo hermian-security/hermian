@@ -137,6 +137,7 @@ pub fn parse_pam_payload(payload: &str) -> Option<AuthEvent> {
         rhost,
         service,
         tty,
+        port: None,
     })
 }
 

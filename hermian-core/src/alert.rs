@@ -79,6 +79,9 @@ pub struct Finding {
     pub signature: String,
     #[serde(default)]
     pub pids: Vec<u32>,
+    /// Responses an operator could choose (shown as buttons where supported).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offers: Vec<crate::response::ResponseAction>,
 }
 
 impl Finding {
@@ -94,7 +97,14 @@ impl Finding {
             actions: Vec::new(),
             signature: signature.to_string(),
             pids: Vec::new(),
+            offers: Vec::new(),
         }
+    }
+
+    /// Offer a response the operator can choose.
+    pub fn offer(mut self, action: crate::response::ResponseAction) -> Self {
+        self.offers.push(action);
+        self
     }
 
     pub fn what(mut self, what: impl Into<String>) -> Self {
@@ -174,6 +184,9 @@ pub struct Alert {
     /// Number of identical occurrences folded into this alert (>= 1).
     #[serde(default = "one")]
     pub repeats: u32,
+    /// Responses offered with this alert (see [`Finding::offers`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offers: Vec<crate::response::ResponseAction>,
 }
 
 fn one() -> u32 {
@@ -256,6 +269,7 @@ impl Alert {
             actions: finding.actions,
             signature: finding.signature,
             repeats: 1,
+            offers: finding.offers,
         }
     }
 

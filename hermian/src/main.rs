@@ -1,6 +1,7 @@
 mod alerts;
 mod auditnetlink;
 mod authlog;
+mod blocklist;
 mod btf;
 mod channels;
 mod cli;
@@ -19,7 +20,9 @@ mod paths;
 mod procsrc;
 mod retention;
 mod selfprotect;
+mod sessions;
 mod status;
+mod tgbot;
 mod ui;
 mod uninstall;
 mod watchers;
@@ -39,6 +42,8 @@ fn main() {
         cli::Cmd::Collect(args) => collect::run(&args),
         cli::Cmd::Isolate(args) => isolate::cmd_isolate(&args),
         cli::Cmd::Unisolate => isolate::cmd_unisolate(),
+        cli::Cmd::Blocked => blocklist::cmd_blocked(),
+        cli::Cmd::Unblock(args) => blocklist::cmd_unblock(&args.ip),
         cli::Cmd::Uninstall(args) => uninstall::run(&args),
     };
     if let Err(e) = result {

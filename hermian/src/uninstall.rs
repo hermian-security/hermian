@@ -30,8 +30,10 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     let _ = std::process::Command::new("systemctl")
         .args(["disable", "--now", "hermian"])
         .output();
-    // Never leave a host isolated by a tool that is about to disappear.
+    // Never leave a host isolated by a tool that is about to disappear, and
+    // drop the blocks made with the Telegram buttons too.
     let _ = isolate::remove_isolation();
+    crate::blocklist::remove_table();
 
     for path in [
         paths::UNIT_PATH.to_string(),

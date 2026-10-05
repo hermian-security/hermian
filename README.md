@@ -129,6 +129,25 @@ bot_token = "123456789:AAH..."
 chat_id = "-1001234567890"
 ```
 
+#### Response buttons (optional)
+
+Telegram alerts can carry buttons: `Block` on the brute-force digest, and
+`Ignore` / `Disconnect user` / `Disconnect and block` on suspicious SSH
+logins. They act at once, so only list people you trust:
+
+```toml
+[notifications.telegram]
+actions = true
+allowed_user_ids = [123456789]   # your Telegram user id (ask @userinfobot)
+
+[response]
+block_duration_hours = 24
+```
+
+Then run `sudo hermian enable` once to grant the firewall and kill
+capabilities. Presses from anyone else are refused and logged. List or lift
+blocks with `sudo hermian blocked` and `sudo hermian unblock <ip>`.
+
 Email (SMTP or sendmail) and webhooks (Slack, Discord, ntfy, generic JSON) are
 also supported. Their settings are in the same config file. HIGH and CRITICAL
 alerts trigger notifications by default.

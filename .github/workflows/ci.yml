@@ -108,6 +108,9 @@ jobs:
             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
           test -n "$BIN"
           sudo "$BIN" --ignored --exact isolate::tests::nft_accepts_the_ruleset
+          sudo "$BIN" --ignored --exact blocklist::tests::nft_accepts_the_block_table
+          # Really adds/lists/removes blocks, in a private network namespace.
+          sudo unshare -n "$BIN" --ignored --exact blocklist::tests::live_block_list_unblock
       - run: HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
       - name: Vendored eBPF object is current
         run: |

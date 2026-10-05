@@ -8,6 +8,22 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Added
 
+- Telegram response buttons (off by default; `notifications.telegram.actions`
+  plus `allowed_user_ids`):
+  - A brute-force digest every 2 hours, only when failed logins targeted
+    accounts that exist and can log in (or root), with `Block <ip>`,
+    `Block all` and `Ignore 2h`. It warns when root can log in with a
+    password (checked with `sshd -T`), with a `Remind me in 7 days` button.
+  - Suspicious logins (after a burst, from a new source, root from a new
+    place) get `Ignore`, `Disconnect user` and `Disconnect and block`.
+  - Buttons act immediately, work only for the listed user ids in the
+    configured chat, expire, and each works once. Presses are fetched by
+    outbound polling, so nothing listens on the host. Each one is answered
+    in the chat and recorded as a local alert.
+  - Blocks live in their own nftables table with a timeout
+    (`response.block_duration_hours`, default 24); IPv6 is blocked per /64;
+    management CIDRs and allowlisted sources are never blocked.
+    `hermian blocked` and `hermian unblock <ip>` manage them.
 - Alert retention: stored alerts and collect bundles older than
   `general.alert_retention_days` (default 90; 0 keeps them) are deleted
   hourly, and `alerts.log` rotates at 50 MB with three old copies kept.
@@ -55,6 +71,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - A known port bound again on another address (`127.0.0.1:8080` then
   `0.0.0.0:8080`) is a new listener.
 - `ExecStart = x` (spaces around `=`) is parsed.
+- Listener alerts name the owning process again: the `/proc/net/tcp`
+  parser was one field off and read the refcount as the socket inode, so
+  the owner was never found.
 - Exited ancestors of a live process are all kept in the tree, not just its
   parent, so a double-forked implant keeps the web server in its chain.
 - D1 flags escalate related connects, listeners and `/tmp` execs for ten
@@ -163,6 +182,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 - If you send email through a remote SMTP server with `smtp_security =
   "none"` and credentials, switch to `"starttls"` or `"tls"`.
+- To use the Telegram buttons, set `actions = true` and `allowed_user_ids`,
+  then run `sudo hermian enable` once (it grants the capabilities).
 - Stored alerts older than 90 days are deleted within an hour of upgrading.
   To keep them, set `general.alert_retention_days = 0` (or back up
   `/var/lib/hermian/alerts/`) first.

@@ -33,6 +33,7 @@ eBPF / inotify / auth logs / PAM / polling
 The agent targets systemd hosts on kernel 5.4+, amd64 and arm64. The core tests
 also run on Windows and macOS; the daemon doesn't. There's no network listener
 or remote event stream. Configured channels send alerts, not raw telemetry.
+Telegram button presses, when enabled, are fetched by outbound long-polling.
 
 ## Detection rules
 
@@ -43,7 +44,7 @@ are the detailed rule reference, including exemptions and severity choices.
 | Group | Looks for |
 | --- | --- |
 | [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (direct or through other programs), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
-| [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
+| [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), a [brute-force digest](hermian-core/src/detect/brute.rs) every 2 h when existing accounts were targeted (HIGH), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
 | [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron and at jobs, shell profiles, SSH keys, systemd units (admin, vendor, per-user), PAM, global environment, rc.local, udev rules, and boot-time modules |
 | [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
 | [D5: network](hermian-core/src/detect/d5.rs) | Connections linked to flagged chains, baseline novelty, and new listeners |
@@ -172,6 +173,41 @@ metadata, doesn't read passwords, and returns `PAM_IGNORE`.
 
 Monitoring logs and notifies by default; it doesn't kill or quarantine processes.
 `hermian isolate` adds nftables rules. `hermian unisolate` removes them.
+
+### Telegram buttons
+
+With `notifications.telegram.actions = true` and `allowed_user_ids` set,
+alerts that offer responses carry inline buttons:
+
+| Alert | Buttons |
+| --- | --- |
+| Brute-force digest (failed logins against accounts that exist and have a login shell, or root; sent every `ssh.brute_digest_hours` only when a source reached `ssh.brute_min_attempts`) | `Block <ip>` for the top sources, `Block all`, `Ignore 2h`, and `Remind me in 7 days` when the digest warns that root can log in with a password |
+| Login after a burst, from a new source, or root from a new place | `Ignore`, `Disconnect user`, `Disconnect and block` |
+
+Buttons act immediately; there's no confirmation step. They only work for
+the listed Telegram user ids in the configured chat, expire after
+`action_ttl_mins`, and each works once. Every press is recorded as a local
+alert and answered in the chat. Presses are fetched by outbound
+long-polling (`getUpdates`), so nothing listens on the host, and it works
+during isolation. A webhook set on the same bot stops it; `status` says so.
+
+- **Block** adds the source to an nftables set with a timeout
+  (`response.block_duration_hours`, default 24) in its own `hermian_block`
+  table, dropping its traffic both ways. IPv6 sources are blocked as their
+  /64. Management CIDRs, allowlisted SSH sources and loopback/link-local
+  addresses are always refused. `hermian blocked` lists blocks and
+  `hermian unblock <ip>` lifts one; blocks survive a daemon restart but not
+  a reboot.
+- **Disconnect** stops the sshd processes holding that connection (matched
+  by source address and port from the log line), so the user's other
+  sessions stay up. With block, the block goes in first so the session
+  can't come straight back. Programs the user started get SIGHUP; ones that
+  ignore it keep running.
+- **Ignore** on the digest stops listing those sources for one digest
+  period. Successful logins from them still alert.
+
+`hermian enable` grants `CAP_NET_ADMIN` and `CAP_KILL` only when actions are
+on; re-run it after turning them on.
 
 Isolation requires `response.management_cidrs`. Automatic isolation also needs
 `response.auto_isolate = true` and `CAP_NET_ADMIN`, which `hermian enable`

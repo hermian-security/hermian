@@ -21,7 +21,7 @@ pub mod telegram {
     const MAX_TEXT: usize = 3800;
 
     /// Bot API base. Overridable for integration tests against a mock server.
-    fn api_base() -> String {
+    pub fn api_base() -> String {
         std::env::var("HERMIAN_TELEGRAM_API")
             .unwrap_or_else(|_| "https://api.telegram.org".to_string())
     }
@@ -136,12 +136,37 @@ pub mod telegram {
         if let Some(t) = cfg.message_thread_id {
             payload["message_thread_id"] = serde_json::json!(t);
         }
+        // Response buttons, when enabled and the alert offers any.
+        let buttons = if cfg.actions_enabled() && !alert.offers.is_empty() {
+            crate::tgbot::register(
+                &alert.ref_id,
+                &alert.offers,
+                cfg.action_ttl_mins,
+                chrono::Utc::now(),
+            )
+        } else {
+            Vec::new()
+        };
+        if !buttons.is_empty() {
+            payload["reply_markup"] = crate::tgbot::keyboard(&buttons);
+        }
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(cfg.timeout_secs.clamp(3, 60)))
             .user_agent(&format!("hermian/{}", hermian_core::VERSION))
             .build();
         match agent.post(&url).send_json(payload) {
-            Ok(_) => Ok(()),
+            Ok(resp) => {
+                if !buttons.is_empty() {
+                    if let Some(mid) = resp
+                        .into_json::<serde_json::Value>()
+                        .ok()
+                        .and_then(|v| v["result"]["message_id"].as_i64())
+                    {
+                        crate::tgbot::attach_message(&buttons, mid);
+                    }
+                }
+                Ok(())
+            }
             Err(ureq::Error::Status(code, resp)) => {
                 let detail = resp
                     .into_string()

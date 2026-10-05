@@ -14,8 +14,8 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    auditnetlink, authlog, config, configdiff, ebpf, fallback, health, isolate, notify, pamsock,
-    paths, procsrc, retention, selfprotect, status, watchers,
+    auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, isolate, notify,
+    pamsock, paths, procsrc, retention, selfprotect, sessions, status, tgbot, watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -25,6 +25,9 @@ struct EngineState {
     ref_seq: u32,
     #[serde(default)]
     counters: Option<hermian_core::Counters>,
+    /// "Remind me in 7 days" on the root-password warning.
+    #[serde(default)]
+    root_warning_snoozed_until: Option<chrono::DateTime<Utc>>,
 }
 
 fn load_engine_state() -> Option<EngineState> {
@@ -38,6 +41,7 @@ fn save_engine_state(engine: &Engine) {
         ref_day: day.to_string(),
         ref_seq: seq,
         counters: Some(engine.counters.clone()),
+        root_warning_snoozed_until: engine.root_warning_snoozed_until,
     };
     if let Ok(text) = serde_json::to_string(&st) {
         let _ = config::write_secure(&paths::engine_state_file(), &text);
@@ -73,6 +77,10 @@ pub fn run() -> Result<()> {
     engine.set_local_offset(local_offset());
     if let Some(st) = load_engine_state() {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
+        engine.root_warning_snoozed_until = st.root_warning_snoozed_until;
+    }
+    if let Some(on) = sessions::root_password_login() {
+        engine.set_root_password_login(on);
     }
     engine.set_user_names(procsrc::load_user_names());
     for path in ["/etc/passwd", "/etc/group"] {
@@ -287,6 +295,15 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     fallback::spawn_listener_poller(event_tx.clone(), listener_close_tx, shutdown.clone())?;
     fallback::spawn_suid_sweeper(event_tx.clone(), shutdown.clone())?;
 
+    // --- Telegram response buttons ---------------------------------------
+    // The poller follows config reloads through this shared copy; it idles
+    // while actions are off.
+    let tg_cfg = Arc::new(std::sync::Mutex::new(
+        initial_cfg.notifications.telegram.clone(),
+    ));
+    let (action_tx, mut action_rx) = mpsc::channel::<tgbot::ActionRequest>(64);
+    tgbot::spawn_poller(tg_cfg.clone(), action_tx, shutdown.clone())?;
+
     // --- Signals ---------------------------------------------------------
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -350,6 +367,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                 if let Event::File(f) = &ev {
                     if std::path::Path::new(&f.path) == config_path {
                         reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "file change");
+                        sync_tg_cfg(&tg_cfg, &current_cfg);
                         continue;
                     }
                 }
@@ -388,6 +406,9 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             Some((proto, addr, port)) = listener_close_rx.recv() => {
                 engine.forget_listener(&proto, addr, port);
             }
+            Some(req) = action_rx.recv() => {
+                handle_action(&mut engine, &notifier, &current_cfg, req);
+            }
             _ = ticker.tick() => {
                 let now = Utc::now();
                 engine.set_local_offset(local_offset());
@@ -410,6 +431,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                     next_retention = std::time::Instant::now() + Duration::from_secs(3600);
                     let days = current_cfg.general.alert_retention_days;
                     tokio::task::spawn_blocking(move || retention::run(days));
+                    // sshd settings can change any time; recheck hourly.
+                    tokio::task::spawn_blocking(sessions::refresh_root_password_login);
+                }
+                if let Some(on) = sessions::cached_root_password_login() {
+                    engine.set_root_password_login(on);
                 }
                 let _ = config::save_baseline(&engine.baseline);
                 save_engine_state(&engine);
@@ -441,9 +467,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             }
             _ = sighup.recv() => {
                 reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "SIGHUP");
+                sync_tg_cfg(&tg_cfg, &current_cfg);
             }
             _ = sigusr2.recv() => {
                 reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "SIGUSR2");
+                sync_tg_cfg(&tg_cfg, &current_cfg);
             }
         }
     }
@@ -494,6 +522,125 @@ fn report_dropped_events(
                 &format!("selfprotect|dropped|{}", source),
             ),
         );
+    }
+}
+
+fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>, cfg: &Config) {
+    if let Ok(mut c) = shared.lock() {
+        *c = cfg.notifications.telegram.clone();
+    }
+}
+
+/// Carry out a Telegram button press that passed every check (see tgbot).
+///
+/// Quick engine-side choices (ignore, snooze) happen here; firewall and
+/// process work runs on a blocking thread, which then posts the outcome as
+/// a reply to the alert. Every press is also recorded as a local alert.
+fn handle_action(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    cfg: &Config,
+    req: tgbot::ActionRequest,
+) {
+    use hermian_core::ResponseAction as A;
+    let now = Utc::now();
+    let label = req.action.label();
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::Low,
+            &format!("Telegram response: {}", label),
+            &format!("{} chose '{}' on alert {}.", req.by, label, req.alert_ref),
+            "Recorded so every remote response has an audit trail.",
+            &["Undo a block with 'hermian unblock <ip>'; list them with 'hermian blocked'."],
+            &[("By", req.by.as_str()), ("Alert", req.alert_ref.as_str())],
+            &format!(
+                "selfprotect|tg-action|{}|{}",
+                req.alert_ref,
+                now.timestamp_nanos_opt().unwrap_or(0)
+            ),
+        ),
+    );
+    let tg = cfg.notifications.telegram.clone();
+    let settled = req.action.settles();
+    let mid = req.message_id;
+    let by = req.by.clone();
+    match req.action {
+        A::Ignore { sources, hours } => {
+            let text = if sources.is_empty() || hours == 0 {
+                format!("Ignored by {}.", by)
+            } else {
+                engine.ignore_sources(&sources, now + chrono::Duration::hours(i64::from(hours)));
+                format!(
+                    "Ignoring {} source(s) for {}h (by {}). Logins from them still alert.",
+                    sources.len(),
+                    hours,
+                    by
+                )
+            };
+            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+        }
+        A::SnoozeRootPasswordWarning { days } => {
+            engine.snooze_root_warning(now + chrono::Duration::days(i64::from(days)));
+            save_engine_state(engine);
+            let text = format!(
+                "Root password warning snoozed for {} days (by {}).",
+                days, by
+            );
+            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+        }
+        A::Block { sources } => {
+            for ip in &sources {
+                engine.brute.forget(ip);
+            }
+            let cfg = cfg.clone();
+            tokio::task::spawn_blocking(move || {
+                let hours = cfg.response.block_duration_hours;
+                let lines: Vec<String> = sources
+                    .iter()
+                    .map(|ip| match blocklist::block(*ip, hours, &cfg) {
+                        Ok(key) => format!("Blocked {} for {}h", key, hours),
+                        Err(e) => format!("{}: {:#}", ip, e),
+                    })
+                    .collect();
+                let text = format!("{} (by {})", lines.join("\n"), by);
+                log_daemon(Severity::High, &text.replace('\n', "; "));
+                tgbot::report(&tg, mid, &text, settled);
+            });
+        }
+        A::Disconnect {
+            source,
+            port,
+            user,
+            block,
+        } => {
+            let cfg = cfg.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut lines = Vec::new();
+                // Block first: otherwise the session can come right back.
+                if block {
+                    let hours = cfg.response.block_duration_hours;
+                    lines.push(match blocklist::block(source, hours, &cfg) {
+                        Ok(key) => format!("Blocked {} for {}h", key, hours),
+                        Err(e) => format!("Block failed: {:#}", e),
+                    });
+                }
+                lines.push(match sessions::disconnect(source, port) {
+                    Ok(d) => format!(
+                        "Disconnected {} from {} ({} connection(s), {} sshd process(es) stopped)",
+                        user,
+                        source,
+                        d.connections,
+                        d.processes.len()
+                    ),
+                    Err(e) => format!("Disconnect: {:#}", e),
+                });
+                let text = format!("{} (by {})", lines.join("\n"), by);
+                log_daemon(Severity::High, &text.replace('\n', "; "));
+                tgbot::report(&tg, mid, &text, settled);
+            });
+        }
     }
 }
 
@@ -1011,6 +1158,20 @@ fn write_status_snapshot(
         delivered_per_channel: ns.per_channel.clone(),
         dropped_per_channel: ns.dropped_by_channel.clone(),
         events_dropped: health::snapshot(),
+        telegram_actions: if cfg.notifications.telegram.actions_enabled() {
+            format!(
+                "on ({} user{})",
+                cfg.notifications.telegram.allowed_user_ids.len(),
+                if cfg.notifications.telegram.allowed_user_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        } else {
+            "off".to_string()
+        },
+        telegram_poll_error: tgbot::last_poll_error(),
         config_hash: integrity.config_hash.clone(),
         binary_hash: integrity.binary_hash.clone(),
         integrity_ok: integrity.binary_ok && integrity.config_ok,

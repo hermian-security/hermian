@@ -13,6 +13,7 @@ pub mod detect;
 pub mod engine;
 pub mod events;
 pub mod proctree;
+pub mod response;
 pub mod selftest;
 
 pub use alert::{
@@ -27,5 +28,6 @@ pub use events::{
     ListenerEvent, ProcInfo, PtraceEvent, Severity, WriterInfo,
 };
 pub use proctree::{role_of, ProcessTree, Role};
+pub use response::ResponseAction;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -39,6 +39,10 @@ pub enum Cmd {
     Isolate(IsolateArgs),
     /// Remove network isolation
     Unisolate,
+    /// List addresses blocked with the Telegram "Block" buttons
+    Blocked,
+    /// Lift a block before it expires
+    Unblock(UnblockArgs),
     /// Completely remove HERMIAN from this host
     Uninstall(UninstallArgs),
     /// Run the daemon (used by the systemd unit)
@@ -126,6 +130,12 @@ pub struct IsolateArgs {
     /// timer, so it works even if you can't get back in)
     #[arg(long = "for", value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(1..=10080))]
     pub for_mins: Option<u32>,
+}
+
+#[derive(clap::Args)]
+pub struct UnblockArgs {
+    /// The blocked address (for IPv6, any address in the blocked /64)
+    pub ip: String,
 }
 
 #[derive(clap::Args)]

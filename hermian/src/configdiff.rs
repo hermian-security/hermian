@@ -25,6 +25,9 @@ const DESTINATION_FIELDS: &[&str] = &[
     "notifications.telegram.bot_token",
     "notifications.telegram.chat_id",
     "notifications.telegram.message_thread_id",
+    // Who can act on alerts from Telegram is as sensitive as where they go.
+    "notifications.telegram.actions",
+    "notifications.telegram.allowed_user_ids",
     "notifications.email.transport",
     "notifications.email.to",
     "notifications.email.smtp_host",

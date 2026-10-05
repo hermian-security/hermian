@@ -235,6 +235,10 @@ pub struct AuthEvent {
     pub rhost: Option<IpAddr>,
     pub service: String,
     pub tty: String,
+    /// The client's source port, when the log line has it. Together with
+    /// `rhost` it identifies the session, so a response can disconnect that
+    /// login and not every session of the same user.
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]

@@ -44,6 +44,10 @@ pub struct StatusState {
     pub dropped_per_channel: BTreeMap<String, u64>,
     /// Telemetry lost since start, by source (eBPF ring, inotify, audit).
     pub events_dropped: BTreeMap<String, u64>,
+    /// Telegram response buttons: "off", or "on (N users)".
+    pub telegram_actions: String,
+    /// Last problem fetching button presses (empty when fine).
+    pub telegram_poll_error: String,
     pub config_hash: String,
     pub binary_hash: String,
     pub integrity_ok: bool,
@@ -82,6 +86,8 @@ impl Default for StatusState {
             delivered_per_channel: BTreeMap::new(),
             dropped_per_channel: BTreeMap::new(),
             events_dropped: BTreeMap::new(),
+            telegram_actions: String::new(),
+            telegram_poll_error: String::new(),
             config_hash: String::new(),
             binary_hash: String::new(),
             integrity_ok: true,
@@ -254,6 +260,18 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
             .map(|(k, v)| format!("{} {}", k, v))
             .collect();
         out.push_str(&st.row("Delivered", &st.dim(&parts.join(" \u{00B7} "))));
+        out.push('\n');
+    }
+    if !state.telegram_actions.is_empty() && state.telegram_actions != "off" {
+        let v = if state.telegram_poll_error.is_empty() {
+            state.telegram_actions.clone()
+        } else {
+            st.warn(&format!(
+                "{}, not receiving presses: {}",
+                state.telegram_actions, state.telegram_poll_error
+            ))
+        };
+        out.push_str(&st.row("Buttons", &v));
         out.push('\n');
     }
     if !state.dropped_per_channel.is_empty() {

@@ -261,6 +261,7 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            port: extract_port(msg),
         });
     }
     let failure = lower.starts_with("failed ")
@@ -283,6 +284,7 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            port: extract_port(msg),
         });
     }
     None
@@ -316,6 +318,20 @@ fn word_after(msg: &str, pattern: &str) -> Option<String> {
         return None;
     }
     Some(word)
+}
+
+/// The client port from "... from <ip> port <n> ...", taken after the last
+/// " from " for the same reason as [`extract_rhost`].
+fn extract_port(msg: &str) -> Option<u16> {
+    let from = msg.rfind(" from ")?;
+    let after = &msg[from + 6..];
+    let p = after.find(" port ")?;
+    after[p + 6..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 fn extract_rhost(msg: &str) -> Option<IpAddr> {
@@ -364,6 +380,7 @@ mod tests {
         assert_eq!(a.result, AuthResult::Success);
         assert_eq!(a.user, "alice");
         assert_eq!(a.rhost, Some("10.0.0.5".parse().unwrap()));
+        assert_eq!(a.port, Some(51234));
         assert_eq!(
             a.ts.format("%Y-%m-%dT%H:%M").to_string(),
             "2024-01-15T10:20"
@@ -402,6 +419,10 @@ mod tests {
                     a from 203.0.113.1 from 198.51.100.7 port 4 ssh2";
         let ev = parse_line(line).unwrap();
         assert_eq!(ev.rhost, Some("198.51.100.7".parse().unwrap()));
+        // Same for the port: a username can't put a fake one in front.
+        let line = "Jan 15 10:20:30 web sshd[1234]: Failed password for invalid user \
+                    a port 1 from 198.51.100.7 port 4242 ssh2";
+        assert_eq!(parse_line(line).unwrap().port, Some(4242));
     }
 
     #[test]

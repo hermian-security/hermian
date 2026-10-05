@@ -60,6 +60,16 @@ pub enum ConfigError {
     EmptyReason(&'static str),
     #[error("general.alert_retention_days must be at most 3650 (0 keeps alerts forever)")]
     RetentionDays,
+    #[error("ssh.brute_digest_hours must be between 1 and 24")]
+    DigestHours,
+    #[error("ssh.brute_min_attempts must be between 1 and 10000")]
+    DigestMinAttempts,
+    #[error("notifications.telegram.actions needs the telegram channel and at least one entry in allowed_user_ids")]
+    TelegramActions,
+    #[error("notifications.telegram.action_ttl_mins must be between 1 and 1440")]
+    ActionTtl,
+    #[error("response.block_duration_hours must be between 1 and 8760")]
+    BlockHours,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,9 +121,15 @@ pub struct SshCfg {
     pub permit_root: bool,
     pub failed_burst_count: u32,
     pub failed_burst_window_secs: u64,
-    /// Off-hours window in UTC. Set start == end to disable.
+    /// Off-hours window in local time. Set start == end to disable.
     pub off_hours_start: u32,
     pub off_hours_end: u32,
+    /// Failed logins against *existing* accounts are summed up in a digest
+    /// every this many hours, sent only if there were any.
+    pub brute_digest_hours: u32,
+    /// A source needs at least this many failures against existing accounts
+    /// in a digest period to be listed.
+    pub brute_min_attempts: u32,
 }
 
 impl Default for SshCfg {
@@ -124,6 +140,8 @@ impl Default for SshCfg {
             failed_burst_window_secs: 60,
             off_hours_start: 22,
             off_hours_end: 6,
+            brute_digest_hours: 2,
+            brute_min_attempts: 10,
         }
     }
 }
@@ -185,6 +203,14 @@ pub struct TelegramCfg {
     /// Send CRITICAL alerts with notification sound (others are silent).
     pub silent_below_critical: bool,
     pub timeout_secs: u64,
+    /// Show response buttons (Block IP, Disconnect...) under alerts that
+    /// offer them. Off by default: it turns the bot into a remote control.
+    pub actions: bool,
+    /// Telegram user ids allowed to press those buttons. Required when
+    /// `actions` is on; presses from anyone else are refused and logged.
+    pub allowed_user_ids: Vec<i64>,
+    /// Buttons stop working after this many minutes.
+    pub action_ttl_mins: u32,
 }
 
 impl Default for TelegramCfg {
@@ -195,7 +221,17 @@ impl Default for TelegramCfg {
             message_thread_id: None,
             silent_below_critical: true,
             timeout_secs: 10,
+            actions: false,
+            allowed_user_ids: Vec::new(),
+            action_ttl_mins: 30,
         }
+    }
+}
+
+impl TelegramCfg {
+    /// Whether response buttons are in use.
+    pub fn actions_enabled(&self) -> bool {
+        self.actions && !self.allowed_user_ids.is_empty()
     }
 }
 
@@ -274,7 +310,7 @@ impl NotificationsCfg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResponseCfg {
     pub auto_isolate: bool,
@@ -283,7 +319,23 @@ pub struct ResponseCfg {
     /// isolated until `hermian unisolate`). A dead-man switch in case the
     /// management CIDRs turn out to be wrong.
     pub auto_isolate_revert_mins: u32,
+    /// How long a "Block IP" lasts, in hours.
+    pub block_duration_hours: u32,
 }
+
+impl Default for ResponseCfg {
+    fn default() -> Self {
+        ResponseCfg {
+            auto_isolate: false,
+            management_cidrs: Vec::new(),
+            auto_isolate_revert_mins: 0,
+            block_duration_hours: 24,
+        }
+    }
+}
+
+/// Upper bound for `block_duration_hours` (one year).
+pub const MAX_BLOCK_HOURS: u32 = 24 * 365;
 
 /// Upper bound for `auto_isolate_revert_mins` (one week).
 pub const MAX_REVERT_MINS: u32 = 7 * 24 * 60;
@@ -323,6 +375,24 @@ impl Config {
         }
         if self.general.alert_retention_days > MAX_RETENTION_DAYS {
             return Err(ConfigError::RetentionDays);
+        }
+        if !(1..=24).contains(&self.ssh.brute_digest_hours) {
+            return Err(ConfigError::DigestHours);
+        }
+        if !(1..=10_000).contains(&self.ssh.brute_min_attempts) {
+            return Err(ConfigError::DigestMinAttempts);
+        }
+        let tg = &self.notifications.telegram;
+        if tg.actions
+            && (tg.allowed_user_ids.is_empty() || !self.notifications.has_channel("telegram"))
+        {
+            return Err(ConfigError::TelegramActions);
+        }
+        if !(1..=1440).contains(&tg.action_ttl_mins) {
+            return Err(ConfigError::ActionTtl);
+        }
+        if !(1..=MAX_BLOCK_HOURS).contains(&self.response.block_duration_hours) {
+            return Err(ConfigError::BlockHours);
         }
         if !(1..=10_000).contains(&self.ssh.failed_burst_count) {
             return Err(ConfigError::BurstCount);
@@ -440,6 +510,8 @@ failed_burst_count = 5          # failures in the window; INFO until a login fol
 failed_burst_window_secs = 60
 off_hours_start = 22    # host local time; set start == end to disable off-hours weighting
 off_hours_end = 6
+brute_digest_hours = 2  # failed logins against existing accounts, summed up this often
+brute_min_attempts = 10 # failures a source needs in that period to be listed
 
 [detections]
 d1_process_chains = true
@@ -464,6 +536,13 @@ bot_token = ""
 chat_id = ""
 silent_below_critical = true   # only CRITICAL makes a sound
 timeout_secs = 10
+# Response buttons (Block IP, Disconnect user...) under alerts that offer them.
+# Only the Telegram user ids listed here can press them. Your id: message
+# @userinfobot. Re-run 'hermian enable' after turning this on (it grants the
+# daemon the firewall and kill capabilities these need).
+actions = false
+allowed_user_ids = []          # e.g. [123456789]
+action_ttl_mins = 30           # buttons expire after this
 
 [notifications.email]
 transport = "smtp"             # smtp | sendmail (use the host's MTA)
@@ -488,6 +567,7 @@ timeout_secs = 10
 auto_isolate = false    # on CRITICAL, drop all traffic except management_cidrs
 management_cidrs = []   # e.g. ["203.0.113.0/24"]
 auto_isolate_revert_mins = 0  # >0 lifts an automatic isolation after this long
+block_duration_hours = 24     # how long a "Block IP" button blocks a source
 
 [allowlist]
 # [[allowlist.process_chains]]
@@ -527,6 +607,41 @@ auto_isolate_revert_mins = 0  # >0 lifts an automatic isolation after this long
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telegram_actions_need_the_channel_and_allowed_users() {
+        let base = "[notifications]\nchannels = [\"journald\", \"telegram\"]\n\
+                    [notifications.telegram]\nbot_token = \"1:x\"\nchat_id = \"-1\"\n";
+        let no_users = Config::parse(&format!("{}actions = true\n", base)).unwrap();
+        assert!(matches!(
+            no_users.validate(),
+            Err(ConfigError::TelegramActions)
+        ));
+        let ok = Config::parse(&format!(
+            "{}actions = true\nallowed_user_ids = [42]\n",
+            base
+        ))
+        .unwrap();
+        ok.validate().unwrap();
+        assert!(ok.notifications.telegram.actions_enabled());
+        let no_channel =
+            Config::parse("[notifications.telegram]\nactions = true\nallowed_user_ids = [42]\n")
+                .unwrap();
+        assert!(matches!(
+            no_channel.validate(),
+            Err(ConfigError::TelegramActions)
+        ));
+        let block = Config::parse("[response]\nblock_duration_hours = 0\n").unwrap();
+        assert!(matches!(block.validate(), Err(ConfigError::BlockHours)));
+        let digest = Config::parse("[ssh]\nbrute_digest_hours = 48\n").unwrap();
+        assert!(matches!(digest.validate(), Err(ConfigError::DigestHours)));
+        // Defaults: off, 24 h blocks, 2 h digest, 10 attempts.
+        let d = Config::default();
+        assert!(!d.notifications.telegram.actions_enabled());
+        assert_eq!(d.response.block_duration_hours, 24);
+        assert_eq!(d.ssh.brute_digest_hours, 2);
+        assert_eq!(d.ssh.brute_min_attempts, 10);
+    }
 
     #[test]
     fn default_toml_parses_and_validates() {

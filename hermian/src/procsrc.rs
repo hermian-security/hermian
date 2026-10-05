@@ -380,12 +380,15 @@ pub struct TcpEntry {
     pub proto: &'static str,
     pub local_addr: IpAddr,
     pub local_port: u16,
+    pub remote_addr: IpAddr,
+    pub remote_port: u16,
     pub state: u8,
     pub uid: u32,
     pub inode: u64,
 }
 
 pub const TCP_LISTEN: u8 = 0x0A;
+pub const TCP_ESTABLISHED: u8 = 0x01;
 
 fn parse_hex_addr(hex: &str, port_hex: &str) -> Option<(IpAddr, u16)> {
     let port = u16::from_str_radix(port_hex, 16).ok()?;
@@ -408,6 +411,10 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
     let Some(content) = read_file(path) else {
         return Vec::new();
     };
+    parse_tcp_table(&content, proto)
+}
+
+fn parse_tcp_table(content: &str, proto: &'static str) -> Vec<TcpEntry> {
     content
         .lines()
         .skip(1)
@@ -415,9 +422,12 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
             let mut it = line.split_whitespace();
             let _sl = it.next()?;
             let local = it.next()?;
-            let _remote = it.next()?;
+            let remote = it.next()?;
             let state = u8::from_str_radix(it.next()?, 16).ok()?;
-            for _ in 0..4 {
+            // tx_queue:rx_queue, tr:tm->when, retrnsmt. Skipping four here
+            // used to read the timeout as uid and the refcount as the inode,
+            // so socket owners (listener pids) were never found.
+            for _ in 0..3 {
                 it.next()?;
             }
             let uid = it.next()?.parse().unwrap_or(0);
@@ -426,10 +436,15 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
             let (local_addr, local_port) = local
                 .split_once(':')
                 .and_then(|(h, p)| parse_hex_addr(h, p))?;
+            let (remote_addr, remote_port) = remote
+                .split_once(':')
+                .and_then(|(h, p)| parse_hex_addr(h, p))?;
             Some(TcpEntry {
                 proto,
                 local_addr,
                 local_port,
+                remote_addr,
+                remote_port,
                 state,
                 uid,
                 inode,
@@ -441,6 +456,35 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
 pub fn read_tcp_tables() -> Vec<TcpEntry> {
     let mut out = parse_tcp_file("/proc/net/tcp", "tcp");
     out.extend(parse_tcp_file("/proc/net/tcp6", "tcp6"));
+    out
+}
+
+/// Every pid holding any of these socket inodes (a forked sshd and its
+/// monitor share the connection's socket), in one pass over `/proc/*/fd`.
+pub fn all_pids_for_inodes(inodes: &[u64]) -> Vec<u32> {
+    let mut out = Vec::new();
+    if inodes.is_empty() {
+        return out;
+    }
+    for pid in proc_pids() {
+        let Ok(fds) = fs::read_dir(format!("/proc/{}/fd", pid)) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            fs::read_link(fd.path())
+                .ok()
+                .and_then(|l| {
+                    l.to_string_lossy()
+                        .strip_prefix("socket:[")
+                        .and_then(|s| s.strip_suffix(']'))
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .is_some_and(|ino| inodes.contains(&ino))
+        });
+        if holds {
+            out.push(pid);
+        }
+    }
     out
 }
 
@@ -601,6 +645,22 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // temp_dir itself may be a symlink (macOS-style setups); use the real path.
         fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn tcp_table_rows_carry_both_ends() {
+        // Copied from a real /proc/net/tcp (uid 991, inode 4242).
+        let t = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:0016 0764A8C6:C350 01 00000000:00000000 00:00000000 00000000   991        0 4242 1 0000000000000000 20 4 30 10 -1\n";
+        let rows = parse_tcp_table(t, "tcp");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.local_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(r.local_port, 22);
+        assert_eq!(r.remote_addr, "198.168.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(r.remote_port, 50000);
+        assert_eq!(r.state, TCP_ESTABLISHED);
+        assert_eq!(r.uid, 991);
+        assert_eq!(r.inode, 4242);
     }
 
     #[test]

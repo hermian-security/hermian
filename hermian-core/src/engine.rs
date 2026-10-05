@@ -78,6 +78,18 @@ pub struct Engine {
     pub counters: Counters,
     /// Host's local UTC offset (set by the daemon), for off-hours rules.
     pub local_offset: FixedOffset,
+    /// Accounts with a login shell (from /etc/passwd). Brute force counts
+    /// only when it names one of these, or root.
+    pub login_users: std::collections::HashSet<String>,
+    /// Failed logins against existing accounts, for the periodic digest.
+    pub brute: detect::brute::BruteDigest,
+    /// Sources an operator chose to ignore, until when.
+    pub ignored_sources: HashMap<IpAddr, DateTime<Utc>>,
+    /// Whether sshd lets root log in with a password (set by the daemon from
+    /// `sshd -T`).
+    pub root_password_login: bool,
+    /// The root-password warning is left out of digests until then.
+    pub root_warning_snoozed_until: Option<DateTime<Utc>>,
 }
 
 fn day_key(now: DateTime<Utc>) -> String {
@@ -108,7 +120,45 @@ impl Engine {
             listeners: HashMap::new(),
             counters,
             local_offset: FixedOffset::east_opt(0).expect("zero offset is valid"),
+            login_users: std::collections::HashSet::new(),
+            brute: detect::brute::BruteDigest::default(),
+            ignored_sources: HashMap::new(),
+            root_password_login: false,
+            root_warning_snoozed_until: None,
         }
+    }
+
+    /// Stop reporting failed logins from these sources until `until`.
+    /// Successful logins from them still alert.
+    pub fn ignore_sources(&mut self, sources: &[IpAddr], until: DateTime<Utc>) {
+        for ip in sources {
+            self.ignored_sources.insert(*ip, until);
+            self.brute.forget(ip);
+        }
+    }
+
+    pub fn source_ignored(&self, ip: &IpAddr, now: DateTime<Utc>) -> bool {
+        self.ignored_sources
+            .get(ip)
+            .is_some_and(|until| now < *until)
+    }
+
+    /// From `sshd -T`: root may log in with a password.
+    pub fn set_root_password_login(&mut self, enabled: bool) {
+        self.root_password_login = enabled;
+    }
+
+    /// Leave the root-password warning out of digests until `until`.
+    pub fn snooze_root_warning(&mut self, until: DateTime<Utc>) {
+        self.root_warning_snoozed_until = Some(until);
+    }
+
+    fn root_warning_due(&self, now: DateTime<Utc>) -> bool {
+        self.root_password_login
+            && self
+                .root_warning_snoozed_until
+                .map(|until| now >= until)
+                .unwrap_or(true)
     }
 
     /// The host's local UTC offset; off-hours windows are in local time.
@@ -137,6 +187,9 @@ impl Engine {
     }
 
     pub fn seed_file_snapshot(&mut self, path: &str, content: String) {
+        if path == "/etc/passwd" {
+            self.login_users = detect::d2::login_users(&content);
+        }
         self.files.update(path, content);
     }
 
@@ -249,6 +302,7 @@ impl Engine {
                         self.files.update(&e.path, content.clone());
                         if e.path == "/etc/passwd" {
                             self.user_names = parse_user_names(content);
+                            self.login_users = detect::d2::login_users(content);
                         }
                     }
                 }
@@ -266,6 +320,7 @@ impl Engine {
                         local_offset: self.local_offset,
                     };
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
+                    self.record_brute_force(&e, now);
                 }
                 if e.result == AuthResult::Success {
                     if let Some(ip) = e.rhost {
@@ -292,6 +347,43 @@ impl Engine {
         self.raise(findings, now, wall)
     }
 
+    /// Count a failed SSH login for the digest, if it named an account that
+    /// exists and can log in (or root), from a source nobody chose to ignore.
+    fn record_brute_force(&mut self, e: &crate::events::AuthEvent, now: DateTime<Utc>) {
+        if e.result == AuthResult::Success || (e.service != "sshd" && e.service != "ssh") {
+            return;
+        }
+        let Some(ip) = e.rhost else { return };
+        if self.allowlist.source_allowed(ip) || self.source_ignored(&ip, now) {
+            return;
+        }
+        if e.user == "root" || self.login_users.contains(&e.user) {
+            self.brute.record(ip, &e.user, now);
+        }
+    }
+
+    /// The brute-force digest, when its period is over and it found something.
+    fn brute_digest(&mut self, now: DateTime<Utc>) -> Option<Finding> {
+        if !self.cfg.detections.d2_auth {
+            return None;
+        }
+        let hours = self.cfg.ssh.brute_digest_hours.clamp(1, 24);
+        let (started, sources) = self
+            .brute
+            .take_if_due(now, Duration::hours(i64::from(hours)))?;
+        let sources = sources
+            .into_iter()
+            .filter(|(ip, _)| !self.source_ignored(ip, now))
+            .collect();
+        detect::brute::digest_finding(
+            started,
+            sources,
+            self.cfg.ssh.brute_min_attempts,
+            hours,
+            self.root_warning_due(now),
+        )
+    }
+
     /// Periodic housekeeping; returns dedup summaries to deliver.
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Alert> {
         self.counters.roll_day(&day_key(now));
@@ -302,8 +394,12 @@ impl Engine {
         self.prune_flags(now);
         let listener_cutoff = now - Duration::hours(TREE_RETENTION_HOURS);
         self.listeners.retain(|_, t| *t >= listener_cutoff);
+        self.ignored_sources.retain(|_, until| now < *until);
 
         let mut alerts = Vec::new();
+        if let Some(digest) = self.brute_digest(now) {
+            alerts.extend(self.raise(vec![digest], now, now));
+        }
         for summary in self.dedup.tick(now) {
             let alert = Alert::from_finding(summary, self.refs.next(now), self.host.clone(), now);
             self.counters.record_alert(alert.severity);
@@ -731,6 +827,7 @@ mod tests {
                 rhost: Some(ip),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                port: None,
             }));
             infos += alerts
                 .iter()
@@ -760,6 +857,7 @@ mod tests {
                 rhost: Some(ip),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                port: None,
             }));
             assert!(!has(&a, DetectionId::D2, Severity::High), "{:?}", a);
         }
@@ -770,6 +868,7 @@ mod tests {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            port: None,
         }));
         assert!(
             has(&alerts, DetectionId::D2, Severity::High),
@@ -797,6 +896,7 @@ mod tests {
             rhost: Some("198.51.100.9".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            port: None,
         }));
         assert!(
             !alerts.iter().any(|a| a.title.contains("burst")),
@@ -820,6 +920,7 @@ mod tests {
                 rhost: Some("198.51.100.5".parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                port: None,
             }))
         };
         let mut eng = engine_without_baseline();
@@ -836,6 +937,7 @@ mod tests {
             rhost: Some("198.51.100.5".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            port: None,
         }));
         assert!(!has(&again, DetectionId::D2, Severity::High), "{:?}", again);
         let mut cfg = Config::default();
@@ -866,6 +968,7 @@ mod tests {
                 rhost: Some("203.0.113.9".parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                port: None,
             }),
         );
         assert!(has(&alerts, DetectionId::D2, Severity::Low), "{:?}", alerts);
@@ -1792,6 +1895,7 @@ mod tests {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            port: None,
         }));
         assert_eq!(eng.tree.len(), 1);
         assert_eq!(eng.bursts.len(), 1);

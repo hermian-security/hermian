@@ -182,6 +182,21 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
             }
         }
     }
+    // A suspicious login (after a burst, from a new source, root from a new
+    // place) gets Ignore / Disconnect / Disconnect-and-block. A routine
+    // repeat (INFO) doesn't.
+    if ev.result == AuthResult::Success {
+        findings = findings
+            .into_iter()
+            .map(|f| {
+                if f.severity >= Severity::Low {
+                    login_offers(f, ev, rhost)
+                } else {
+                    f
+                }
+            })
+            .collect();
+    }
     findings
 }
 
@@ -327,9 +342,39 @@ fn is_zero_id(s: &str) -> bool {
 }
 
 /// Shells that mean "no interactive login".
-fn is_nologin(shell: &str) -> bool {
+pub fn is_nologin(shell: &str) -> bool {
     let base = shell.rsplit('/').next().unwrap_or("");
     shell.is_empty() || matches!(base, "nologin" | "false" | "sync" | "halt" | "shutdown")
+}
+
+/// Accounts that can log in: those with a real shell in /etc/passwd.
+pub fn login_users(passwd: &str) -> std::collections::HashSet<String> {
+    parse_passwd(passwd)
+        .into_iter()
+        .filter(|(_, e)| !is_nologin(&e.shell))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// The three responses offered with a suspicious login.
+fn login_offers(f: Finding, ev: &AuthEvent, rhost: std::net::IpAddr) -> Finding {
+    use crate::response::ResponseAction;
+    f.offer(ResponseAction::Ignore {
+        sources: Vec::new(),
+        hours: 0,
+    })
+    .offer(ResponseAction::Disconnect {
+        source: rhost,
+        port: ev.port,
+        user: ev.user.clone(),
+        block: false,
+    })
+    .offer(ResponseAction::Disconnect {
+        source: rhost,
+        port: ev.port,
+        user: ev.user.clone(),
+        block: true,
+    })
 }
 
 fn parse_passwd(s: &str) -> Vec<(String, PasswdEntry)> {
