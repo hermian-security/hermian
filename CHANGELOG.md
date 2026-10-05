@@ -108,6 +108,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   refuses `0.0.0.0/0` / `::/0`. New dead-man switch: `hermian isolate --for
   <minutes>` and `response.auto_isolate_revert_mins` lift it via a systemd
   timer.
+- The PAM module has no JSON dependency and no panic paths left. It runs
+  inside sshd under `panic = "abort"`, so a panic there would kill the login.
+  Its docs show the absolute module path (a bare name never loads).
 - A corrupt BTF blob can't panic the daemon, and `dpkg-query` isn't asked
   about file names that would act as globs.
 

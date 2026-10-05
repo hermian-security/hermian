@@ -2,6 +2,7 @@
 name = "hermian-pam"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
 name = "pam_hermian"
@@ -9,4 +10,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Only to check that the hand-built payload parses; the module itself has no
+# JSON dependency (see lib.rs).
 serde_json = "1"

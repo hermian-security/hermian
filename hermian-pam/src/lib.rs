@@ -5,10 +5,18 @@
 //! `PAM_IGNORE`), never reads credentials, and fails silently when the daemon
 //! is not running so it can never lock anyone out.
 //!
-//! Recommended `/etc/pam.d/sshd` lines (installed by `hermian enable --with-pam`):
+//! It runs inside sshd and login, and the workspace builds with
+//! `panic = "abort"` (a profile setting that can't differ per crate), so a
+//! panic here would kill the login process. The code is kept free of panic
+//! paths: no indexing, no unwrap, no JSON library, just bounded string
+//! building and three syscalls.
+//!
+//! `/etc/pam.d/sshd` lines (installed by `hermian enable --with-pam`). Use the
+//! absolute path: a bare `pam_hermian.so` is looked up in libpam's own
+//! directory, not `/usr/lib/security`, and silently never loads.
 //! ```text
-//! auth    optional pam_hermian.so
-//! session optional pam_hermian.so
+//! auth    optional    /usr/lib/security/pam_hermian.so
+//! session optional    /usr/lib/security/pam_hermian.so
 //! ```
 
 use std::ffi::{c_char, c_int, c_void, CStr};
@@ -47,7 +55,7 @@ fn clip(s: &str) -> String {
     if s.chars().count() <= MAX_FIELD_CHARS {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(MAX_FIELD_CHARS - 1).collect();
+    let mut out: String = s.chars().take(MAX_FIELD_CHARS.saturating_sub(1)).collect();
     out.push('\u{2026}');
     out
 }
@@ -66,15 +74,56 @@ fn report(pamh: *const c_void, result: &str) {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let payload = serde_json::json!({
-        "ts": ts,
-        "result": result,
-        "user": user,
-        "rhost": rhost,
-        "service": service,
-        "tty": tty,
-    });
-    send_datagram(&payload.to_string());
+    send_datagram(&payload(ts, result, &user, &rhost, &service, &tty));
+}
+
+/// The datagram: one flat JSON object the daemon's parser expects.
+fn payload(ts: u64, result: &str, user: &str, rhost: &str, service: &str, tty: &str) -> String {
+    let mut out =
+        String::with_capacity(64 + 6 * (user.len() + rhost.len() + service.len() + tty.len()));
+    out.push_str("{\"ts\":");
+    out.push_str(&ts.to_string());
+    for (k, v) in [
+        ("result", result),
+        ("user", user),
+        ("rhost", rhost),
+        ("service", service),
+        ("tty", tty),
+    ] {
+        out.push_str(",\"");
+        out.push_str(k);
+        out.push_str("\":\"");
+        json_escape_into(&mut out, v);
+        out.push('"');
+    }
+    out.push('}');
+    out
+}
+
+/// JSON string escaping (RFC 8259): quotes, backslashes and control
+/// characters. Everything else is valid UTF-8 already.
+fn json_escape_into(out: &mut String, s: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let b = c as u32;
+                out.push_str("\\u00");
+                // b < 0x20, so both nibbles index within HEX.
+                for nib in [(b >> 4) & 0xf, b & 0xf] {
+                    if let Some(h) = HEX.get(nib as usize) {
+                        out.push(char::from(*h));
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
 }
 
 fn send_datagram(payload: &str) {
@@ -162,6 +211,19 @@ pub extern "C" fn pam_sm_acct_mgmt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_is_valid_json_with_hostile_fields() {
+        let user = "eve\"},\"result\":\"success\\\n\u{1}x";
+        let p = payload(1700000000, "attempt", user, "198.51.100.7", "sshd", "ssh");
+        // The parser the daemon uses must read back exactly what was sent.
+        let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["ts"], 1700000000);
+        assert_eq!(v["result"], "attempt");
+        assert_eq!(v["user"], user);
+        assert_eq!(v["rhost"], "198.51.100.7");
+        assert!(!p.contains('\n'));
+    }
 
     #[test]
     fn fields_are_clipped_on_a_char_boundary() {
