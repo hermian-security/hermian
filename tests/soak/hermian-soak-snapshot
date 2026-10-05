@@ -7,7 +7,8 @@ START_FILE=/var/lib/hermian/soak-start
 [ -f "$START_FILE" ] || date -u +%Y-%m-%dT%H:%M:%SZ > "$START_FILE"
 START=$(cat "$START_FILE")
 mkdir -p /var/log/hermian
-hermian alerts -n 5000 --json 2>/dev/null | python3 -c '
+# -n caps the newest N; a long soak can pass 5000, so ask for all of them.
+hermian alerts -n 4000000000 --json 2>/dev/null | python3 -c '
 import sys, json, collections, datetime
 start = sys.argv[1]
 c = collections.Counter(); titles = collections.Counter()

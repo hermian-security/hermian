@@ -34,7 +34,8 @@ jobs:
       - run: sh -n tests/run_suite.sh
       - run: sh -n tests/false_positives/run_false_positive.sh
       - run: sh -n tests/helpers/disposable_host.sh
-      - run: sh -n tests/soak/start.sh
+      - name: sh -n on soak scripts
+        run: for f in tests/soak/start.sh tests/soak/report.sh tests/soak/metrics.sh tests/soak/hermian-soak-snapshot; do sh -n "$f"; done
       - name: sh -n on packaging scripts
         run: for f in packaging/install.sh packaging/debian/postinst packaging/debian/prerm packaging/debian/postrm; do sh -n "$f"; done
 
