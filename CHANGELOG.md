@@ -24,6 +24,15 @@ Earlier release information remains in the repository's GitHub Releases and Git 
     (`response.block_duration_hours`, default 24); IPv6 is blocked per /64;
     management CIDRs and allowlisted sources are never blocked.
     `hermian blocked` and `hermian unblock <ip>` manage them.
+- `hermian enable` (which upgrades run) adds settings and sections new in
+  this version to an existing `config.toml`, commented out next to where
+  they belong, with their explanations. Values are never changed: the file
+  must read back as exactly the same settings or it's left alone. A backup
+  is kept as `config.toml.bak`. Configs from early betas, which had no
+  Telegram or email section, now show them.
+- The default config documents every option: what each detection group
+  covers, `message_thread_id`, what `management_cidrs` is for, and an
+  allowlist example for your own SSH sources.
 - Alert retention: stored alerts and collect bundles older than
   `general.alert_retention_days` (default 90; 0 keeps them) are deleted
   hourly, and `alerts.log` rotates at 50 MB with three old copies kept.

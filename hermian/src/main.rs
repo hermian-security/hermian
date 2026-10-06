@@ -8,6 +8,7 @@ mod cli;
 mod collect;
 mod config;
 mod configdiff;
+mod confmerge;
 mod daemon;
 mod ebpf;
 mod enable;

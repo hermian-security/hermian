@@ -39,6 +39,9 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         paths::UNIT_PATH.to_string(),
         "/etc/sysctl.d/60-hermian.conf".to_string(),
         paths::config_path().to_string_lossy().into_owned(),
+        crate::enable::backup_path(&paths::config_path())
+            .to_string_lossy()
+            .into_owned(),
         paths::state_dir().to_string_lossy().into_owned(),
         paths::log_dir().to_string_lossy().into_owned(),
         paths::run_dir().to_string_lossy().into_owned(),

@@ -27,12 +27,19 @@ pub fn session_inodes(rows: &[procsrc::TcpEntry], source: IpAddr, port: Option<u
         }
         _ => a == b,
     };
-    rows.iter()
+    let mut out: Vec<u64> = Vec::new();
+    for r in rows
+        .iter()
         .filter(|r| r.state == procsrc::TCP_ESTABLISHED && r.inode != 0)
         .filter(|r| same(r.remote_addr, source))
         .filter(|r| port.is_none_or(|p| r.remote_port == p))
-        .map(|r| r.inode)
-        .collect()
+    {
+        // /proc/net/tcp can list a socket twice if read while it changes.
+        if !out.contains(&r.inode) {
+            out.push(r.inode);
+        }
+    }
+    out
 }
 
 /// End the SSH session(s) from `source` (`port` narrows it to one login).

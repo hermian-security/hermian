@@ -80,6 +80,20 @@ pub fn run(args: &EnableArgs) -> Result<()> {
     }
     let _ = fs::set_permissions(paths::config_path(), fs::Permissions::from_mode(0o600));
 
+    // Show settings new in this version in the existing file, commented
+    // out. Before the hashes are recorded, so the integrity check matches.
+    match document_new_settings() {
+        Ok(Some(n)) if !args.quiet => println!(
+            "{}",
+            st.dim(&format!(
+                "Added {} new setting line(s) to {}, commented out (backup: config.toml.bak).",
+                n,
+                paths::config_path().display()
+            ))
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("hermian: left the config as it was: {:#}", e),
+    }
     selfprotect::init_hashes().context("failed to initialise integrity hashes")?;
     init_baseline(&cfg, args.no_baseline)?;
     if let Err(e) = ensure_inotify_limits() {
@@ -132,6 +146,33 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         status::cmd_status(false)?;
     }
     Ok(())
+}
+
+/// Add template settings the config lacks, commented out (see confmerge).
+/// Returns how many lines were added, if any.
+fn document_new_settings() -> Result<Option<usize>> {
+    let path = paths::config_path();
+    let current = fs::read_to_string(&path)?;
+    let Some(merged) = crate::confmerge::merge(
+        &current,
+        hermian_core::DEFAULT_CONFIG_TOML,
+        hermian_core::VERSION,
+    ) else {
+        return Ok(None);
+    };
+    let added = merged
+        .lines()
+        .count()
+        .saturating_sub(current.lines().count());
+    config::write_secure(&backup_path(&path), &current)?;
+    config::replace_file_keep_mode(&path, &merged)?;
+    Ok(Some(added))
+}
+
+pub fn backup_path(config: &std::path::Path) -> std::path::PathBuf {
+    let mut s = config.as_os_str().to_owned();
+    s.push(".bak");
+    std::path::PathBuf::from(s)
 }
 
 fn init_baseline(cfg: &hermian_core::Config, no_baseline: bool) -> Result<()> {

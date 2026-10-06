@@ -495,6 +495,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# HERMIAN configuration
 # This file is monitored while the daemon runs. A real change that validates
 # reloads and pages CRITICAL. Invalid TOML stays on the last good config and
 # is logged, not paged. Every allowlist entry requires a 'reason'.
+#
+# Lines starting with '#' are inactive: remove the '#' to use a setting.
+# 'hermian enable' (run on every upgrade) adds settings new in that version
+# to this file, commented out, without changing anything you've set.
 
 [general]
 hostname = ""           # empty = use the system hostname
@@ -514,11 +518,11 @@ brute_digest_hours = 2  # failed logins against existing accounts, summed up thi
 brute_min_attempts = 10 # failures a source needs in that period to be listed
 
 [detections]
-d1_process_chains = true
-d2_auth = true
-d3_persistence = true
-d4_priv_esc = true
-d5_network = true
+d1_process_chains = true   # web/db shells, download-and-run, /tmp and fileless execution
+d2_auth = true             # SSH brute force, suspicious logins, account changes
+d3_persistence = true      # cron, systemd, SSH keys, shell profiles, PAM, loader config
+d4_priv_esc = true         # setuid files, sudoers/shadow edits, ptrace, LD_PRELOAD
+d5_network = true          # connections from flagged chains, new destinations, listeners
 
 [notifications]
 # journald and file receive every alert. The other channels receive alerts at
@@ -532,16 +536,19 @@ min_severity = "HIGH"
 # 1. Message @BotFather, /newbot, copy the token.
 # 2. Send any message to your new bot (or add it to a group).
 # 3. curl https://api.telegram.org/bot<TOKEN>/getUpdates  -> "chat":{"id":...}
-bot_token = ""
-chat_id = ""
+#    A private chat's id is your own user id; a group's is negative.
+# 4. Add "telegram" to channels above, then: sudo hermian notify-test
+bot_token = ""                 # e.g. "123456789:AAH..."
+chat_id = ""                   # in quotes, e.g. "123456789" or "-1001234567890"
 silent_below_critical = true   # only CRITICAL makes a sound
 timeout_secs = 10
+# message_thread_id = 12345    # topic id, for forum-style supergroups
 # Response buttons (Block IP, Disconnect user...) under alerts that offer them.
 # Only the Telegram user ids listed here can press them. Your id: message
 # @userinfobot. Re-run 'hermian enable' after turning this on (it grants the
 # daemon the firewall and kill capabilities these need).
 actions = false
-allowed_user_ids = []          # e.g. [123456789]
+allowed_user_ids = []          # numbers, no quotes, e.g. [123456789]
 action_ttl_mins = 30           # buttons expire after this
 
 [notifications.email]
@@ -564,12 +571,24 @@ token = ""
 timeout_secs = 10
 
 [response]
+# management_cidrs: the addresses YOU manage this host from (home, office,
+# VPN, bastion). They're never blocked by a button and stay reachable during
+# isolation. Set them before turning on auto_isolate or Telegram actions.
 auto_isolate = false    # on CRITICAL, drop all traffic except management_cidrs
-management_cidrs = []   # e.g. ["203.0.113.0/24"]
+management_cidrs = []   # e.g. ["203.0.113.0/24", "198.51.100.7/32"]
 auto_isolate_revert_mins = 0  # >0 lifts an automatic isolation after this long
 block_duration_hours = 24     # how long a "Block IP" button blocks a source
 
 [allowlist]
+# Exceptions. Each needs a reason. Prefer fixing a noisy rule over a broad
+# exception. Uncomment a block (all its lines) and edit it; repeat a block
+# to add more entries.
+#
+# Your own SSH sources, so your logins don't alert:
+# [[allowlist.ssh_sources]]
+# source = "198.51.100.7/32"
+# reason = "My home connection"
+#
 # [[allowlist.process_chains]]
 # parent = "deploy-agent"
 # child  = "bash"
