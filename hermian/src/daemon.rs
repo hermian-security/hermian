@@ -73,6 +73,8 @@ pub fn run() -> Result<()> {
     // when it had to restart the previous one.
     let unclean_prev = heartbeat::start(&paths::run_marker_file());
     let watchdog_note = heartbeat::take_restart_note(&paths::watchdog_note_file());
+    let panic_note = heartbeat::take_restart_note(&paths::panic_note_file());
+    heartbeat::install_panic_note(paths::panic_note_file());
 
     let mut engine = Engine::new(cfg.clone(), allowlist, baseline, host);
     if let Some(st) = load_engine_state() {
@@ -99,7 +101,13 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    let result = rt.block_on(async_main(cfg, engine, unclean_prev, watchdog_note));
+    let cause = unclean_prev.map(|prev| {
+        (
+            prev,
+            unclean_cause(panic_note.as_deref(), watchdog_note.as_deref()),
+        )
+    });
+    let result = rt.block_on(async_main(cfg, engine, cause));
     // Don't hang on a blocking-pool thread (the eBPF converter, a delivery in
     // flight) once main is done.
     rt.shutdown_timeout(Duration::from_secs(2));
@@ -114,11 +122,29 @@ struct Sources {
     watch_health: Option<watchers::SharedWatchHealth>,
 }
 
+/// Why the previous run stopped uncleanly, as `(sentence, fact label)`. A
+/// panic note is the most specific; the watchdog's note comes next.
+fn unclean_cause(panic: Option<&str>, watchdog: Option<&str>) -> (String, &'static str) {
+    match (panic, watchdog) {
+        (Some(p), _) => (format!("It crashed ({})", p), "Crash"),
+        (None, Some(note)) => (
+            format!(
+                "The watchdog restarted it after it stopped responding ({})",
+                note
+            ),
+            "Watchdog restart",
+        ),
+        (None, None) => (
+            "The process died without cleanup (SIGKILL, OOM kill, or power loss).".to_string(),
+            "Unexpected stop",
+        ),
+    }
+}
+
 async fn async_main(
     initial_cfg: Config,
     mut engine: Engine,
-    unclean_prev: Option<String>,
-    watchdog_note: Option<String>,
+    unclean: Option<(String, (String, &'static str))>,
 ) -> Result<()> {
     let initial_notify = status::read_state()
         .map(|s| notify::NotifyState {
@@ -206,20 +232,7 @@ async fn async_main(
     }
 
     // --- Unclean restart ------------------------------------------------
-    if let Some(prev) = unclean_prev {
-        let (cause, cause_label) = match &watchdog_note {
-            Some(note) => (
-                format!(
-                    "The watchdog restarted it after it stopped responding ({})",
-                    note
-                ),
-                "Watchdog restart",
-            ),
-            None => (
-                "The process died without cleanup (crash, SIGKILL, or power loss).".to_string(),
-                "Unexpected stop",
-            ),
-        };
+    if let Some((prev, (cause, cause_label))) = unclean {
         emit_self(
             &notifier,
             self_alert(
@@ -1290,6 +1303,15 @@ mod tests {
             &reload_signature(functional, hash),
         );
         eng.alert_from(f, Utc::now())
+    }
+
+    #[test]
+    fn unclean_cause_prefers_the_panic_note() {
+        let (text, label) = unclean_cause(Some("panic in thread 'x': boom"), Some("stale"));
+        assert_eq!(label, "Crash");
+        assert!(text.contains("boom"), "{}", text);
+        assert_eq!(unclean_cause(None, Some("stale")).1, "Watchdog restart");
+        assert_eq!(unclean_cause(None, None).1, "Unexpected stop");
     }
 
     #[test]

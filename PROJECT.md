@@ -58,8 +58,10 @@ A web server spawning a shell is HIGH. A normal shell under an SSH session
 isn't. File rules also distinguish operator edits from unattended writes.
 
 Roles that exempt a process (package and config managers, user tools,
-debuggers, session daemons) need its executable in a root-owned system
-directory; a binary merely named `dpkg` doesn't count. Script tools such as
+debuggers, session daemons) need its executable in a system directory that
+root really owns (the file and every directory above it, none writable by
+anyone else); a binary merely named `dpkg`, or one in a deploy user's
+`/opt/app`, doesn't count. Script tools such as
 dnf or Debian's adduser run under an interpreter, so the script's own path
 (from the command line) has to be in such a directory. Build tools that
 excuse LD_PRELOAD (make, cargo, fakeroot...) follow the same rule. A TTY or
@@ -81,8 +83,9 @@ operator is typing.
 The default baseline learns SSH sources, destination IPs, and connector identities
 for 24 hours, then starts judging novelty. Learning itself doesn't stop when the
 window closes: a source, destination, or program counts as new the first time it
-is ever seen, not every time it appears afterwards. Destination IPs are host-wide,
-not per-application. Disabling the baseline also disables novelty judgments.
+is ever seen, not every time it appears afterwards. Destinations are host-wide,
+not per-application, and judged by network: an address in a /24 (IPv6: /64)
+already seen isn't new, so an API or CDN rotating addresses doesn't page. Disabling the baseline also disables novelty judgments.
 Root-login source history is tracked separately.
 
 Allowlist entries need a `reason`. Prefer fixing a noisy rule over adding a broad
@@ -225,11 +228,15 @@ doesn't isolate, so a local user can't trigger it by naming a program
 `nginx`. Genuine means the binary in a root-owned location is named like the
 service, or a trusted interpreter (gunicorn, puma, tomcat) runs it under a
 system account (uid < 1000).
-The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
-neighbour discovery, DNS to the resolvers in resolv.conf, cloud instance
-metadata (169.254.169.254, which some providers need for SSH logins), and TCP
-to the notification endpoints resolved at isolation time. Routed traffic
-(containers, VMs) is dropped too. It isn't a complete network cutoff.
+The rules keep loopback, management CIDRs, DHCP, IPv6 neighbour discovery,
+DNS to the resolvers in resolv.conf, cloud instance metadata
+(169.254.169.254, which some providers need for SSH logins), and TCP to the
+notification endpoints resolved at isolation time. Connections already open
+to anywhere else are cut, so a reverse shell started before the alert
+doesn't survive it; an SSH session from outside the management CIDRs drops
+too. Routed traffic (containers, VMs) is dropped as well. It isn't a
+complete network cutoff: Telegram, webhook and SMTP endpoints stay reachable
+so alerts still go out, and code on the host could use them too.
 Catch-all CIDRs (`0.0.0.0/0`, `::/0`) are rejected since they'd make
 isolation a no-op.
 

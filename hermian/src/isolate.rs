@@ -1,8 +1,9 @@
 //! Network isolation via an nftables table owned by HERMIAN.
 //!
 //! Isolation is never automatic unless `response.auto_isolate = true` *and*
-//! `response.management_cidrs` is non-empty; those CIDRs (plus loopback and
-//! established flows) remain reachable so the operator can still get in.
+//! `response.management_cidrs` is non-empty; those CIDRs (and loopback) stay
+//! reachable so the operator can still get in. Connections already open to
+//! anywhere else are cut, not grandfathered in.
 //! DHCP, IPv6 neighbour discovery, the configured DNS resolvers and the
 //! notification endpoints stay open too, so the link survives and alerts
 //! still go out.
@@ -81,7 +82,12 @@ fn normalize_cidr(cidr: &str) -> Option<String> {
 /// Cloud instance metadata. GCE OS Login and similar agents need it for SSH
 /// itself, so cutting it can lock the operator out. It's link-local to the
 /// hypervisor, not a route to the internet.
-const METADATA: &[&str] = &["ip daddr 169.254.169.254", "ip6 daddr fd00:ec2::254"];
+const METADATA: &[(&str, &str)] = &[("ip", "169.254.169.254"), ("ip6", "fd00:ec2::254")];
+
+/// ICMP errors tied to a tracked flow (path MTU, unreachable). They carry no
+/// payload, and without them a management SSH session can stall on large
+/// packets.
+const RELATED_ICMP: &str = "    ct state related meta l4proto { icmp, ipv6-icmp } accept\n";
 
 /// Build the complete ruleset as one `nft -f -` script. It creates, deletes
 /// and recreates the table in a single transaction, so there's no window
@@ -105,7 +111,7 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
     // input/output hooks, so without this chain it wasn't isolated at all.
     s.push_str("  chain forward {\n");
     s.push_str("    type filter hook forward priority -10; policy drop;\n");
-    s.push_str("    ct state established,related accept\n");
+    s.push_str(RELATED_ICMP);
     for (cidr, fam) in &cidrs {
         s.push_str(&format!("    {} saddr {} accept\n", fam, cidr));
         s.push_str(&format!("    {} daddr {} accept\n", fam, cidr));
@@ -121,13 +127,39 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
             hook
         ));
         s.push_str(&format!("    {} lo accept\n", iface));
-        s.push_str("    ct state established,related accept\n");
+        // No blanket `ct state established accept`: it kept every connection
+        // open at isolation time alive, a reverse shell included. Management
+        // CIDRs are accepted both ways below, so their sessions survive;
+        // the other exceptions only get their replies back.
+        s.push_str(RELATED_ICMP);
         for (cidr, fam) in &cidrs {
             s.push_str(&format!("    {} {} {} accept\n", fam, dir, cidr));
         }
         if chain == "output" {
-            for m in METADATA {
-                s.push_str(&format!("    {} tcp dport 80 accept\n", m));
+            for (f, ip) in METADATA {
+                s.push_str(&format!("    {} daddr {} tcp dport 80 accept\n", f, ip));
+            }
+        } else {
+            for (f, ip) in METADATA {
+                s.push_str(&format!(
+                    "    {} saddr {} tcp sport 80 ct state established accept\n",
+                    f, ip
+                ));
+            }
+            for r in &egress.resolvers {
+                s.push_str(&format!(
+                    "    {} saddr {} meta l4proto {{ udp, tcp }} th sport 53 ct state established accept\n",
+                    fam(r),
+                    r
+                ));
+            }
+            for (ip, port) in &egress.notify {
+                s.push_str(&format!(
+                    "    {} saddr {} tcp sport {} ct state established accept\n",
+                    fam(ip),
+                    ip,
+                    port
+                ));
             }
         }
         // Keep the link itself alive: IPv6 neighbour/router discovery and
@@ -375,7 +407,7 @@ pub fn cmd_isolate(args: &crate::cli::IsolateArgs) -> Result<()> {
     };
     println!("{}", st.warn("Host isolated."));
     println!(
-        "  Reachable: loopback, established flows, {}",
+        "  Reachable: loopback, {} (other open connections are cut)",
         cfg.response.management_cidrs.join(", ")
     );
     println!(
@@ -511,6 +543,25 @@ mod tests {
     fn catch_all_cidrs_are_refused() {
         let e = apply_isolation(&["0.0.0.0/0".into()], &egress()).unwrap_err();
         assert!(e.to_string().contains("matches everything"), "{}", e);
+    }
+
+    /// A blanket established-accept kept a reverse shell opened before the
+    /// alert working through isolation.
+    #[test]
+    fn open_connections_outside_the_exceptions_are_cut() {
+        let s = ruleset(&["203.0.113.0/24".into()], &egress());
+        assert!(!s.contains("ct state established,related accept"), "{}", s);
+        for line in s.lines().filter(|l| l.contains("ct state established")) {
+            assert!(line.contains("saddr"), "unscoped: {}", line);
+        }
+        let input = &s[s.find("chain input").unwrap()..s.find("chain output").unwrap()];
+        assert!(input.contains(
+            "ip saddr 192.0.2.53 meta l4proto { udp, tcp } th sport 53 ct state established accept"
+        ));
+        assert!(
+            input.contains("ip saddr 149.154.167.220 tcp sport 443 ct state established accept")
+        );
+        assert!(s.contains("ct state related meta l4proto { icmp, ipv6-icmp } accept"));
     }
 
     #[test]

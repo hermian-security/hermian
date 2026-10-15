@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# Every unit `hermian enable` writes (hermian uninstall removes the same set).
+remove_units() {
+    rm -f /etc/systemd/system/hermian.service \
+        /etc/systemd/system/hermian-watchdog.service \
+        /etc/systemd/system/hermian-watchdog.timer
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 # The module is gone after remove, so its PAM lines must go too; the
 # comment line and the backup go with them. Same filter as hermian uninstall.
 remove_pam_hook() {
@@ -11,16 +19,15 @@ remove_pam_hook() {
 
 case "$1" in
     remove)
-        rm -f /etc/systemd/system/hermian.service
         remove_pam_hook
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        remove_units
     ;;
     purge)
-        rm -f /etc/systemd/system/hermian.service
-        rm -rf /etc/hermian /var/lib/hermian /var/log/hermian /run/hermian
         remove_pam_hook
         rm -f /etc/pam.d/sshd.hermian-bak
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        rm -rf /etc/hermian /var/lib/hermian /var/log/hermian /run/hermian
+        rm -f /etc/sysctl.d/60-hermian.conf
+        remove_units
     ;;
 esac
 

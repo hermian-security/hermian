@@ -98,6 +98,7 @@ impl Engine {
     pub fn new(cfg: Config, allowlist: Allowlist, mut baseline: Baseline, host: String) -> Self {
         let now = Utc::now();
         baseline.migrate_connectors(now);
+        baseline.index_dests();
         let dedup_window = cfg.notifications.dedup_window_secs;
         let counters = Counters {
             day: day_key(now),

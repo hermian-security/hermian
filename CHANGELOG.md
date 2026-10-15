@@ -115,6 +115,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   minutes (was two, beaten by a `sleep 130`).
 - A setuid file under `/opt` (vendor helpers like chrome-sandbox) is HIGH,
   not CRITICAL. The default config shows how to allowlist PHP `mail()`.
+- Isolation cuts connections that were already open. A blanket
+  `ct state established` rule kept every flow from before the alert alive,
+  a reverse shell included. Now only management CIDRs keep their sessions,
+  and DNS, metadata and notification endpoints get their replies.
+- Trusted install paths are checked for ownership, not just their prefix.
+  A tool under `/opt/<app>` owned by a deploy user (or any file or parent
+  directory someone other than root can rewrite) no longer earns a package
+  manager's or admin tool's exemption.
 
 ### Fixed
 
@@ -200,9 +208,25 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   both the root-policy finding and the new-source finding, which meant two
   Telegram messages for one event. The sharper finding is kept; ties keep
   the root-policy alert.
+- `apt remove` stops and deletes the watchdog timer too. It used to keep
+  firing every minute against the removed binary. Remove and purge now
+  match `hermian uninstall`, including the Telegram block table and, on
+  purge, the inotify sysctl file.
+- `install.sh` piped into `sh` always downloads and verifies. A file named
+  `hermian` in the current directory used to switch it to local mode and
+  get installed as root unchecked. Local mode now means the script sits in
+  an extracted tarball, and `--version` there is an error.
+- After a crash, the "unclean shutdown" alert quotes the panic (thread and
+  message) instead of guessing between a crash, a kill and power loss.
+- Two Telegram `Block` presses at the same moment can't create the block
+  table twice.
 
 ### Changed
 
+- Destination novelty is judged by network, /24 for IPv4 and /64 for
+  IPv6. An app server calling an API or CDN that rotates addresses inside
+  a block paged HIGH "Web server connected to a new external destination"
+  for each new address. `baseline.json` is unchanged.
 - Login alerts name the SSH auth method when the log has it: `(key)` or
   `(password)` after "authenticated" (keyboard-interactive counts as
   password). Nothing is claimed when the method is unknown.
@@ -244,6 +268,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - Stored alerts older than 90 days are deleted within an hour of upgrading.
   To keep them, set `general.alert_retention_days = 0` (or back up
   `/var/lib/hermian/alerts/`) first.
+- Isolation now drops SSH sessions that don't come from
+  `response.management_cidrs`. If you rely on auto-isolation, make sure the
+  address you manage the host from is in that list.
 
 ## 0.1.0-beta.5 - 2026-09-23
 

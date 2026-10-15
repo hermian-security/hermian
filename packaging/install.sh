@@ -9,7 +9,7 @@
 #   - `hermian enable`: config, state, logs, systemd unit, inotify limits
 # It never edits sshd_config, pam.d or nftables; isolation is opt-in.
 #
-# Remote (no ./hermian next to the call site): downloads the pinned release,
+# Remote (piped, or no hermian binary next to this script): downloads the pinned release,
 # verifies it (cosign, else gh, else checksum-only with a warning), picks the
 # .deb on Debian/Ubuntu or the tarball elsewhere.
 # Local (run from an extracted tarball): installs the files next to the script.
@@ -75,10 +75,21 @@ install_tree() { # extracted tarball dir
     run /usr/local/bin/hermian enable
 }
 
-install_local() {
+install_local() { # dir holding this script and the binary
+    cd "$1" || die "cannot enter $1"
     say "installing the tarball at $(pwd)"
     install_tree .
     say "done - check with: hermian status"
+}
+
+# Where this script lives, when it runs from a file. Piped into `sh`, $0 is
+# the shell, so there's no file and the remote path is taken. The current
+# directory never decides it: a stray ./hermian there used to be installed
+# as root, unverified.
+script_dir() {
+    case "$0" in
+        install.sh|*/install.sh) [ -f "$0" ] && dirname "$0" ;;
+    esac
 }
 
 install_remote() {
@@ -138,11 +149,12 @@ install_remote() {
 
 main() {
     version=$DEFAULT_VERSION
+    version_set=0
     dry_run=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --version) [ $# -ge 2 ] || die "--version needs a value"; version=$2; shift 2 ;;
-            --version=*) version=${1#--version=}; shift ;;
+            --version) [ $# -ge 2 ] || die "--version needs a value"; version=$2; version_set=1; shift 2 ;;
+            --version=*) version=${1#--version=}; version_set=1; shift ;;
             --dry-run) dry_run=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument: $1 (try --help)" ;;
@@ -155,8 +167,11 @@ main() {
         command -v systemctl >/dev/null 2>&1 || die "systemd is required"
     fi
 
-    if [ -f ./hermian ]; then
-        install_local
+    here=$(script_dir || true)
+    if [ -n "$here" ] && [ -f "$here/hermian" ]; then
+        [ "$version_set" -eq 0 ] ||
+            die "--version picks a download; this script is inside an extracted tarball ($here)"
+        install_local "$here"
     else
         install_remote "$version"
     fi
