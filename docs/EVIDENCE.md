@@ -50,6 +50,12 @@ Ubuntu 22.04.5, kernel 5.15.0-170, 2 vCPU. Sources: deployment notes and
   digests).
 - No attack or false-positive workloads were run here; it's a production
   host, not a disposable one.
+- Dead-man switch exercised on 2026-10-15 (deployed build, sha `180f15d6…`):
+  SIGKILLing the daemon paged HIGH on the next start (unclean shutdown,
+  HER-2026-1015-188); freezing it with SIGSTOP paged HIGH after 3m42s of
+  stale heartbeat and the watchdog restarted it (HER-WD-20261015-170218),
+  heartbeat back to 0s. The durable alert queue is covered by tests but
+  hasn't faced a real channel outage yet.
 
 ## Numbers that looked inconsistent
 
@@ -69,8 +75,8 @@ Older drafts disagree; this is the current reading:
 - Automatic isolation under a real incident (unit tests only). Telegram
   buttons have been pressed live on the production VPS, but not during an
   actual attack.
-- The dead-man switch and durable alert queues are new (2026-10-15) and
-  haven't been exercised against a live failure yet.
+- Durable alert queues under a real channel outage (unit tests only so far;
+  the watchdog and unclean-shutdown paths have run live on the VPS).
 - A heartbeat or independent tamper monitor beyond the local watchdog.
 - Release verification reproduced on a clean machine: `sha256sum -c`,
   `gh attestation verify`, `cosign verify-blob`.
