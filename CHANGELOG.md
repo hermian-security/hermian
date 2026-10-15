@@ -6,6 +6,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.6 - 2026-10-15
+
+The first release with the one-command installer: a dead-man switch, durable
+alert queues, Telegram response buttons, a brute-force digest, and hardening
+across the engine, collectors, isolation and packaging.
+
 ### Added
 
 - Telegram response buttons (off by default; `notifications.telegram.actions`
@@ -65,6 +71,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Security
 
+- rustls is updated to 0.23.46 for RUSTSEC-2026-0346, -0347, -0348 and
+  -0349. It reaches the binary through every Telegram and webhook delivery.
 - A web or database shell started through another program (`nginx -> perl
   -> sh`, `awk 'BEGIN{system("sh")}'`) is HIGH like a direct one; only the
   nearest parent used to count. Downloaders behind an interpreter and relay
