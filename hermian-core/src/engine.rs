@@ -951,6 +951,35 @@ mod tests {
         assert!(login(&mut eng).is_empty());
     }
 
+    /// One login must not page twice: a root login from a never-seen source
+    /// matched both the root-policy and the novelty rule, and Telegram got
+    /// two messages for the same event.
+    #[test]
+    fn root_login_from_a_new_source_is_one_alert() {
+        let mut cfg = Config::default();
+        cfg.ssh.off_hours_start = 0;
+        cfg.ssh.off_hours_end = 0;
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
+        let alerts = eng.process(Event::Auth(AuthEvent {
+            ts: Utc::now(),
+            result: AuthResult::Success,
+            user: "root".into(),
+            rhost: Some("203.0.113.77".parse().unwrap()),
+            service: "sshd".into(),
+            tty: "ssh".into(),
+            port: None,
+        }));
+        let d2: Vec<_> = alerts
+            .iter()
+            .filter(|a| a.detection == DetectionId::D2)
+            .collect();
+        assert_eq!(d2.len(), 1, "{:?}", alerts);
+        assert_eq!(d2[0].severity, Severity::High);
+        assert!(d2[0].title.contains("new source"), "{:?}", d2[0].title);
+    }
+
     #[test]
     fn novel_source_with_baseline_fires() {
         let mut cfg = Config::default();

@@ -56,6 +56,8 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
         AuthResult::Success => {
             let recent = bursts.recent_failures(rhost, ev.ts, window);
             let after_burst = recent >= threshold;
+            let mut root_login: Option<Finding> = None;
+            let mut new_source: Option<Finding> = None;
             if after_burst {
                 let users = bursts.recent_users(rhost);
                 findings.push(
@@ -103,7 +105,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 } else {
                     Severity::Info
                 };
-                findings.push(
+                root_login = Some(
                     Finding::new(
                         DetectionId::D2,
                         severity,
@@ -148,7 +150,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 } else {
                     Severity::Low
                 };
-                findings.push(
+                new_source = Some(
                     Finding::new(
                         DetectionId::D2,
                         severity,
@@ -179,6 +181,16 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         "Add the source to allowlist.ssh_sources if it is legitimate.",
                     ]),
                 );
+            }
+            // One login, one alert. A root login from a never-seen source
+            // matches both rules above; keeping both sent two notifications
+            // for one event. The sharper finding wins (ties go to the root
+            // policy alert, which carries the novelty in its title anyway).
+            match (root_login, new_source) {
+                (Some(r), Some(n)) => findings.push(if n.severity > r.severity { n } else { r }),
+                (Some(r), None) => findings.push(r),
+                (None, Some(n)) => findings.push(n),
+                (None, None) => {}
             }
         }
     }

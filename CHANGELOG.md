@@ -173,6 +173,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   Its docs show the absolute module path (a bare name never loads).
 - A corrupt BTF blob can't panic the daemon, and `dpkg-query` isn't asked
   about file names that would act as globs.
+- One SSH login, one alert: root logging in from a never-seen source fired
+  both the root-policy finding and the new-source finding, which meant two
+  Telegram messages for one event. The sharper finding is kept; ties keep
+  the root-policy alert.
 
 ### Changed
 
