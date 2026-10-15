@@ -266,7 +266,7 @@ Use `--json` with `status`, `alerts`, `show`, or `test` for scripts.
 
 The default 24-hour baseline learns SSH sources and network activity for novelty
 checks; a source or destination is new the first time it's seen, not every time
-it reappears. Exceptions belong in the config's allowlist, with a `reason` for
+it reappears (destinations by /24, or /64 for IPv6). Exceptions belong in the config's allowlist, with a `reason` for
 each one.
 
 Optional network isolation needs management CIDRs configured first. See

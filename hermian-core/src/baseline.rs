@@ -18,6 +18,10 @@ pub struct Baseline {
     /// Destinations of outbound connections, recorded lifetime-wide like
     /// `known_ssh_sources`.
     pub known_dests: HashSet<IpAddr>,
+    /// The networks of `known_dests` (see [`dest_net`]). Derived, not saved:
+    /// rebuilt by [`Baseline::index_dests`] when a baseline is loaded.
+    #[serde(skip)]
+    pub known_dest_nets: HashSet<IpAddr>,
     /// Connecting programs (see `connector_key`), recorded lifetime-wide.
     pub known_connectors: HashSet<String>,
     /// Sources that have successfully logged in as root. Separate from
@@ -44,6 +48,19 @@ pub const CONNECTOR_SCHEME: u8 = 1;
 /// limit. Past the cap, unseen values are simply novel.
 pub const MAX_LEARNED: usize = 50_000;
 
+/// The network a destination is judged by: its /24 (IPv4, including
+/// v4-mapped IPv6) or /64 (IPv6). APIs and CDNs rotate addresses inside a
+/// block, and each new address used to page "new external destination".
+pub fn dest_net(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & 0xffff_ff00).into()),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => dest_net(IpAddr::V4(v4)),
+            None => IpAddr::V6((u128::from(v6) & (u128::MAX << 64)).into()),
+        },
+    }
+}
+
 impl Default for Baseline {
     fn default() -> Self {
         Baseline {
@@ -53,6 +70,7 @@ impl Default for Baseline {
             complete: true,
             known_ssh_sources: HashSet::new(),
             known_dests: HashSet::new(),
+            known_dest_nets: HashSet::new(),
             known_connectors: HashSet::new(),
             root_sources: HashSet::new(),
             connector_scheme: 0,
@@ -70,6 +88,7 @@ impl Baseline {
             complete: !enabled,
             known_ssh_sources: HashSet::new(),
             known_dests: HashSet::new(),
+            known_dest_nets: HashSet::new(),
             known_connectors: HashSet::new(),
             root_sources: HashSet::new(),
             connector_scheme: CONNECTOR_SCHEME,
@@ -161,6 +180,20 @@ impl Baseline {
         if self.known_dests.len() < MAX_LEARNED {
             self.known_dests.insert(ip);
         }
+        if self.known_dest_nets.len() < MAX_LEARNED {
+            self.known_dest_nets.insert(dest_net(ip));
+        }
+    }
+
+    /// Rebuild the derived network set after loading from disk.
+    pub fn index_dests(&mut self) {
+        let nets: Vec<IpAddr> = self.known_dests.iter().map(|ip| dest_net(*ip)).collect();
+        for net in nets {
+            if self.known_dest_nets.len() >= MAX_LEARNED {
+                break;
+            }
+            self.known_dest_nets.insert(net);
+        }
     }
 
     /// The relearn window only suppresses judging (see `can_judge_connectors`);
@@ -181,8 +214,9 @@ impl Baseline {
         self.known_ssh_sources.contains(&ip)
     }
 
+    /// Known if this address, or another in its network, was seen before.
     pub fn dest_is_known(&self, ip: IpAddr) -> bool {
-        self.known_dests.contains(&ip)
+        self.known_dests.contains(&ip) || self.known_dest_nets.contains(&dest_net(ip))
     }
 
     pub fn connector_is_known(&self, key: &str) -> bool {
@@ -202,6 +236,35 @@ mod tests {
     fn disabled_baseline_is_complete_immediately() {
         let b = Baseline::new(false, 24, now());
         assert!(b.is_complete());
+    }
+
+    #[test]
+    fn destinations_are_judged_by_network() {
+        let t0 = now();
+        let mut b = Baseline::new(true, 24, t0);
+        b.observe_dest("198.51.100.7".parse().unwrap(), t0);
+        b.observe_dest("2001:db8:1:2::5".parse().unwrap(), t0);
+        // Same /24 or /64: a rotated address isn't new.
+        assert!(b.dest_is_known("198.51.100.200".parse().unwrap()));
+        assert!(b.dest_is_known("::ffff:198.51.100.9".parse().unwrap()));
+        assert!(b.dest_is_known("2001:db8:1:2:ffff::1".parse().unwrap()));
+        // Next block over is.
+        assert!(!b.dest_is_known("198.51.101.7".parse().unwrap()));
+        assert!(!b.dest_is_known("2001:db8:1:3::5".parse().unwrap()));
+    }
+
+    #[test]
+    fn dest_networks_are_rebuilt_after_loading() {
+        // baseline.json keeps plain addresses; the network set isn't saved.
+        let mut b: Baseline = serde_json::from_str(
+            r#"{"enabled":true,"complete":true,"known_dests":["203.0.113.5"]}"#,
+        )
+        .unwrap();
+        assert!(!b.dest_is_known("203.0.113.6".parse().unwrap()));
+        b.index_dests();
+        assert!(b.dest_is_known("203.0.113.6".parse().unwrap()));
+        let text = serde_json::to_string(&b).unwrap();
+        assert!(!text.contains("known_dest_nets"), "{}", text);
     }
 
     #[test]
