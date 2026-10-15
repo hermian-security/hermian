@@ -135,6 +135,26 @@ jobs:
             target/release/hermian
             target/release/libpam_hermian.so
 
+  # arm64 used to be built only at release time, so arch-specific lints (c_char
+  # is u8 there, i8 on x86_64) failed the release instead of the PR. Not a
+  # required check; the release workflow still gates on the five above.
+  arm64:
+    name: clippy (arm64)
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      # Same command as the release's arm64 build, with the vendored eBPF object.
+      - run: HERMIAN_EBPF_FROM_SOURCE=0 cargo clippy --release --locked --all-targets -- -D warnings
+
   # Advisory for now: not in the required-check set (that's a repository
   # setting). Known vulnerabilities, yanked crates, licenses, sources.
   supply-chain:
