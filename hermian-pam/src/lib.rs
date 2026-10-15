@@ -138,7 +138,8 @@ fn send_datagram(payload: &str) {
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         let n = SOCKET_PATH.len().min(addr.sun_path.len());
         for (dst, src) in addr.sun_path.iter_mut().zip(SOCKET_PATH.iter().take(n)) {
-            *dst = *src as libc::c_char;
+            // c_char is i8 on x86_64 and u8 on aarch64; this writes the byte either way.
+            *dst = libc::c_char::from_ne_bytes([*src]);
         }
         let len = (std::mem::size_of::<libc::sa_family_t>() + n) as libc::socklen_t;
         let _ = libc::sendto(
