@@ -73,6 +73,25 @@ pub fn note_restart(path: &Path, reason: &str) {
     );
 }
 
+/// Write any panic's message to `path` before the process aborts (release
+/// builds use `panic = "abort"`), so the next start's unclean-shutdown alert
+/// can say what crashed instead of guessing. Read it back with
+/// [`take_restart_note`].
+pub fn install_panic_note(path: std::path::PathBuf) {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let note = panic_note(thread.name().unwrap_or("unnamed"), &info.to_string());
+        let _ = fs::write(&path, note);
+        default(info);
+    }));
+}
+
+/// One line, so it fits in an alert fact.
+fn panic_note(thread: &str, info: &str) -> String {
+    format!("panic in thread '{}': {}\n", thread, info.replace('\n', " "))
+}
+
 /// Read and delete the watchdog's restart note.
 pub fn take_restart_note(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
@@ -120,6 +139,26 @@ mod tests {
         // A run that dies leaves it behind; the next start reports it.
         let prev = start(&marker).expect("previous run recorded");
         assert!(prev.contains(&std::process::id().to_string()), "{}", prev);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_panic_note_is_one_line_naming_the_thread() {
+        // (The hook itself is process-global, so it isn't installed here:
+        // other tests panic on purpose in parallel.)
+        let d = scratch("panic");
+        fs::create_dir_all(&d).unwrap();
+        let p = d.join("panic-note");
+        let note = panic_note(
+            "hermian-authlog",
+            "panicked at hermian/src/authlog.rs:1:2:\nboom",
+        );
+        fs::write(&p, note).unwrap();
+        let read = take_restart_note(&p).expect("note read back");
+        assert_eq!(
+            read,
+            "panic in thread 'hermian-authlog': panicked at hermian/src/authlog.rs:1:2: boom"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 

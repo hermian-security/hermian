@@ -524,7 +524,8 @@ async fn run_channel(
         let cfg = q.cfg.clone();
         let result = tokio::task::spawn_blocking(move || send(name, &alert, &cfg))
             .await
-            // A panicking send is a failure, not a delivery.
+            // A panicking send is a failure, not a delivery. (Release builds
+            // abort on panic instead; see Cargo.toml.)
             .unwrap_or_else(|e| Err(SendError::transient(format!("send panicked: {}", e))));
         match result {
             Ok(()) => {

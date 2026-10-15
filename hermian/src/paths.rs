@@ -75,6 +75,11 @@ pub fn watchdog_note_file() -> PathBuf {
     state_dir().join("watchdog-note")
 }
 
+/// The last panic's message, left for the next start to report.
+pub fn panic_note_file() -> PathBuf {
+    state_dir().join("panic-note")
+}
+
 /// Rate-limit state for the watchdog's alerts.
 pub fn watchdog_state_file() -> PathBuf {
     state_dir().join("watchdog.json")
