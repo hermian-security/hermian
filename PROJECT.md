@@ -83,8 +83,9 @@ operator is typing.
 The default baseline learns SSH sources, destination IPs, and connector identities
 for 24 hours, then starts judging novelty. Learning itself doesn't stop when the
 window closes: a source, destination, or program counts as new the first time it
-is ever seen, not every time it appears afterwards. Destination IPs are host-wide,
-not per-application. Disabling the baseline also disables novelty judgments.
+is ever seen, not every time it appears afterwards. Destinations are host-wide,
+not per-application, and judged by network: an address in a /24 (IPv6: /64)
+already seen isn't new, so an API or CDN rotating addresses doesn't page. Disabling the baseline also disables novelty judgments.
 Root-login source history is tracked separately.
 
 Allowlist entries need a `reason`. Prefer fixing a noisy rule over adding a broad

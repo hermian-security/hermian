@@ -211,6 +211,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- Destination novelty is judged by network, /24 for IPv4 and /64 for
+  IPv6. An app server calling an API or CDN that rotates addresses inside
+  a block paged HIGH "Web server connected to a new external destination"
+  for each new address. `baseline.json` is unchanged.
 - Login alerts name the SSH auth method when the log has it: `(key)` or
   `(password)` after "authenticated" (keyboard-interactive counts as
   password). Nothing is claimed when the method is unknown.
