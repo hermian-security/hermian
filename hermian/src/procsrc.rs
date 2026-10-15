@@ -92,21 +92,62 @@ pub fn read_regular_file(path: &str) -> Option<String> {
 pub fn open_regular(path: &str) -> Option<(fs::File, fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
     let p = std::path::Path::new(path);
-    // A symlinked parent (e.g. ~/.ssh -> /root/.ssh) would redirect the read.
-    let parent = p.parent()?;
-    if fs::canonicalize(parent).ok()? != parent {
-        return None;
-    }
-    let f = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
-        .open(p)
-        .ok()?;
+    let f = match open_no_symlinks(path) {
+        Ok(f) => f,
+        // Kernels before 5.6 (or a seccomp filter) lack openat2: fall back
+        // to checking the parent, then O_NOFOLLOW on the last component.
+        // That leaves a small race (the parent can be swapped for a symlink
+        // in between), which openat2 closes.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) => {
+            // A symlinked parent (e.g. ~/.ssh -> /root/.ssh) would redirect the read.
+            let parent = p.parent()?;
+            if fs::canonicalize(parent).ok()? != parent {
+                return None;
+            }
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(
+                    libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+                )
+                .open(p)
+                .ok()?
+        }
+        Err(_) => return None,
+    };
     let meta = f.metadata().ok()?;
     if !meta.file_type().is_file() {
         return None;
     }
     Some((f, meta))
+}
+
+/// Open read-only with no symlink anywhere in the path, atomically
+/// (`openat2` with `RESOLVE_NO_SYMLINKS`, Linux 5.6+).
+fn open_no_symlinks(path: &str) -> std::io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    let c = std::ffi::CString::new(path)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: open_how is plain data; zeroed is a valid value.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags =
+        (libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+            as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
+    // SAFETY: valid C string and open_how of the size passed.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just returned this fd and nothing else owns it.
+    Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) })
 }
 
 pub fn exe_of(pid: u32) -> Option<(String, bool)> {
@@ -132,6 +173,46 @@ pub fn cmdline_of(pid: u32) -> Option<String> {
     } else {
         Some(args.join(" "))
     }
+}
+
+/// The raw argument vector from `/proc/<pid>/cmdline` (at most 64 args).
+pub fn argv_of(pid: u32) -> Vec<String> {
+    let Ok(f) = fs::File::open(format!("/proc/{}/cmdline", pid)) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if f.take(64 * 1024).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    buf.split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .take(64)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+/// The exe the engine's trust checks should see for `pid`. Normally `exe`
+/// unchanged; for a script tool (`dnf`, `adduser`...) the script's own path,
+/// so a shell script at `/tmp/dnf` isn't trusted as the package manager.
+/// See [`hermian_core::proctree::script_tool_exe`].
+pub fn judged_exe(pid: u32, comm: &str, exe: &str) -> String {
+    let unchanged = hermian_core::proctree::script_tool_exe(comm, exe, &[]);
+    if unchanged == exe {
+        // Not a script tool under an interpreter: no need to read cmdline.
+        return unchanged;
+    }
+    // Mid-exec, comm is already the new one while the argument area isn't
+    // set up yet and cmdline reads empty. Give it a moment.
+    let mut argv = argv_of(pid);
+    for _ in 0..5 {
+        if !argv.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        argv = argv_of(pid);
+    }
+    let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+    hermian_core::proctree::script_tool_exe(comm, exe, &refs)
 }
 
 pub fn comm_of(pid: u32) -> Option<String> {
@@ -246,12 +327,12 @@ pub fn proc_info(pid: u32, now: chrono::DateTime<chrono::Utc>) -> Option<ProcInf
         pid,
         ppid,
         uid,
-        comm,
         exe: if deleted {
             format!("{} (deleted)", exe)
         } else {
-            exe
+            judged_exe(pid, &comm, &exe)
         },
+        comm,
         start,
         tty_nr,
         container,
@@ -284,6 +365,7 @@ pub fn pid_for_path(path: &str) -> Option<(u32, String, String, u32, i64)> {
             if target == path {
                 let comm = comm_of(pid).unwrap_or_default();
                 let (exe, _) = exe_of(pid).unwrap_or_default();
+                let exe = judged_exe(pid, &comm, &exe);
                 let uid = uid_of(pid).unwrap_or(0);
                 let (_ppid, tty_nr, _start) = stat_of(pid).unwrap_or((0, 0, 0));
                 return Some((pid, comm, exe, uid, tty_nr));
@@ -298,12 +380,15 @@ pub struct TcpEntry {
     pub proto: &'static str,
     pub local_addr: IpAddr,
     pub local_port: u16,
+    pub remote_addr: IpAddr,
+    pub remote_port: u16,
     pub state: u8,
     pub uid: u32,
     pub inode: u64,
 }
 
 pub const TCP_LISTEN: u8 = 0x0A;
+pub const TCP_ESTABLISHED: u8 = 0x01;
 
 fn parse_hex_addr(hex: &str, port_hex: &str) -> Option<(IpAddr, u16)> {
     let port = u16::from_str_radix(port_hex, 16).ok()?;
@@ -326,6 +411,10 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
     let Some(content) = read_file(path) else {
         return Vec::new();
     };
+    parse_tcp_table(&content, proto)
+}
+
+fn parse_tcp_table(content: &str, proto: &'static str) -> Vec<TcpEntry> {
     content
         .lines()
         .skip(1)
@@ -333,9 +422,12 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
             let mut it = line.split_whitespace();
             let _sl = it.next()?;
             let local = it.next()?;
-            let _remote = it.next()?;
+            let remote = it.next()?;
             let state = u8::from_str_radix(it.next()?, 16).ok()?;
-            for _ in 0..4 {
+            // tx_queue:rx_queue, tr:tm->when, retrnsmt. Skipping four here
+            // used to read the timeout as uid and the refcount as the inode,
+            // so socket owners (listener pids) were never found.
+            for _ in 0..3 {
                 it.next()?;
             }
             let uid = it.next()?.parse().unwrap_or(0);
@@ -344,10 +436,15 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
             let (local_addr, local_port) = local
                 .split_once(':')
                 .and_then(|(h, p)| parse_hex_addr(h, p))?;
+            let (remote_addr, remote_port) = remote
+                .split_once(':')
+                .and_then(|(h, p)| parse_hex_addr(h, p))?;
             Some(TcpEntry {
                 proto,
                 local_addr,
                 local_port,
+                remote_addr,
+                remote_port,
                 state,
                 uid,
                 inode,
@@ -359,6 +456,35 @@ fn parse_tcp_file(path: &str, proto: &'static str) -> Vec<TcpEntry> {
 pub fn read_tcp_tables() -> Vec<TcpEntry> {
     let mut out = parse_tcp_file("/proc/net/tcp", "tcp");
     out.extend(parse_tcp_file("/proc/net/tcp6", "tcp6"));
+    out
+}
+
+/// Every pid holding any of these socket inodes (a forked sshd and its
+/// monitor share the connection's socket), in one pass over `/proc/*/fd`.
+pub fn all_pids_for_inodes(inodes: &[u64]) -> Vec<u32> {
+    let mut out = Vec::new();
+    if inodes.is_empty() {
+        return out;
+    }
+    for pid in proc_pids() {
+        let Ok(fds) = fs::read_dir(format!("/proc/{}/fd", pid)) else {
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            fs::read_link(fd.path())
+                .ok()
+                .and_then(|l| {
+                    l.to_string_lossy()
+                        .strip_prefix("socket:[")
+                        .and_then(|s| s.strip_suffix(']'))
+                        .and_then(|s| s.parse::<u64>().ok())
+                })
+                .is_some_and(|ino| inodes.contains(&ino))
+        });
+        if holds {
+            out.push(pid);
+        }
+    }
     out
 }
 
@@ -459,6 +585,11 @@ pub fn is_suid_or_sgid(path: &str) -> bool {
 /// Whether `path` is owned by an installed package. `None` when no package
 /// manager could answer.
 pub fn file_in_package_database(path: &str) -> Option<bool> {
+    // `dpkg-query -S` takes a glob: a file named `x*` or `[a]` could match
+    // some packaged file and pass as package-owned. Don't ask about those.
+    if path.contains(['*', '?', '[', ']', '\\']) {
+        return None;
+    }
     for (cmd, args) in [
         ("dpkg-query", vec!["-S"]),
         ("rpm", vec!["-qf"]),
@@ -478,6 +609,27 @@ pub fn file_in_package_database(path: &str) -> Option<bool> {
     None
 }
 
+/// Whether `path` is a 32-bit ELF on a 64-bit x86 host. Such programs make
+/// compat (int 0x80 / ia32) syscalls, which the `sys_enter_*` tracepoints
+/// don't see, so their connects and ptrace calls are invisible to eBPF.
+pub fn is_compat_binary(path: &str) -> bool {
+    if !cfg!(target_arch = "x86_64") || path.is_empty() {
+        return false;
+    }
+    let Ok(f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut hdr = [0u8; 5];
+    if f.take(5).read_exact(&mut hdr).is_err() {
+        return false;
+    }
+    is_elf32(&hdr)
+}
+
+fn is_elf32(hdr: &[u8; 5]) -> bool {
+    hdr[..4] == *b"\x7fELF" && hdr[4] == 1
+}
+
 pub fn current_exe_path() -> Result<PathBuf> {
     fs::read_link("/proc/self/exe").context("failed to resolve own binary path")
 }
@@ -493,6 +645,65 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // temp_dir itself may be a symlink (macOS-style setups); use the real path.
         fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn tcp_table_rows_carry_both_ends() {
+        // Copied from a real /proc/net/tcp (uid 991, inode 4242).
+        let t = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:0016 0764A8C6:C350 01 00000000:00000000 00:00000000 00000000   991        0 4242 1 0000000000000000 20 4 30 10 -1\n";
+        let rows = parse_tcp_table(t, "tcp");
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.local_addr, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(r.local_port, 22);
+        assert_eq!(r.remote_addr, "198.168.100.7".parse::<IpAddr>().unwrap());
+        assert_eq!(r.remote_port, 50000);
+        assert_eq!(r.state, TCP_ESTABLISHED);
+        assert_eq!(r.uid, 991);
+        assert_eq!(r.inode, 4242);
+    }
+
+    #[test]
+    fn elf_class_is_read_from_the_header() {
+        assert!(is_elf32(b"\x7fELF\x01"));
+        assert!(!is_elf32(b"\x7fELF\x02"));
+        assert!(!is_elf32(b"#!/bi"));
+        // Our own binary is 64-bit.
+        let me = current_exe_path().unwrap();
+        assert!(!is_compat_binary(me.to_str().unwrap()));
+        assert!(!is_compat_binary("/nonexistent"));
+    }
+
+    #[test]
+    fn script_named_like_a_tool_is_judged_by_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("scripttool");
+        let script = dir.join("dnf");
+        fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new(&script).spawn().unwrap();
+        let pid = child.id();
+        // Wait for the exec to land: comm switches to "dnf", then the new
+        // argument area appears.
+        let mut comm = String::new();
+        for _ in 0..200 {
+            comm = comm_of(pid).unwrap_or_default();
+            if comm == "dnf" && argv_of(pid).len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (exe, _) = exe_of(pid).unwrap();
+        let judged = judged_exe(pid, &comm, &exe);
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(comm, "dnf");
+        assert_eq!(judged, script.to_str().unwrap(), "exe was {}", exe);
+        assert_ne!(
+            hermian_core::role_of(&comm, &judged),
+            hermian_core::Role::PackageManager
+        );
     }
 
     #[test]

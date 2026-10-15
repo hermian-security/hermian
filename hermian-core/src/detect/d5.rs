@@ -27,7 +27,11 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
         return findings;
     }
 
-    let flagged = ctx.has_recent_flag(ev.pid, 120, Some(DetectionId::D1));
+    let flagged = ctx.has_recent_flag(
+        ev.pid,
+        crate::detect::FLAG_WINDOW_SECS,
+        Some(DetectionId::D1),
+    );
     if flagged {
         findings.push(
             Finding::new(
@@ -37,7 +41,7 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 &format!("d5|connect-flagged|{}|{}", ev.comm, ev.daddr),
             )
             .what(format!(
-                "{} (pid {}) connected to {} within two minutes of its chain being flagged by D1.",
+                "{} (pid {}) connected to {} within ten minutes of its chain being flagged by D1.",
                 ev.comm, ev.pid, dest
             ))
             .chain(ctx.chain_nodes(ev.pid))
@@ -56,8 +60,14 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
     }
 
     // Only skip infra ports after the flagged-chain check: a web shell
-    // calling out to attacker:53 is exactly the case we mustn't drop.
-    if INFRA_PORTS.contains(&ev.dport) {
+    // calling out to attacker:53 is exactly the case we mustn't drop. And
+    // only to the LAN or to servers seen while learning: "port 53 to
+    // anywhere" was a free pass for DNS-port C2 to a fresh address.
+    if INFRA_PORTS.contains(&ev.dport)
+        && (!is_external
+            || !ctx.baseline.can_judge_novelty()
+            || ctx.baseline.dest_is_known(ev.daddr))
+    {
         return findings;
     }
 
@@ -72,8 +82,7 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 &format!("d5|web-new-dest|{}", ev.daddr),
             )
             .what(format!(
-                "{} (under {}) connected to {}, a destination never observed during the \
-                 baseline period.",
+                "{} (under {}) connected to {}, a destination never seen before.",
                 ev.comm, web.comm, dest
             ))
             .chain(ctx.chain_nodes(ev.pid))
@@ -143,7 +152,12 @@ pub fn connector_exe(tree: &crate::proctree::ProcessTree, pid: u32, comm: &str) 
 }
 
 pub fn evaluate_listener(ev: &ListenerEvent, ctx: &Ctx) -> Vec<Finding> {
-    let flagged = ev.pid != 0 && ctx.has_recent_flag(ev.pid, 300, Some(DetectionId::D1));
+    let flagged = ev.pid != 0
+        && ctx.has_recent_flag(
+            ev.pid,
+            crate::detect::FLAG_WINDOW_SECS,
+            Some(DetectionId::D1),
+        );
     let owner_role = ctx
         .tree
         .get(ev.pid)
@@ -178,7 +192,10 @@ pub fn evaluate_listener(ev: &ListenerEvent, ctx: &Ctx) -> Vec<Finding> {
         DetectionId::D5,
         severity,
         title,
-        &format!("d5|listener|{}|{}|{}", ev.proto, ev.port, ev.comm),
+        &format!(
+            "d5|listener|{}|{}|{}|{}",
+            ev.proto, ev.addr, ev.port, ev.comm
+        ),
     )
     .what(format!(
         "{} (pid {}) started listening on {} ({}).",

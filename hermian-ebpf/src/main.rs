@@ -54,9 +54,6 @@ pub struct ExecIntent {
 #[map]
 static EXEC_INTENT: LruHashMap<u32, ExecIntent> = LruHashMap::with_max_entries(4096, 0);
 
-#[map]
-static INTENT_SCRATCH: PerCpuArray<ExecIntent> = PerCpuArray::with_max_entries(1, 0);
-
 /// Layout must match `hermian::ebpf::RawExec` exactly.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -114,12 +111,16 @@ const SCHED_EXEC_PID: usize = 12;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
-/// How many envp entries to inspect for LD_PRELOAD. Each probe costs verifier
-/// budget; 12 was trivially bypassed by exporting a dozen dummy variables
-/// first. Still a bound, not a guarantee.
-const ENV_SCAN: usize = 32;
+/// How many envp entries to inspect for LD_PRELOAD / LD_AUDIT. Each probe
+/// costs verifier budget; 12 was trivially bypassed by exporting a dozen
+/// dummy variables first, and 32 by a few dozen. Still a bound, not a
+/// guarantee: userspace reports it as such.
+const ENV_SCAN: usize = 64;
 
 const LD_PRELOAD_EQ: &[u8; 11] = b"LD_PRELOAD=";
+/// LD_AUDIT loads a library into the process just like LD_PRELOAD (via the
+/// rtld-audit interface) and was not checked at all.
+const LD_AUDIT_EQ: &[u8; 9] = b"LD_AUDIT=";
 
 #[inline(always)]
 fn current_pid_uid() -> (u32, u32, u32) {
@@ -175,7 +176,7 @@ fn scan_env_for_ld_preload(envp: u64) -> u8 {
         };
         // SAFETY: p is a user pointer; the helper bounds-checks it.
         if unsafe { bpf_probe_read_user_str_bytes(p as *const u8, &mut buf) }.is_ok()
-            && buf[..11] == LD_PRELOAD_EQ[..]
+            && (buf[..11] == LD_PRELOAD_EQ[..] || buf[..9] == LD_AUDIT_EQ[..])
         {
             return 1;
         }
@@ -186,16 +187,19 @@ fn scan_env_for_ld_preload(envp: u64) -> u8 {
 /// Record the caller's intent at syscall entry. The image has not changed yet,
 /// so only argv/envp are read here; the authoritative filename and comm come
 /// from sched_process_exec once the exec has succeeded.
+///
+/// The intent is built on the BPF stack (136 bytes) rather than in a per-CPU
+/// scratch map. Syscall tracepoints can be preempted on newer kernels
+/// (faultable tracepoints), and a second exec on the same CPU mid-way would
+/// have overwritten a shared slot, mixing argv0/LD_PRELOAD between tasks.
 #[inline(always)]
 fn record_intent(ctx: &TracePointContext, argv_off: usize, envp_off: usize, via_execveat: u8) {
-    let Some(intent) = INTENT_SCRATCH.get_ptr_mut(0) else {
-        return;
+    let mut intent = ExecIntent {
+        ld_preload: 0,
+        via_execveat,
+        _pad: [0u8; 6],
+        argv0: [0u8; 128],
     };
-    // SAFETY: per-CPU scratch slot; not preempted by another tracepoint on this CPU.
-    let intent = unsafe { &mut *intent };
-    intent.ld_preload = 0;
-    intent.via_execveat = via_execveat;
-    intent.argv0[0] = 0;
 
     // SAFETY: offsets are within the tracepoint's fixed argument block.
     let (argv, envp) = unsafe {
@@ -214,7 +218,7 @@ fn record_intent(ctx: &TracePointContext, argv_off: usize, envp_off: usize, via_
         intent.ld_preload = scan_env_for_ld_preload(envp);
     }
     let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let _ = EXEC_INTENT.insert(&tgid, intent, 0);
+    let _ = EXEC_INTENT.insert(&tgid, &intent, 0);
 }
 
 /// execve(const char *filename, char *const argv[], char *const envp[])
@@ -293,32 +297,57 @@ pub fn hermian_connect(ctx: TracePointContext) -> u32 {
     if sa_addr == 0 {
         return 0;
     }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct SockAddrPrefix {
-        family: u16,
-        port_be: u16,
-        v4_addr: [u8; 4], // = flowinfo for AF_INET6
-        v6_addr: [u8; 16],
-        _tail: u32,
-    }
-    // SAFETY: sa_addr is a user pointer; the helper bounds-checks the 28-byte read.
-    let sa: SockAddrPrefix = match unsafe { bpf_probe_read_user(sa_addr as *const SockAddrPrefix) }
-    {
-        Ok(v) => v,
+    // Read the family first, then only as many bytes as that family needs.
+    // A fixed 28-byte read failed (and dropped the event) whenever a 16-byte
+    // sockaddr_in sat at the end of a mapped page: an easy way to connect
+    // unseen.
+    // SAFETY: sa_addr is a user pointer; the helper bounds-checks the read.
+    let family: u16 = match unsafe { bpf_probe_read_user(sa_addr as *const u16) } {
+        Ok(f) => f,
         Err(_) => return 0,
     };
     let mut ev = ConnectEvent {
         pid,
         uid,
         gid,
-        family: sa.family,
-        dport: u16::from_be(sa.port_be),
+        family,
+        dport: 0,
         daddr6: [0u8; 16],
     };
-    match sa.family {
-        AF_INET => ev.daddr6[..4].copy_from_slice(&sa.v4_addr),
-        AF_INET6 => ev.daddr6.copy_from_slice(&sa.v6_addr),
+    match family {
+        AF_INET => {
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct In4 {
+                family: u16,
+                port_be: u16,
+                addr: [u8; 4],
+            }
+            // SAFETY: 8 bytes, inside any valid sockaddr_in (16 bytes).
+            let sa: In4 = match unsafe { bpf_probe_read_user(sa_addr as *const In4) } {
+                Ok(v) => v,
+                Err(_) => return 0,
+            };
+            ev.dport = u16::from_be(sa.port_be);
+            ev.daddr6[..4].copy_from_slice(&sa.addr);
+        }
+        AF_INET6 => {
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct In6 {
+                family: u16,
+                port_be: u16,
+                flowinfo: u32,
+                addr: [u8; 16],
+            }
+            // SAFETY: 24 bytes, inside any valid sockaddr_in6 (28 bytes).
+            let sa: In6 = match unsafe { bpf_probe_read_user(sa_addr as *const In6) } {
+                Ok(v) => v,
+                Err(_) => return 0,
+            };
+            ev.dport = u16::from_be(sa.port_be);
+            ev.daddr6.copy_from_slice(&sa.addr);
+        }
         _ => return 0,
     }
     CONNECT_EVENTS.output(&ctx, &ev, 0);

@@ -6,6 +6,245 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Added
+
+- Telegram response buttons (off by default; `notifications.telegram.actions`
+  plus `allowed_user_ids`):
+  - A brute-force digest every 2 hours, only when failed logins targeted
+    accounts that exist and can log in (or root), with `Block <ip>`,
+    `Block all` and `Ignore 2h`. It warns when root can log in with a
+    password (checked with `sshd -T`), with a `Remind me in 7 days` button.
+  - Suspicious logins (after a burst, from a new source, root from a new
+    place) get `Ignore`, `Disconnect session` and `Disconnect and block`.
+  - Buttons act immediately, work only for the listed user ids in the
+    configured chat, expire, and each works once. Presses are fetched by
+    outbound polling, so nothing listens on the host. Each one is answered
+    in the chat and recorded as a local alert.
+  - Blocks live in their own nftables table with a timeout
+    (`response.block_duration_hours`, default 24); IPv6 is blocked per /64;
+    management CIDRs and allowlisted sources are never blocked.
+    `hermian blocked` and `hermian unblock <ip>` manage them.
+- `hermian enable` (which upgrades run) adds settings and sections new in
+  this version to an existing `config.toml`, commented out next to where
+  they belong, with their explanations. Values are never changed: the file
+  must read back as exactly the same settings or it's left alone. A backup
+  is kept as `config.toml.bak`. Configs from early betas, which had no
+  Telegram or email section, now show them.
+- The default config documents every option: what each detection group
+  covers, `message_thread_id`, what `management_cidrs` is for, and an
+  allowlist example for your own SSH sources.
+- Telegram alerts open with a `■■■□ HERMIAN - HIGH` header (filled cells
+  count up with severity), `Host : web-01`, the bold title, and a sentence
+  or two: what happened and where, then a `hermian show` line. Evidence,
+  process chains, the why and the steps stay in the CLI; they were the same
+  story three times in a chat window. No emoji, and the whole alert is
+  no longer repeated underneath. The brute-force digest lists its sources
+  on one line instead of emitting a raw newline escape in the value, and
+  the disconnect button reads `Disconnect session`.
+- Alert retention: stored alerts and collect bundles older than
+  `general.alert_retention_days` (default 90; 0 keeps them) are deleted
+  hourly, and `alerts.log` rotates at 50 MB with three old copies kept.
+- The dead-man switch: the daemon writes a heartbeat to its run directory
+  every 30 s, and a new `hermian-watchdog` systemd timer (installed by
+  `hermian enable`, checked every minute) pages HIGH and restarts the
+  daemon when the heartbeat goes stale. A crash or SIGKILL is reported on
+  the next start. `status` shows the heartbeat age.
+- Durable alert queues: alerts waiting for a notifying channel are written
+  to `state/pending/<channel>/` and reloaded after a restart, so delivery
+  is at-least-once (a crash mid-send can duplicate an alert, never lose
+  one). Retention prunes them with the rest of the store.
+- Releases ship an `install.sh` next to the binaries, and the README leads
+  with one command: `curl -fsSL .../releases/download/vX.Y.Z/install.sh |
+  sudo sh`. It's served from the same tag it installs, picks the `.deb` on
+  Debian/Ubuntu or the tarball elsewhere, always checks `SHA256SUMS`, and
+  verifies it with `cosign` or `gh` when installed (checksum-only, with a
+  warning, otherwise). It takes `--version` and `--dry-run`, and the whole
+  script runs from one function so a truncated download can't half-run.
+  Manual steps and the strict verification flow moved into the README's
+  "Verify manually" details.
+
+### Security
+
+- A web or database shell started through another program (`nginx -> perl
+  -> sh`, `awk 'BEGIN{system("sh")}'`) is HIGH like a direct one; only the
+  nearest parent used to count. Downloaders behind an interpreter and relay
+  tools (nc, socat) anywhere under a service are HIGH too.
+- A web shell flag no longer marks the web server itself, so its other
+  requests aren't escalated for the next ten minutes.
+- Auto-isolation ignores CRITICALs whose web server or database doesn't look
+  genuine: the binary must be named like the service in a root-owned
+  location, or be a trusted interpreter running as a system account. Any
+  local user could otherwise run a program called `nginx` (or rename python
+  to it) and cut the host off. The alert still pages.
+- Tool exemptions are harder to borrow:
+  - A script named like a tool (`/tmp/dnf`, python renamed to `dnf`) isn't
+    the package manager; the script's own path has to be trusted.
+  - LD_PRELOAD under `make`, `cargo` and friends is INFO only when that build
+    tool is really installed, not just named so.
+  - Running `visudo -c` or `passwd -S` from a cron job or service no longer
+    excuses a direct sudoers/shadow write a moment later. The tool has to
+    come from an operator session or a package/config manager.
+  - A ptrace from a process we never saw exec (a forked child calling itself
+    `gdb`) isn't treated as a debugger; the daemon now reads it from /proc.
+  - A TTY or `sudo` under a web server, database or cron isn't an operator
+    session (`pty.spawn` from a web shell no longer downgrades alerts).
+- The real `crontab` installing a download-and-run job is CRITICAL, and every
+  cron line is checked (only the first four were). A package manager writing
+  a unit that runs from `/tmp` is reported too.
+
+- A second, different change to the same sudoers, cron, unit,
+  authorized_keys, ld.so.preload or account file within the dedup window is
+  its own alert; only identical content is folded.
+- Account diffs catch more: uid/gid 0 however written (`00`), a service
+  account getting a login shell, gid and home changes, and new members of
+  docker, lxd, incus-admin, libvirt, disk, shadow and adm.
+- ld.so.conf.d checks no longer accept `/libevil`, `/usr/../tmp` or an
+  `include` outside ld.so.conf.d.
+- DNS/NTP-port connections to a new public address are judged like any
+  other once the baseline is done; only the LAN and learned servers are
+  skipped.
+- A known port bound again on another address (`127.0.0.1:8080` then
+  `0.0.0.0:8080`) is a new listener.
+- `ExecStart = x` (spaces around `=`) is parsed.
+- Listener alerts name the owning process again: the `/proc/net/tcp`
+  parser was one field off and read the refcount as the socket inode, so
+  the owner was never found.
+- Exited ancestors of a live process are all kept in the tree, not just its
+  parent, so a double-forked implant keeps the web server in its chain.
+- D1 flags escalate related connects, listeners and `/tmp` execs for ten
+  minutes (was two, beaten by a `sleep 130`).
+- A setuid file under `/opt` (vendor helpers like chrome-sandbox) is HIGH,
+  not CRITICAL. The default config shows how to allowlist PHP `mail()`.
+
+### Fixed
+
+- Ref ids follow the wall clock and never go backwards, so a late event or a
+  clock step around midnight can't reissue an id and overwrite an alert file.
+- The staging heuristic works on words: `ssh` and `flush` aren't shells (an
+  rsync cron job touching `/tmp` was CRITICAL), and a unit is only flagged
+  when the program, not an option like `--socket /tmp/x`, sits in `/tmp`.
+  `base64 -d | sh` and a cron job running a `/tmp` binary are flagged.
+- Known SSH sources, destinations, and connector programs are recorded for
+  the lifetime of the install. They used to freeze when the baseline window
+  closed, so a source first seen after it (a new ISP address, a jump host)
+  paged `new source` on every login, and programs re-alerted as `first
+  outbound` on every connect. Novelty now means first sighting, so each is
+  reported once.
+- Dedup signatures, auth sources and learned baseline sets are capped, so
+  attacker-chosen paths or rotating IPv6 sources can't grow memory without
+  bound. Far-past event timestamps are clamped like future ones.
+
+- Self-protection gaps:
+  - A missing `binary.sha256` or `config.sha256` pages HIGH at startup
+    instead of being quietly re-created (delete it, swap the binary, and
+    nothing used to fire).
+  - Config reloads compare against the config in effect, so writing the
+    hash file before the config no longer skips both the reload and its
+    alert.
+  - A clean stop pages HIGH and waits a few seconds for delivery.
+  - Dropped telemetry (eBPF ring loss, inotify overflow, audit ENOBUFS) pages
+    HIGH; `status` shows those totals and alerts a channel gave up on.
+- The unit restarts after any exit not requested through systemctl and no
+  longer gives up after five quick failures. It also sets `UMask=0077`,
+  `ProtectKernelLogs` and a private keyring.
+
+- More persistence surfaces are watched: `/etc/pam.d`, `/etc/environment`
+  and `pam_env.conf`, `rc.local`, udev rules, boot-time kernel modules, at
+  jobs, vendor units in `/usr/lib/systemd/system`, per-user systemd units,
+  and `.ssh` in service-account homes outside `/home` (`/var/www/.ssh`).
+  `pam_exec`, a non-system PAM module, `LD_PRELOAD` in the global
+  environment and udev `RUN+=` are CRITICAL when unattended.
+- The audit fallback only accepts netlink messages from the kernel; other
+  local sockets could inject fake exec records. Its exec rule is removed on
+  shutdown again (the daemon used to exit before the reader noticed).
+- Root reads of user-controlled files use `openat2(RESOLVE_NO_SYMLINKS)` on
+  5.6+ kernels, closing the swap-the-parent-for-a-symlink race. Symlinked
+  homes and `.ssh` dirs aren't watched.
+- `/etc/pam.d/sshd` edits (enable, uninstall) are atomic and keep the file's
+  mode and owner; a crash mid-write could leave a broken PAM stack.
+- `hermian uninstall` stops the daemon before lifting isolation, and only
+  deletes absolute paths with a `hermian` component, so an odd
+  `HERMIAN_STATE_DIR` can't point `remove_dir_all` at `/`.
+- auth.log rotation is detected by inode within ~2 s and the new file is read
+  from the start; lines logged right after a rotation used to be skipped.
+- eBPF event conversion (several /proc reads per event) and alert
+  persistence (fsync) run off the async workers; the alert queue is bounded
+  and overflow is logged and counted.
+- Alert records are never overwritten if a ref id repeats, and a failed
+  write is logged instead of dropped silently.
+- Webhook and Telegram errors have every URL cut to scheme and host, so a
+  normalised URL can't leak the secret path or bot token into status or
+  syslog.
+- SMTP credentials aren't sent over a cleartext connection to a remote host.
+- Isolation also drops forwarded traffic (Docker, VMs), keeps cloud metadata
+  reachable, loads management CIDRs normalised from the parsed value, and
+  refuses `0.0.0.0/0` / `::/0`. New dead-man switch: `hermian isolate --for
+  <minutes>` and `response.auto_isolate_revert_mins` lift it via a systemd
+  timer.
+- eBPF probes:
+  - The connect probe reads the address family first, then only that
+    family's bytes. A fixed 28-byte read failed (and dropped the event)
+    when a `sockaddr_in` sat at the end of a page.
+  - `LD_AUDIT` is flagged like `LD_PRELOAD`, and 64 env entries are
+    checked (was 32).
+  - Exec intents are built on the BPF stack instead of a per-CPU scratch
+    slot that a preempted syscall tracepoint could share.
+  - 32-bit programs on x86_64 (whose syscalls the hooks don't see) are
+    logged, and CPUs hot-plugged after startup page until a restart.
+- The PAM module has no JSON dependency and no panic paths left. It runs
+  inside sshd under `panic = "abort"`, so a panic there would kill the login.
+  Its docs show the absolute module path (a bare name never loads).
+- A corrupt BTF blob can't panic the daemon, and `dpkg-query` isn't asked
+  about file names that would act as globs.
+- One SSH login, one alert: root logging in from a never-seen source fired
+  both the root-policy finding and the new-source finding, which meant two
+  Telegram messages for one event. The sharper finding is kept; ties keep
+  the root-policy alert.
+
+### Changed
+
+- Login alerts name the SSH auth method when the log has it: `(key)` or
+  `(password)` after "authenticated" (keyboard-interactive counts as
+  password). Nothing is claimed when the method is unknown.
+- Alert copy says what was seen instead of what it might mean: an SSH login
+  from a new source is no longer called "unusual timing", and "assume the
+  host is compromised" reads "potentially" where the evidence is a change,
+  not an intrusion.
+- Releases need green CI: the release workflow checks the five required
+  checks on the tagged commit before building. Release builds also run
+  clippy and the full test suite on both amd64 and arm64.
+- The eBPF build is pinned to `nightly-2026-09-17` (with bpf-linker
+  v0.11.1, it reproduces the vendored object exactly), so a new nightly can't
+  break the byte-for-byte check.
+- New CI jobs: `cargo deny` (advisories, yanked crates, licenses, sources)
+  and an MSRV check. `rust-version = "1.91"` is declared; the docs' old 1.79
+  claim didn't build. A yanked `yoke-derive` was updated.
+- Checkouts don't keep credentials; `make deb` uses cargo-deb like the
+  release (it called `dpkg-buildpackage` with no `debian/` dir), and the
+  Makefile picks the host arch.
+- Expect a HIGH "HERMIAN is stopping" notice on every stop, including
+  package upgrades.
+- User management run from cron or a plain service (not a session, package
+  or config manager) is now reported when it rewrites `/etc/shadow`.
+- Email with `smtp_security = "none"` and a username now fails (with a clear
+  error in `status`) unless the SMTP host is loopback.
+
+### Removed
+
+- Off-hours weighting for SSH logins. Administrators log in whenever they
+  need to; timing alone isn't evidence. Old `ssh.off_hours_start/end` keys
+  still parse but do nothing.
+
+### Upgrade
+
+- If you send email through a remote SMTP server with `smtp_security =
+  "none"` and credentials, switch to `"starttls"` or `"tls"`.
+- To use the Telegram buttons, set `actions = true` and `allowed_user_ids`,
+  then run `sudo hermian enable` once (it grants the capabilities).
+- Stored alerts older than 90 days are deleted within an hour of upgrading.
+  To keep them, set `general.alert_retention_days = 0` (or back up
+  `/var/lib/hermian/alerts/`) first.
+
 ## 0.1.0-beta.5 - 2026-09-23
 
 Fixes from the first full run on a real host (Ubuntu 22.04, kernel 6.8): the

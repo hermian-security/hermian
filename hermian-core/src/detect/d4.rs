@@ -1,14 +1,13 @@
 //! D4 - Privilege escalation indicators.
 
 use crate::alert::Finding;
-use crate::detect::{writer_label, Ctx};
+use crate::detect::{content_tag, writer_label, Ctx};
 use crate::events::{
     is_container_overlay_path, is_editor_artifact, DetectionId, ExecEvent, FileEvent, FileKind,
     PtraceEvent, Severity,
 };
 use crate::proctree::{is_container_runtime, is_system_tool, is_user_mgmt_tool, role_of, Role};
 
-const PTRACE_TRACEME: u64 = 0;
 const PTRACE_ATTACH: u64 = 16;
 const PTRACE_SEIZE: u64 = 0x4206;
 
@@ -18,15 +17,17 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
     if ev.request != PTRACE_ATTACH && ev.request != PTRACE_SEIZE {
         return Vec::new();
     }
-    if ev.request == PTRACE_TRACEME || ev.target_pid == ev.pid {
+    if ev.target_pid == ev.pid {
         return Vec::new();
     }
     // The exe comes from the tree: a binary merely named gdb isn't a debugger.
+    // With no exe at all (a forked child we never saw exec), the name alone
+    // would be trusted, and `prctl(PR_SET_NAME, "gdb")` costs nothing, so
+    // only a known exe can earn the exemption.
     let exe = ctx.tree.get(ev.pid).map(|p| p.exe.as_str()).unwrap_or("");
-    if role_of(&ev.comm, exe) == Role::Debugger
-        || is_container_runtime(&ev.comm, exe)
-        || ctx.allowlist.debugger_allowed(&ev.comm)
-    {
+    let trusted_tool = !exe.is_empty()
+        && (role_of(&ev.comm, exe) == Role::Debugger || is_container_runtime(&ev.comm, exe));
+    if trusted_tool || ctx.allowlist.debugger_allowed(&ev.comm) {
         return Vec::new();
     }
     // A parent tracing its own child (test harnesses, sandboxes, language runtimes).
@@ -75,6 +76,17 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
     ])]
 }
 
+/// Build drivers that set LD_PRELOAD for their children (fakeroot, sanitizer
+/// and test harnesses).
+const BUILD_TOOLS: &[&str] = &[
+    "make",
+    "cargo",
+    "cmake",
+    "ninja",
+    "fakeroot",
+    "dpkg-buildpackage",
+];
+
 pub fn evaluate_exec(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     if !ev.ld_preload {
         return Vec::new();
@@ -86,12 +98,10 @@ pub fn evaluate_exec(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     // (jemalloc, ASan, fakeroot, libeatmydata...). Escalate only when unattended.
     let interactive = ctx.tree.has_interactive_session(ev.pid, ev.tty_nr);
     let chain = ctx.tree.chain_of(ev.pid);
-    let from_build_tool = chain.iter().any(|p| {
-        matches!(
-            p.comm.as_str(),
-            "make" | "cargo" | "cmake" | "ninja" | "fakeroot" | "dpkg-buildpackage"
-        )
-    });
+    // By installed exe, not by name: anything can call itself `make`.
+    let from_build_tool = chain
+        .iter()
+        .any(|p| is_system_tool(&p.comm, &p.exe, BUILD_TOOLS) && !p.exe.is_empty());
     if interactive || from_build_tool {
         return vec![Finding::new(
             DetectionId::D4,
@@ -160,10 +170,18 @@ fn suid_in_transient(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !ev.is_suid || !is_user_owned_location(&ev.path) {
         return None;
     }
+    // Vendor software installs setuid helpers under /opt (Chrome's
+    // chrome-sandbox): still worth a page, but not a CRITICAL that can
+    // auto-isolate the host.
+    let severity = if ev.path.starts_with("/opt/") {
+        Severity::High
+    } else {
+        Severity::Critical
+    };
     Some(
         Finding::new(
             DetectionId::D4,
-            Severity::Critical,
+            severity,
             "setuid binary created outside system directories",
             &format!("d4|suid|{}", ev.path),
         )
@@ -187,7 +205,7 @@ fn suid_in_transient(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         .actions([
             "Remove the setuid bit or delete the file immediately.",
             "Identify the process and user that created it.",
-            "Assume the creating account is compromised and audit it.",
+            "Treat the creating account as suspect and audit it.",
         ]),
     )
 }
@@ -242,7 +260,7 @@ fn sudoers(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     } else if ctx
         .tree
         .recent_process(ctx.now, chrono::Duration::seconds(8), |p| {
-            is_system_tool(&p.comm, &p.exe, &["visudo"]) && ctx.tool_exemption_applies(p.pid)
+            is_system_tool(&p.comm, &p.exe, &["visudo"]) && recent_tool_counts(p, ctx)
         })
         .is_some()
     {
@@ -277,7 +295,11 @@ fn sudoers(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
             } else {
                 "sudoers modified outside visudo"
             },
-            &format!("d4|sudoers|{}", ev.path),
+            &format!(
+                "d4|sudoers|{}|{}",
+                ev.path,
+                content_tag(ev.content.as_deref().unwrap_or(""))
+            ),
         )
         .what(format!(
             "{} was {} by {}, not by visudo{}.",
@@ -313,6 +335,19 @@ fn is_installer_chain(pid: u32, ctx: &Ctx) -> bool {
     })
 }
 
+/// Whether a tool seen running recently may stand in for a writer we
+/// couldn't identify.
+///
+/// Running the real tool proves nothing about who wrote the file:
+/// `visudo -c` or `passwd -S root` and then a direct write to sudoers or
+/// shadow used to pass as the tool's own write. So the tool also has to have
+/// been started by an operator at a session or by a package/config manager,
+/// not by cron, a service or some other unattended process.
+fn recent_tool_counts(p: &crate::events::ProcInfo, ctx: &Ctx) -> bool {
+    ctx.tool_exemption_applies(p.pid)
+        && (ctx.tree.has_interactive_session(p.pid, p.tty_nr) || is_installer_chain(p.pid, ctx))
+}
+
 /// The standard tools write account files via temp+rename and exit at once,
 /// so the writer is usually gone by the time we look. A user-management tool
 /// (or a package manager) that ran in the last few seconds is the writer.
@@ -324,7 +359,7 @@ fn recent_account_tool(ctx: &Ctx) -> bool {
                     role_of(&p.comm, &p.exe),
                     Role::PackageManager | Role::ConfigManager
                 ))
-                && ctx.tool_exemption_applies(p.pid)
+                && recent_tool_counts(p, ctx)
         })
         .is_some()
 }
@@ -390,4 +425,218 @@ fn account_files(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
             "Identify the process that wrote the file.",
         ]),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::alert::Alert;
+    use crate::baseline::Baseline;
+    use crate::config::Config;
+    use crate::engine::Engine;
+    use crate::events::*;
+    use chrono::{DateTime, Duration, Utc};
+
+    fn engine() -> Engine {
+        let cfg = Config::default();
+        let allow = cfg.allowlist.clone();
+        Engine::new(cfg, allow, Baseline::new(false, 24, Utc::now()), "t".into())
+    }
+
+    fn exec(t: DateTime<Utc>, pid: u32, ppid: u32, comm: &str, exe: &str) -> ExecEvent {
+        ExecEvent {
+            ts: t,
+            pid,
+            ppid,
+            uid: 0,
+            gid: 0,
+            comm: comm.into(),
+            exe: exe.into(),
+            argv0: exe.into(),
+            ld_preload: false,
+            deleted_exe: false,
+            tty_nr: 0,
+            container: false,
+            container_id: None,
+        }
+    }
+
+    fn file(t: DateTime<Utc>, path: &str, content: Option<&str>) -> Event {
+        Event::File(FileEvent {
+            ts: t,
+            path: path.into(),
+            kind: FileKind::MovedTo,
+            dev: 0,
+            ino: 0,
+            writer: None,
+            session_present: false,
+            is_suid: false,
+            has_file_caps: false,
+            content: content.map(str::to_string),
+            container: false,
+            managed_by_package: None,
+        })
+    }
+
+    fn d4_at_least(a: &[Alert], s: Severity) -> bool {
+        a.iter()
+            .any(|a| a.detection == DetectionId::D4 && a.severity >= s)
+    }
+
+    fn base(eng: &mut Engine, t: DateTime<Utc>) {
+        eng.process(Event::Exec(exec(
+            t,
+            1,
+            0,
+            "systemd",
+            "/usr/lib/systemd/systemd",
+        )));
+        eng.process(Event::Exec(exec(t, 400, 1, "cron", "/usr/sbin/cron")));
+        eng.process(Event::Exec(exec(t, 401, 400, "sh", "/usr/bin/dash")));
+    }
+
+    #[test]
+    fn ld_preload_under_a_fake_build_tool_is_high() {
+        let mut eng = engine();
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(Event::Exec(exec(t, 402, 401, "make", "/tmp/make")));
+        let mut ev = exec(t, 403, 402, "sshd", "/usr/sbin/sshd");
+        ev.ld_preload = true;
+        let a = eng.process(Event::Exec(ev));
+        assert!(d4_at_least(&a, Severity::High), "{:?}", a);
+    }
+
+    #[test]
+    fn ld_preload_under_real_make_is_info() {
+        let mut eng = engine();
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(Event::Exec(exec(t, 402, 401, "make", "/usr/bin/make")));
+        let mut ev = exec(t, 403, 402, "cc", "/usr/bin/cc");
+        ev.ld_preload = true;
+        let a = eng.process(Event::Exec(ev));
+        assert!(!d4_at_least(&a, Severity::Low), "{:?}", a);
+    }
+
+    #[test]
+    fn unattended_visudo_check_does_not_excuse_a_sudoers_write() {
+        let mut eng = engine();
+        let t = Utc::now();
+        base(&mut eng, t);
+        // `visudo -c` from a cron job, then a direct write.
+        eng.process(Event::Exec(exec(t, 402, 401, "visudo", "/usr/sbin/visudo")));
+        let a = eng.process(file(
+            t + Duration::seconds(1),
+            "/etc/sudoers.d/90-x",
+            Some("eve ALL=(ALL) NOPASSWD: ALL\n"),
+        ));
+        assert!(d4_at_least(&a, Severity::Critical), "{:?}", a);
+    }
+
+    #[test]
+    fn unattended_passwd_status_does_not_excuse_a_shadow_write() {
+        let mut eng = engine();
+        let t = Utc::now();
+        base(&mut eng, t);
+        eng.process(Event::Exec(exec(t, 402, 401, "passwd", "/usr/bin/passwd")));
+        let a = eng.process(file(t + Duration::seconds(1), "/etc/shadow", None));
+        assert!(d4_at_least(&a, Severity::Critical), "{:?}", a);
+    }
+
+    #[test]
+    fn a_second_different_sudoers_change_is_not_deduplicated() {
+        let mut eng = engine();
+        let t = Utc::now();
+        base(&mut eng, t);
+        let first = eng.process(file(t, "/etc/sudoers.d/90-x", Some("eve ALL=(ALL) ALL\n")));
+        assert!(d4_at_least(&first, Severity::High), "{:?}", first);
+        let second = eng.process(file(
+            t + Duration::seconds(30),
+            "/etc/sudoers.d/90-x",
+            Some("eve ALL=(ALL) ALL\nmallory ALL=(ALL) ALL\n"),
+        ));
+        assert!(d4_at_least(&second, Severity::High), "{:?}", second);
+        // The identical content again is.
+        let again = eng.process(file(
+            t + Duration::seconds(40),
+            "/etc/sudoers.d/90-x",
+            Some("eve ALL=(ALL) ALL\nmallory ALL=(ALL) ALL\n"),
+        ));
+        assert!(!d4_at_least(&again, Severity::High), "{:?}", again);
+    }
+
+    #[test]
+    fn operator_visudo_still_excuses_its_write() {
+        let mut eng = engine();
+        let t = Utc::now();
+        eng.process(Event::Exec(exec(
+            t,
+            1,
+            0,
+            "systemd",
+            "/usr/lib/systemd/systemd",
+        )));
+        eng.process(Event::Exec(exec(t, 50, 1, "sshd", "/usr/sbin/sshd")));
+        let mut sh = exec(t, 60, 50, "bash", "/usr/bin/bash");
+        sh.tty_nr = 34816;
+        eng.process(Event::Exec(sh));
+        let mut v = exec(t, 61, 60, "visudo", "/usr/sbin/visudo");
+        v.tty_nr = 34816;
+        eng.process(Event::Exec(v));
+        let a = eng.process(file(
+            t + Duration::seconds(1),
+            "/etc/sudoers.d/90-x",
+            Some("dev ALL=(ALL) ALL\n"),
+        ));
+        assert!(a.iter().all(|a| a.detection != DetectionId::D4), "{:?}", a);
+    }
+
+    #[test]
+    fn web_shell_with_a_pty_is_not_an_operator() {
+        let mut eng = engine();
+        let t = Utc::now();
+        eng.process(Event::Exec(exec(
+            t,
+            1,
+            0,
+            "systemd",
+            "/usr/lib/systemd/systemd",
+        )));
+        eng.process(Event::Exec(exec(t, 100, 1, "nginx", "/usr/sbin/nginx")));
+        eng.process(Event::Exec(exec(
+            t,
+            200,
+            100,
+            "python3",
+            "/usr/bin/python3",
+        )));
+        let mut sh = exec(t, 201, 200, "bash", "/usr/bin/bash");
+        sh.tty_nr = 34817;
+        sh.ld_preload = true;
+        let a = eng.process(Event::Exec(sh));
+        assert!(d4_at_least(&a, Severity::High), "{:?}", a);
+    }
+
+    #[test]
+    fn unseen_process_named_gdb_is_not_a_debugger() {
+        let mut eng = engine();
+        let t = Utc::now();
+        eng.process(Event::Exec(exec(
+            t,
+            1,
+            0,
+            "systemd",
+            "/usr/lib/systemd/systemd",
+        )));
+        // A forked child we never saw exec: no exe in the tree.
+        let a = eng.process(Event::Ptrace(PtraceEvent {
+            ts: t,
+            pid: 777,
+            uid: 1000,
+            comm: "gdb".into(),
+            target_pid: 1,
+            request: 16,
+        }));
+        assert!(d4_at_least(&a, Severity::High), "{:?}", a);
+    }
 }

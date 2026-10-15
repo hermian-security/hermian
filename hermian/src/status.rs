@@ -32,6 +32,9 @@ pub struct StatusState {
     pub watches_active: usize,
     pub watches_failed: usize,
     pub watch_error: String,
+    /// Age of the dead-man switch's heartbeat file, if it exists.
+    #[serde(default)]
+    pub heartbeat_age_secs: Option<u64>,
     pub channels: Vec<String>,
     pub min_severity: String,
     pub last_delivery: Option<DateTime<Utc>>,
@@ -40,6 +43,14 @@ pub struct StatusState {
     pub pending_notifications: usize,
     pub last_notify_error: String,
     pub delivered_per_channel: BTreeMap<String, u64>,
+    /// Alerts a notifying channel gave up on, by channel.
+    pub dropped_per_channel: BTreeMap<String, u64>,
+    /// Telemetry lost since start, by source (eBPF ring, inotify, audit).
+    pub events_dropped: BTreeMap<String, u64>,
+    /// Telegram response buttons: "off", or "on (N users)".
+    pub telegram_actions: String,
+    /// Last problem fetching button presses (empty when fine).
+    pub telegram_poll_error: String,
     pub config_hash: String,
     pub binary_hash: String,
     pub integrity_ok: bool,
@@ -68,6 +79,7 @@ impl Default for StatusState {
             watches_active: 0,
             watches_failed: 0,
             watch_error: String::new(),
+            heartbeat_age_secs: None,
             channels: Vec::new(),
             min_severity: String::new(),
             last_delivery: None,
@@ -76,6 +88,10 @@ impl Default for StatusState {
             pending_notifications: 0,
             last_notify_error: String::new(),
             delivered_per_channel: BTreeMap::new(),
+            dropped_per_channel: BTreeMap::new(),
+            events_dropped: BTreeMap::new(),
+            telegram_actions: String::new(),
+            telegram_poll_error: String::new(),
             config_hash: String::new(),
             binary_hash: String::new(),
             integrity_ok: true,
@@ -124,7 +140,12 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
             .unwrap_or(false)
     {
         st.bad("DEGRADED: FILE WATCHERS DOWN")
-    } else if state.failures > 0 || state.pending_notifications > 0 || state.watches_failed > 0 {
+    } else if state.failures > 0
+        || state.pending_notifications > 0
+        || state.watches_failed > 0
+        || !state.events_dropped.is_empty()
+        || !state.dropped_per_channel.is_empty()
+    {
         st.warn("DEGRADED")
     } else {
         st.ok("PROTECTED")
@@ -161,6 +182,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
         None => st.dim(&state.baseline_state),
     };
     out.push_str(&st.row("Baseline", &baseline));
+    out.push('\n');
+    let heartbeat = match state.heartbeat_age_secs {
+        Some(s) if s <= crate::heartbeat::STALE.as_secs() => st.dim(&format!("{}s ago", s)),
+        Some(s) => st.warn(&format!("{}m {:02}s stale", s / 60, s % 60)),
+        None => st.dim("n/a"),
+    };
+    out.push_str(&st.row("Heartbeat", &heartbeat));
     out.push_str("\n\n");
 
     out.push_str(&st.heading("Today"));
@@ -203,6 +231,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     };
     out.push_str(&st.row("File watches", &watches));
     out.push('\n');
+    if !state.events_dropped.is_empty() {
+        out.push_str(&st.row(
+            "Events dropped",
+            &st.warn(&join_counts(&state.events_dropped)),
+        ));
+        out.push('\n');
+    }
     out.push_str(&st.row(
         "Overhead",
         &format!(
@@ -236,6 +271,25 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
             .map(|(k, v)| format!("{} {}", k, v))
             .collect();
         out.push_str(&st.row("Delivered", &st.dim(&parts.join(" \u{00B7} "))));
+        out.push('\n');
+    }
+    if !state.telegram_actions.is_empty() && state.telegram_actions != "off" {
+        let v = if state.telegram_poll_error.is_empty() {
+            state.telegram_actions.clone()
+        } else {
+            st.warn(&format!(
+                "{}, not receiving presses: {}",
+                state.telegram_actions, state.telegram_poll_error
+            ))
+        };
+        out.push_str(&st.row("Buttons", &v));
+        out.push('\n');
+    }
+    if !state.dropped_per_channel.is_empty() {
+        out.push_str(&st.row(
+            "Dropped",
+            &st.warn(&join_counts(&state.dropped_per_channel)),
+        ));
         out.push('\n');
     }
     if state.pending_notifications > 0 {
@@ -274,6 +328,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     out
 }
 
+fn join_counts(m: &BTreeMap<String, u64>) -> String {
+    m.iter()
+        .map(|(k, v)| format!("{} {}", k, v))
+        .collect::<Vec<_>>()
+        .join(" \u{00B7} ")
+}
+
 fn short_hash(h: &str) -> String {
     if h.len() >= 16 {
         format!("sha256:{}\u{2026}{}", &h[..8], &h[h.len() - 8..])
@@ -292,8 +353,9 @@ pub fn state_unreadable() -> bool {
     )
 }
 
-/// `systemctl is-active hermian`, which needs no privileges.
-fn unit_state() -> String {
+/// `systemctl is-active hermian`, which needs no privileges. Also used by
+/// the watchdog to judge the unit state.
+pub(crate) fn unit_state() -> String {
     std::process::Command::new("systemctl")
         .args(["is-active", "hermian"])
         .output()

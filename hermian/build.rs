@@ -3,8 +3,12 @@
 //!
 //! Two build strategies are attempted in order:
 //!
-//! 1. A stable toolchain with the `bpfel-unknown-none` target installed.
-//! 2. A nightly toolchain with `rust-src`, using `-Zbuild-std=core`.
+//! 1. A toolchain that already has a `bpfel-unknown-none` std (rare: it's a
+//!    tier-3 target, so rustup can't install one).
+//! 2. A nightly toolchain with `rust-src`, using `-Zbuild-std=core`. The
+//!    toolchain name comes from `HERMIAN_EBPF_NIGHTLY` (default `nightly`);
+//!    CI pins a dated one, since the vendored object is compared byte for
+//!    byte and any codegen change in a newer nightly would fail that check.
 //!
 //! Both require `bpf-linker` on PATH.
 
@@ -25,16 +29,31 @@ fn toolchain_has_target() -> bool {
         .unwrap_or(false)
 }
 
+/// The nightly toolchain used for the BPF build.
+fn nightly() -> String {
+    env::var("HERMIAN_EBPF_NIGHTLY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "nightly".to_string())
+}
+
 fn nightly_available() -> bool {
+    let want = nightly();
     rustup(&["toolchain", "list"])
-        .map(|s| s.lines().any(|l| l.trim_start().starts_with("nightly")))
+        .map(|s| s.lines().any(|l| l.trim_start().starts_with(&want)))
         .unwrap_or(false)
 }
 
 fn nightly_has_rust_src() -> bool {
-    rustup(&["component", "list", "--installed", "--toolchain", "nightly"])
-        .map(|s| s.lines().any(|l| l.trim().starts_with("rust-src")))
-        .unwrap_or(false)
+    rustup(&[
+        "component",
+        "list",
+        "--installed",
+        "--toolchain",
+        &nightly(),
+    ])
+    .map(|s| s.lines().any(|l| l.trim().starts_with("rust-src")))
+    .unwrap_or(false)
 }
 
 fn bpf_linker_available() -> bool {
@@ -116,10 +135,11 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, BuildError> {
             attempts.push("nightly present but missing rust-src component".into());
         } else {
             ran = true;
+            let toolchain = format!("+{}", nightly());
             let status = clean_cargo()
                 .current_dir(ebpf_dir)
                 .args([
-                    "+nightly",
+                    toolchain.as_str(),
                     "build",
                     "--release",
                     "-Zbuild-std=core",
@@ -134,7 +154,7 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, BuildError> {
             if status.success() && artifact.exists() {
                 return Ok(artifact);
             }
-            attempts.push("nightly + -Zbuild-std=core".into());
+            attempts.push(format!("{} + -Zbuild-std=core", nightly()));
         }
     }
 
@@ -229,13 +249,16 @@ fn main() {
         Err(BuildError::Failed(why) | BuildError::NoToolchain(why)) => panic!(
             "\n\nhermian-ebpf build failed ({why}) and no vendored object was found.\n\
              One of the following is required on the build host:\n  \
-             a) rustup target add bpfel-unknown-none && cargo install bpf-linker\n  \
-             b) rustup toolchain install nightly --component rust-src && cargo install bpf-linker\n  \
-             c) HERMIAN_EBPF_PREBUILT=/path/to/hermian-ebpf.o\n"
+             a) rustup toolchain install nightly --component rust-src, plus bpf-linker\n     \
+                (set HERMIAN_EBPF_NIGHTLY to use a specific dated nightly)\n  \
+             b) HERMIAN_EBPF_PREBUILT=/path/to/hermian-ebpf.o\n"
         ),
     };
 
     println!("cargo:rustc-env=HERMIAN_EBPF_OBJECT={}", obj_path.display());
     println!("cargo:rerun-if-changed=../hermian-ebpf/src/main.rs");
     println!("cargo:rerun-if-changed=../hermian-ebpf/Cargo.toml");
+    // An aya-ebpf bump changes the object too.
+    println!("cargo:rerun-if-changed=../Cargo.lock");
+    println!("cargo:rerun-if-env-changed=HERMIAN_EBPF_NIGHTLY");
 }

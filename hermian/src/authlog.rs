@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use hermian_core::{AuthEvent, AuthResult, Event};
+use hermian_core::{AuthEvent, AuthMethod, AuthResult, Event};
 use tokio::sync::mpsc;
 
 const AUTH_LOG_CANDIDATES: &[&str] = &["/var/log/auth.log", "/var/log/secure"];
@@ -82,13 +82,35 @@ fn open_log() -> Option<(BufReader<File>, &'static str)> {
     })
 }
 
+/// Whether the log at `path` is no longer the file we have open: replaced
+/// (a new inode, the usual logrotate `create` mode) or truncated in place
+/// (`copytruncate`).
+fn rotated(path: &str, open_ino: u64, pos: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(m) => m.ino() != open_ino || m.len() < pos,
+        // Gone for now (between rename and create): keep the old one.
+        Err(_) => false,
+    }
+}
+
 fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
+    use std::os::unix::fs::MetadataExt;
+    // Only the very first open starts at the end (history isn't news). After
+    // a rotation the new file is read from the start: seeking to its end
+    // dropped whatever sshd logged between the rotation and our noticing.
+    let mut from_start = false;
     while !shutdown.load(Ordering::Relaxed) {
         let Some((mut reader, path)) = open_log() else {
             std::thread::sleep(Duration::from_secs(30));
+            from_start = true;
             continue;
         };
-        let _ = reader.seek(SeekFrom::End(0));
+        let open_ino = reader.get_ref().metadata().map(|m| m.ino()).unwrap_or(0);
+        if !from_start {
+            let _ = reader.seek(SeekFrom::End(0));
+        }
+        from_start = true;
         let mut line = String::new();
         let mut idle_polls = 0u32;
         loop {
@@ -100,13 +122,12 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                 Ok(0) => {
                     std::thread::sleep(Duration::from_millis(500));
                     idle_polls += 1;
-                    // Detect rotation (file replaced or truncated) every ~10s.
-                    if idle_polls >= 20 {
+                    // Check for rotation every ~2s, only once the old file is
+                    // drained (we're at its EOF), so nothing in it is skipped.
+                    if idle_polls >= 4 {
                         idle_polls = 0;
-                        let rotated = std::fs::metadata(path)
-                            .map(|m| m.len() < reader.stream_position().unwrap_or(0))
-                            .unwrap_or(true);
-                        if rotated {
+                        let pos = reader.stream_position().unwrap_or(0);
+                        if rotated(path, open_ino, pos) {
                             break;
                         }
                     }
@@ -233,6 +254,7 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
     if lower.starts_with("accepted ") {
         // Accepted publickey for alice from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:...
         let user = word_after(msg, " for ")?;
+        let method = AuthMethod::from_ssh_word(msg.split_whitespace().nth(1).unwrap_or(""));
         return Some(AuthEvent {
             ts,
             result: AuthResult::Success,
@@ -240,6 +262,8 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method,
+            port: extract_port(msg),
         });
     }
     let failure = lower.starts_with("failed ")
@@ -262,6 +286,8 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
+            port: extract_port(msg),
         });
     }
     None
@@ -297,6 +323,20 @@ fn word_after(msg: &str, pattern: &str) -> Option<String> {
     Some(word)
 }
 
+/// The client port from "... from <ip> port <n> ...", taken after the last
+/// " from " for the same reason as [`extract_rhost`].
+fn extract_port(msg: &str) -> Option<u16> {
+    let from = msg.rfind(" from ")?;
+    let after = &msg[from + 6..];
+    let p = after.find(" port ")?;
+    after[p + 6..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 fn extract_rhost(msg: &str) -> Option<IpAddr> {
     // sshd puts "from <ip> port <n>" after the (client-chosen) username, so
     // take the last one: a username like "a from 203.0.113.1" can't reframe
@@ -314,15 +354,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotation_is_seen_by_inode_or_truncation() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("hermian-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("auth.log");
+        let p = log.to_str().unwrap();
+        std::fs::write(&log, "line one\nline two\n").unwrap();
+        let ino = std::fs::metadata(&log).unwrap().ino();
+        assert!(!rotated(p, ino, 18));
+        // copytruncate
+        std::fs::write(&log, "").unwrap();
+        assert!(rotated(p, ino, 18));
+        // create: renamed away, new file in its place
+        std::fs::write(&log, "x\n").unwrap();
+        let ino = std::fs::metadata(&log).unwrap().ino();
+        std::fs::rename(&log, dir.join("auth.log.1")).unwrap();
+        assert!(!rotated(p, ino, 2), "missing file isn't a rotation yet");
+        std::fs::write(&log, "new\n").unwrap();
+        assert!(rotated(p, ino, 2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn accepted_and_failed_lines() {
         let a = parse_line("2024-01-15T10:20:30+0000 web sshd[1234]: Accepted publickey for alice from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:abc").unwrap();
         assert_eq!(a.result, AuthResult::Success);
         assert_eq!(a.user, "alice");
         assert_eq!(a.rhost, Some("10.0.0.5".parse().unwrap()));
+        assert_eq!(a.port, Some(51234));
+        assert_eq!(a.method, AuthMethod::PublicKey);
         assert_eq!(
             a.ts.format("%Y-%m-%dT%H:%M").to_string(),
             "2024-01-15T10:20"
         );
+
+        let p = parse_line(
+            "Jan 15 10:20:30 web sshd[1234]: Accepted password for bob from 10.0.0.6 port 2 ssh2",
+        )
+        .unwrap();
+        assert_eq!(p.method, AuthMethod::Password);
+        assert_eq!(p.method.note(), " (password)");
 
         let f = parse_line("Jan 15 10:20:30 web sshd[1234]: Failed password for root from 198.51.100.7 port 4 ssh2").unwrap();
         assert_eq!(f.result, AuthResult::Failure);
@@ -357,6 +430,10 @@ mod tests {
                     a from 203.0.113.1 from 198.51.100.7 port 4 ssh2";
         let ev = parse_line(line).unwrap();
         assert_eq!(ev.rhost, Some("198.51.100.7".parse().unwrap()));
+        // Same for the port: a username can't put a fake one in front.
+        let line = "Jan 15 10:20:30 web sshd[1234]: Failed password for invalid user \
+                    a port 1 from 198.51.100.7 port 4242 ssh2";
+        assert_eq!(parse_line(line).unwrap().port, Some(4242));
     }
 
     #[test]

@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -45,9 +46,13 @@ pub struct NotifyState {
 }
 
 pub struct Notifier {
-    tx: mpsc::UnboundedSender<Msg>,
+    tx: mpsc::Sender<Msg>,
     pub state: Arc<Mutex<NotifyState>>,
 }
+
+/// Alerts waiting to be persisted and fanned out. Bounded: if persistence
+/// stalls (a hung disk) during an alert flood, memory mustn't grow forever.
+const NOTIFIER_QUEUE: usize = 8192;
 
 enum Msg {
     Alert(Alert),
@@ -88,7 +93,7 @@ pub fn syslog_msg(severity: Severity, text: &str) -> bool {
 
 impl Notifier {
     pub fn spawn(cfg: NotificationsCfg, initial: NotifyState) -> Notifier {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(NOTIFIER_QUEUE);
         let state = Arc::new(Mutex::new(initial));
         let worker_state = state.clone();
         tokio::spawn(async move {
@@ -98,15 +103,56 @@ impl Notifier {
     }
 
     pub fn send(&self, alert: Alert) {
-        let _ = self.tx.send(Msg::Alert(alert));
+        if let Err(mpsc::error::TrySendError::Full(Msg::Alert(a))) =
+            self.tx.try_send(Msg::Alert(alert))
+        {
+            // Still logged locally, so the alert isn't lost outright.
+            syslog_msg(
+                a.severity,
+                &format!("hermian: alert queue full, not persisted: {}", a.headline()),
+            );
+            if let Ok(mut s) = self.state.lock() {
+                *s.dropped_by_channel.entry("queue".to_string()).or_default() += 1;
+            }
+        }
     }
 
     pub fn reconfigure(&self, cfg: NotificationsCfg) {
-        let _ = self.tx.send(Msg::Reconfigure(cfg));
+        // In order with alerts when there's room (the reload notice must go
+        // to the new channels); config changes are rare and must not be lost,
+        // so wait for room otherwise.
+        if let Err(mpsc::error::TrySendError::Full(m)) = self.tx.try_send(Msg::Reconfigure(cfg)) {
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(m).await;
+            });
+        }
     }
 
     pub fn snapshot(&self) -> NotifyState {
         self.state.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    /// Wait until `ref_id` has reached at least one notifying channel (or
+    /// was persisted locally, if it's below `min_severity` or no channel is
+    /// set up), up to `timeout`. Returns whether it got there.
+    pub async fn wait_delivered(&self, ref_id: &str, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let prefix = format!("{} ", ref_id);
+        loop {
+            let done = self
+                .state
+                .lock()
+                .map(|s| s.last_delivery_note.starts_with(&prefix))
+                .unwrap_or(false);
+            if done {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 
@@ -168,7 +214,7 @@ enum ChanMsg {
 /// Each channel runs as its own task with its own queue and backoff, so a
 /// broken or slow channel never delays the others (or local persistence).
 async fn worker(
-    mut rx: mpsc::UnboundedReceiver<Msg>,
+    mut rx: mpsc::Receiver<Msg>,
     mut cfg: NotificationsCfg,
     state: Arc<Mutex<NotifyState>>,
 ) {
@@ -177,8 +223,13 @@ async fn worker(
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Alert(alert) => {
-                let rendered_plain = hermian_core::render(&alert, Theme::Plain);
-                persist(&alert, &rendered_plain, &cfg);
+                // fsync'd file writes and syslog: off the async workers.
+                let (a, c) = (alert.clone(), cfg.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    let rendered_plain = hermian_core::render(&a, Theme::Plain);
+                    persist(&a, &rendered_plain, &c);
+                })
+                .await;
                 if alert.severity >= cfg.min_severity() && !channels.is_empty() {
                     for tx in channels.values() {
                         let _ = tx.send(ChanMsg::Alert(Box::new(alert.clone())));
@@ -223,9 +274,19 @@ fn sync_channels(
     }
 }
 
+/// One alert waiting for a channel, with its on-disk copy. The copy makes
+/// delivery survive a daemon restart (at-least-once: a crash mid-send can
+/// duplicate an alert, never lose one).
+struct Pending {
+    alert: Alert,
+    file: Option<PathBuf>,
+}
+
 struct ChannelQueue {
     name: &'static str,
-    queue: VecDeque<Alert>,
+    queue: VecDeque<Pending>,
+    /// Where queued alerts are persisted; `None` disables the disk copy.
+    pending_dir: Option<PathBuf>,
     cfg: NotificationsCfg,
     backoff: Duration,
     failing_since: Option<DateTime<Utc>>,
@@ -235,6 +296,53 @@ struct ChannelQueue {
 }
 
 impl ChannelQueue {
+    /// Persist `alert` so it survives a restart, returning the file to
+    /// delete on delivery. Best-effort: without it, delivery still works
+    /// but a crash loses the alert.
+    fn save(&self, alert: &Alert) -> Option<PathBuf> {
+        let dir = self.pending_dir.as_ref()?;
+        let result = (|| -> anyhow::Result<PathBuf> {
+            fs::create_dir_all(dir)?;
+            let text = serde_json::to_string_pretty(alert)?;
+            let mut path = dir.join(format!(
+                "{}-{}.json",
+                alert.ts.timestamp_millis(),
+                alert.ref_id
+            ));
+            let mut n = 1;
+            while path.exists() && n < 1000 {
+                path = dir.join(format!(
+                    "{}-{}.{}.json",
+                    alert.ts.timestamp_millis(),
+                    alert.ref_id,
+                    n
+                ));
+                n += 1;
+            }
+            config::write_secure(&path, &text)?;
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => Some(path),
+            Err(e) => {
+                syslog_msg(
+                    Severity::High,
+                    &format!(
+                        "hermian: {} could not persist queued alert {}: {:#}",
+                        self.name, alert.ref_id, e
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    fn forget(file: &Option<PathBuf>) {
+        if let Some(p) = file {
+            let _ = fs::remove_file(p);
+        }
+    }
+
     /// Make room when the queue is full: drop the oldest alert below
     /// CRITICAL, or the oldest overall if everything queued is CRITICAL.
     fn make_room(&mut self) {
@@ -244,10 +352,11 @@ impl ChannelQueue {
         let victim = self
             .queue
             .iter()
-            .position(|a| a.severity < Severity::Critical)
+            .position(|p| p.alert.severity < Severity::Critical)
             .unwrap_or(0);
-        if let Some(a) = self.queue.remove(victim) {
-            self.note_drop(&a, "queue full");
+        if let Some(p) = self.queue.remove(victim) {
+            Self::forget(&p.file);
+            self.note_drop(&p.alert, "queue full");
         }
     }
 
@@ -268,7 +377,8 @@ impl ChannelQueue {
         match msg {
             Some(ChanMsg::Alert(a)) => {
                 self.make_room();
-                self.queue.push_back(*a);
+                let file = self.save(&a);
+                self.queue.push_back(Pending { alert: *a, file });
                 true
             }
             Some(ChanMsg::Config(c)) => {
@@ -321,13 +431,56 @@ impl ChannelQueue {
 
 type SendFn = fn(&str, &Alert, &NotificationsCfg) -> Result<(), SendError>;
 
+/// Alerts a previous run left on disk, oldest first. Files that don't parse
+/// are removed, not retried forever.
+fn load_pending(dir: &Path) -> VecDeque<Pending> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return VecDeque::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    // Over the cap, the oldest go: they matter least, and the alert store
+    // still has them.
+    while files.len() > MAX_PENDING {
+        let _ = fs::remove_file(files.remove(0));
+    }
+    let mut out = VecDeque::new();
+    for path in files {
+        match fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Alert>(&t).ok())
+        {
+            Some(alert) => out.push_back(Pending {
+                alert,
+                file: Some(path),
+            }),
+            None => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+    out
+}
+
 async fn channel_task(
     name: &'static str,
     rx: mpsc::UnboundedReceiver<ChanMsg>,
     cfg: NotificationsCfg,
     state: Arc<Mutex<NotifyState>>,
 ) {
-    run_channel(name, rx, cfg, state, send_classified).await
+    run_channel(
+        name,
+        rx,
+        cfg,
+        state,
+        Some(paths::pending_dir_channel(name)),
+        send_classified,
+    )
+    .await
 }
 
 async fn run_channel(
@@ -335,11 +488,14 @@ async fn run_channel(
     mut rx: mpsc::UnboundedReceiver<ChanMsg>,
     cfg: NotificationsCfg,
     state: Arc<Mutex<NotifyState>>,
+    pending_dir: Option<PathBuf>,
     send: SendFn,
 ) {
+    let queued = pending_dir.as_deref().map(load_pending).unwrap_or_default();
     let mut q = ChannelQueue {
         name,
-        queue: VecDeque::new(),
+        queue: queued,
+        pending_dir,
         cfg,
         backoff: FIRST_BACKOFF,
         failing_since: None,
@@ -358,12 +514,13 @@ async fn run_channel(
             }
         }
         q.publish(&state);
-        let Some(alert) = q.queue.front().cloned() else {
+        let Some(pending) = q.queue.front() else {
             if !q.take(rx.recv().await) {
                 return;
             }
             continue;
         };
+        let alert = pending.alert.clone();
         let cfg = q.cfg.clone();
         let result = tokio::task::spawn_blocking(move || send(name, &alert, &cfg))
             .await
@@ -371,8 +528,9 @@ async fn run_channel(
             .unwrap_or_else(|e| Err(SendError::transient(format!("send panicked: {}", e))));
         match result {
             Ok(()) => {
-                if let Some(a) = q.queue.pop_front() {
-                    mark_delivered(&state, &a);
+                if let Some(p) = q.queue.pop_front() {
+                    ChannelQueue::forget(&p.file);
+                    mark_delivered(&state, &p.alert);
                 }
                 if let Ok(mut s) = state.lock() {
                     *s.per_channel.entry(name.to_string()).or_default() += 1;
@@ -382,8 +540,9 @@ async fn run_channel(
                 q.alarm_sent = false;
             }
             Err(e) if e.permanent => {
-                if let Some(a) = q.queue.pop_front() {
-                    q.note_drop(&a, &e.msg);
+                if let Some(p) = q.queue.pop_front() {
+                    ChannelQueue::forget(&p.file);
+                    q.note_drop(&p.alert, &e.msg);
                 }
                 q.record_error(&e, &state);
             }
@@ -425,6 +584,22 @@ fn notifying_channels(cfg: &NotificationsCfg) -> Vec<&'static str> {
 /// Deliver one alert to one notifying channel.
 pub fn notify_one(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), String> {
     send_classified(channel, alert, cfg).map_err(|e| e.msg)
+}
+
+/// Record an alert and deliver it to every channel right now, synchronously.
+/// Used by `hermian watchdog`: with the daemon down there is no worker to
+/// hand this to. Returns the channels that failed.
+pub fn store_and_send(alert: &Alert, cfg: &NotificationsCfg) -> Vec<(String, String)> {
+    persist(alert, &hermian_core::render(alert, Theme::Plain), cfg);
+    let mut errors = Vec::new();
+    if alert.severity >= cfg.min_severity() {
+        for channel in notifying_channels(cfg) {
+            if let Err(e) = notify_one(channel, alert, cfg) {
+                errors.push((channel.to_string(), e));
+            }
+        }
+    }
+    errors
 }
 
 fn send_classified(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), SendError> {
@@ -473,12 +648,25 @@ fn append_alert_log(rendered: &str) -> anyhow::Result<()> {
 
 fn save_alert_json(alert: &Alert) {
     let dir = paths::alerts_dir();
-    if fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let path = dir.join(format!("{}.json", alert.ref_id));
-    if let Ok(text) = serde_json::to_string_pretty(alert) {
-        let _ = config::write_secure(&path, &text);
+    let result = (|| -> anyhow::Result<()> {
+        fs::create_dir_all(&dir)?;
+        let text = serde_json::to_string_pretty(alert)?;
+        // Never replace an existing record: if a ref id ever repeats (state
+        // lost, clock trouble), keep both.
+        let mut path = dir.join(format!("{}.json", alert.ref_id));
+        let mut n = 1;
+        while path.exists() && n < 1000 {
+            path = dir.join(format!("{}.{}.json", alert.ref_id, n));
+            n += 1;
+        }
+        config::write_secure(&path, &text)
+    })();
+    if let Err(e) = result {
+        // Was silent; `show`/`collect` would then say the alert doesn't exist.
+        syslog_msg(
+            Severity::High,
+            &format!("hermian: could not store alert {}: {:#}", alert.ref_id, e),
+        );
     }
 }
 
@@ -625,7 +813,33 @@ pub mod webhook {
         if !cfg.token.is_empty() {
             s = s.replace(&cfg.token, "<token>");
         }
-        s
+        // The library may print the URL normalised (host case, escaping), so
+        // the literal replace above can miss it: cut every URL in the text
+        // down to scheme://host as well.
+        strip_url_paths(&s)
+    }
+
+    /// `... https://host/secret/path?q ...` -> `... https://host/… ...`.
+    pub fn strip_url_paths(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("://") {
+            let (before, after) = rest.split_at(i + 3);
+            out.push_str(before);
+            let end = after
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | ','))
+                .unwrap_or(after.len());
+            let url = &after[..end];
+            let authority = url.split(['/', '?', '#']).next().unwrap_or("");
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            out.push_str(host);
+            if url.len() > authority.len() {
+                out.push_str("/…");
+            }
+            rest = &after[end..];
+        }
+        out.push_str(rest);
+        out
     }
 
     pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), SendError> {
@@ -699,16 +913,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn urls_in_error_text_lose_their_secret_parts() {
+        let e = "Network Error: https://Hooks.Slack.com/services/T0/B0/SECRET: connection reset";
+        let s = webhook::strip_url_paths(e);
+        assert!(!s.contains("SECRET"), "{}", s);
+        assert!(s.contains("https://Hooks.Slack.com/…"), "{}", s);
+        let e = "error (http://user:pw@10.0.0.5:8080/h?token=abc) failed";
+        let s = webhook::strip_url_paths(e);
+        assert!(!s.contains("pw") && !s.contains("abc"), "{}", s);
+        assert_eq!(webhook::strip_url_paths("no urls here"), "no urls here");
+    }
+
     fn queue() -> ChannelQueue {
         ChannelQueue {
             name: "webhook",
             queue: VecDeque::new(),
+            pending_dir: None,
             cfg: NotificationsCfg::default(),
             backoff: FIRST_BACKOFF,
             failing_since: None,
             alarm_sent: false,
             dropped: 0,
         }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("hermian-notify-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
     }
 
     #[test]
@@ -725,7 +960,58 @@ mod tests {
         }
         assert_eq!(q.queue.len(), MAX_PENDING);
         assert_eq!(q.dropped, 11);
-        assert_eq!(q.queue.front().unwrap().ref_id, "HER-CRIT");
+        assert_eq!(q.queue.front().unwrap().alert.ref_id, "HER-CRIT");
+    }
+
+    #[test]
+    fn queued_alerts_are_persisted_and_cleaned_up_as_they_leave() {
+        let d = scratch("qdisk");
+        let mut q = queue();
+        q.pending_dir = Some(d.clone());
+        q.take(Some(ChanMsg::Alert(Box::new(with_ref("HER-1")))));
+        q.take(Some(ChanMsg::Alert(Box::new(with_ref("HER-2")))));
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 2);
+        // Overflow: the dropped alert's copy goes with it.
+        for i in 0..MAX_PENDING {
+            let mut a = alert();
+            a.ref_id = format!("HER-CRIT-{}", i);
+            a.severity = Severity::Critical;
+            q.take(Some(ChanMsg::Alert(Box::new(a))));
+        }
+        assert_eq!(fs::read_dir(&d).unwrap().count(), MAX_PENDING);
+        // Delivery removes the copy it was carrying.
+        let delivered = q.queue.pop_front().unwrap();
+        ChannelQueue::forget(&delivered.file);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), MAX_PENDING - 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_alerts_are_delivered_after_a_restart() {
+        let d = scratch("reload");
+        for r in ["HER-1", "HER-2"] {
+            let a = with_ref(r);
+            let name = format!("{}-{}.json", a.ts.timestamp_millis(), a.ref_id);
+            fs::write(d.join(name), serde_json::to_string(&a).unwrap()).unwrap();
+        }
+        // A file that doesn't parse is dropped, not retried forever.
+        fs::write(d.join("junk.json"), "{not json").unwrap();
+        let state = Arc::new(Mutex::new(NotifyState::default()));
+        let (_tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_channel(
+            "email",
+            rx,
+            NotificationsCfg::default(),
+            state.clone(),
+            Some(d.clone()),
+            reject_bad,
+        ));
+        settle().await;
+        let s = state.lock().unwrap().clone();
+        assert_eq!(s.per_channel.get("email"), Some(&2), "{:?}", s);
+        assert_eq!(s.pending, 0);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -777,6 +1063,7 @@ mod tests {
             rx,
             NotificationsCfg::default(),
             state.clone(),
+            None,
             reject_bad,
         ));
         settle().await;
@@ -797,6 +1084,7 @@ mod tests {
             down_rx,
             NotificationsCfg::default(),
             state.clone(),
+            None,
             always_down,
         ));
         tokio::spawn(run_channel(
@@ -804,6 +1092,7 @@ mod tests {
             up_rx,
             NotificationsCfg::default(),
             state.clone(),
+            None,
             reject_bad,
         ));
         for r in ["HER-1", "HER-2"] {
@@ -829,6 +1118,7 @@ mod tests {
             rx,
             NotificationsCfg::default(),
             state.clone(),
+            None,
             panics,
         ));
         settle().await;

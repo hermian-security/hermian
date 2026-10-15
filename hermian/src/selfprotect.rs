@@ -39,6 +39,10 @@ pub struct IntegrityStatus {
     pub config_ok: bool,
     pub binary_hash: String,
     pub config_hash: String,
+    /// The stored hash was missing (first start without `hermian enable`,
+    /// or someone deleted it), so there was nothing to compare against.
+    pub binary_record_missing: bool,
+    pub config_record_missing: bool,
 }
 
 fn read_hash(path: &Path) -> Option<String> {
@@ -57,22 +61,49 @@ pub fn verify_at_startup() -> IntegrityStatus {
     let config_hash = sha256_file(&paths::config_path()).unwrap_or_default();
     let stored_binary = read_hash(&paths::binary_hash_file());
     let stored_config = stored_config_hash();
-    // A missing stored hash means first run (or a legitimate upgrade that has
-    // not re-run `hermian enable`): record it now rather than alarm.
+    // `hermian enable` (and the package) record both hashes before the first
+    // start, so a missing one means someone deleted it, or a tarball upgrade
+    // skipped `enable`. Deleting binary.sha256 and swapping the binary used to
+    // pass silently: record the current value, but report it.
     if stored_binary.is_none() && !binary_hash.is_empty() {
         let _ = write_secure(&paths::binary_hash_file(), &binary_hash);
     }
     if stored_config.is_none() && !config_hash.is_empty() {
         let _ = write_secure(&paths::config_hash_file(), &config_hash);
     }
+    let (binary_ok, binary_record_missing) = judge(stored_binary.as_deref(), &binary_hash);
+    let (config_ok, config_record_missing) = judge(stored_config.as_deref(), &config_hash);
     IntegrityStatus {
-        binary_ok: stored_binary.map(|s| s == binary_hash).unwrap_or(true),
-        config_ok: stored_config.map(|s| s == config_hash).unwrap_or(true),
+        binary_record_missing,
+        config_record_missing,
+        binary_ok,
+        config_ok,
         binary_hash,
         config_hash,
     }
 }
 
+/// `(matches, record_missing)` for a stored hash against the current one.
+/// A missing record isn't a mismatch, but it is reported.
+fn judge(stored: Option<&str>, current: &str) -> (bool, bool) {
+    match stored {
+        Some(s) => (s == current, false),
+        None => (true, true),
+    }
+}
+
 pub fn update_config_hash(hash: &str) -> Result<()> {
     write_secure(&paths::config_hash_file(), hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_record_is_reported_not_trusted_silently() {
+        assert_eq!(judge(Some("abc"), "abc"), (true, false));
+        assert_eq!(judge(Some("abc"), "def"), (false, false));
+        assert_eq!(judge(None, "def"), (true, true));
+    }
 }

@@ -1,25 +1,33 @@
 mod alerts;
 mod auditnetlink;
 mod authlog;
+mod blocklist;
 mod btf;
 mod channels;
 mod cli;
 mod collect;
 mod config;
 mod configdiff;
+mod confmerge;
 mod daemon;
 mod ebpf;
 mod enable;
 mod fallback;
+mod health;
+mod heartbeat;
 mod isolate;
 mod notify;
 mod pamsock;
 mod paths;
 mod procsrc;
+mod retention;
 mod selfprotect;
+mod sessions;
 mod status;
+mod tgbot;
 mod ui;
 mod uninstall;
+mod watchdog;
 mod watchers;
 
 use clap::Parser;
@@ -35,9 +43,12 @@ fn main() {
         cli::Cmd::Test(args) => cli::cmd_test(&args),
         cli::Cmd::NotifyTest(args) => cli::cmd_notify_test(&args),
         cli::Cmd::Collect(args) => collect::run(&args),
-        cli::Cmd::Isolate => isolate::cmd_isolate(),
+        cli::Cmd::Isolate(args) => isolate::cmd_isolate(&args),
         cli::Cmd::Unisolate => isolate::cmd_unisolate(),
+        cli::Cmd::Blocked => blocklist::cmd_blocked(),
+        cli::Cmd::Unblock(args) => blocklist::cmd_unblock(&args.ip),
         cli::Cmd::Uninstall(args) => uninstall::run(&args),
+        cli::Cmd::Watchdog => watchdog::run(),
     };
     if let Err(e) = result {
         let st = ui::Style::detect();

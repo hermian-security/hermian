@@ -35,6 +35,13 @@ PRELOAD_EXISTED=0
 # /etc/ld.so.preload would let any local user get code into every process,
 # setuid ones included, so this runs on every exit path.
 cleanup() {
+    # Stop the detached writer first and wait for it: if the alert check
+    # failed fast, the write could otherwise land after this cleanup and stay
+    # behind (an ld.so.preload entry, a cron job).
+    if [ -n "${DETACHED_PID:-}" ]; then
+        kill "$DETACHED_PID" 2>/dev/null || true
+        wait "$DETACHED_PID" 2>/dev/null || true
+    fi
     case "$SCENARIO" in
         webshell)
             rm -f /tmp/.x.sh
@@ -66,8 +73,10 @@ trap 'exit 143' TERM
 
 # Scenarios are unattended by design: run detached from this shell's TTY and
 # session so HERMIAN's session attribution treats them as automated.
+DETACHED_PID=""
 detached() {
     setsid sh -c "$1" </dev/null >/dev/null 2>&1 &
+    DETACHED_PID=$!
 }
 
 START=$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')

@@ -2,21 +2,109 @@
 
 [![Hermian](docs/logo-text.svg)](https://hermian.me)
 
+[![CI](https://github.com/hermian-security/hermian/actions/workflows/ci.yml/badge.svg)](https://github.com/hermian-security/hermian/actions/workflows/ci.yml)
+[![Release](https://github.com/hermian-security/hermian/actions/workflows/release.yml/badge.svg)](https://github.com/hermian-security/hermian/releases)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A small Linux security daemon. Watches process chains, SSH activity, persistence
 changes, privilege escalation signals, and network activity. Alerts go to your
 logs, Telegram, email, or a webhook. No dashboard or central server needed.
 
-**Still in beta.** Start on a test host; coverage and false-positive rates need
-more field testing. See [project notes](PROJECT.md) for how it works and its limits.
+**Beta, validated on one host so far.** One host has completed the full attack
+and false-positive pass; a production VPS has been running it since
+September 2026. Broader testing across distros and time is in progress. Start
+on a test host. The verified numbers are in [docs/EVIDENCE.md](docs/EVIDENCE.md),
+and the known gaps are in [Limits](#limits).
+
+Here's what an alert looks like (Telegram; the CLI has the full record):
+
+```
+■■■■ HERMIAN - CRITICAL
+Host : web-01
+
+- Web server chain ran downloaded code :
+
+nginx started a shell that downloaded a file and is now running it as
+www-data.
+
+Chain  nginx → sh → curl → /tmp/.x
+File   /tmp/.x
+
+━━━━━━━━━━━━━━━━
+
+Web servers don't normally spawn shells. The chain then downloaded a
+file from the internet, which is the shape of a web shell dropped on a
+vulnerable app.
+
+Also
+1. Isolate the host unless this is expected.
+
+━━━━━━━━━━━━━━━━
+hermian show HER-2026-1006-415
+```
+
+## Who it is for
+
+- A VPS, a homelab, or a small set of servers you look after yourself.
+- People who want the alert in chat or logs, not another dashboard or account.
+- Opt-in response: block a source or disconnect a session from the alert, or
+  auto-isolate CRITICAL events, without a central control plane.
+
+## Who it is not for
+
+- Containers and Kubernetes: it watches the host, not what's inside pods.
+- Fleets and endpoint management: no central console, policy management, or
+  compliance reports.
+- Anything you can't test first: the burn-in matrix isn't finished, so don't
+  start on a host you can't afford to debug.
+
+## Limits
+
+- **One distro so far.** Only Ubuntu 22.04 hosts have run it in the field.
+  RHEL/SELinux, the older-kernel fallback, and arm64 are untested.
+- **It sees what it hooks.** Detection runs on kernel and log sources;
+  activity outside them is invisible, and separate rules can report one
+  incident.
+- **Delivery is at-least-once.** Pending alerts are queued per channel on
+  disk (500 each) and survive a restart; a crash mid-send can duplicate one.
+- **The dead-man switch is local.** A systemd timer checks the daemon's
+  heartbeat, pages when it goes stale, and restarts it; a killed daemon is
+  reported on its next start. It isn't an out-of-band monitor.
+- **Isolation isn't a cutoff.** `hermian isolate` installs an nftables ruleset
+  with documented exceptions, and auto-isolation reverts on a timer.
+- **Root owns the box.** Local hashes detect changes; they don't stop someone
+  who already has root.
+
+Architecture and detection details are in [PROJECT.md](PROJECT.md); plans and
+gaps are in [the burn-in matrix](docs/ROADMAP-BURN-IN.md).
 
 ## Install
 
 You'll need Linux, systemd, and kernel 5.4+. eBPF needs 5.8+; older kernels use
 reduced coverage. Builds target amd64 and arm64.
 
+```bash
+curl -fsSL https://github.com/hermian-security/hermian/releases/download/v0.1.0-beta.5/install.sh | sudo sh
+```
+
+The script is served from the release it installs: on Debian/Ubuntu it takes
+the `.deb` (apt starts the daemon), elsewhere the tarball. It always checks
+`SHA256SUMS`, and verifies the release's provenance with `cosign` or the
+GitHub CLI when either is installed; without them it says so and continues
+with the checksum alone. `--dry-run` downloads and verifies, then prints what
+would change; `--version vX.Y.Z` picks another release. The same tag works
+for installing and upgrading.
+
+Prefer to inspect first? Download `install.sh` from the
+[release](https://github.com/hermian-security/hermian/releases) assets, read
+it, then run it.
+
+<details>
+<summary>Verify manually</summary>
+
 Pin a release tag (the newest is on the
 [releases page](https://github.com/hermian-security/hermian/releases)); don't
-script against `latest`. The commands below work the same for installing and
+script against `latest`. These commands work the same for installing and
 upgrading.
 
 ### Debian / Ubuntu
@@ -77,6 +165,8 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
 Run it before `sha256sum -c`: a verified `SHA256SUMS` then vouches for every
 file it lists.
 
+</details>
+
 ### What setup does
 
 HERMIAN runs as root. Setup creates its config, state, logs, and systemd unit,
@@ -87,8 +177,9 @@ errors. Details are in [project notes](PROJECT.md#host-changes).
 ### Upgrade
 
 Nothing updates itself yet (a signed APT repository is planned). Watch the
-repository's releases, then rerun the install commands with the new `VER`.
-Read that release's notes first; they list any one-time steps.
+repository's releases, then rerun the installer for the new tag (`--version
+vX.Y.Z`, or `VER=vX.Y.Z` in the manual steps). Read that release's notes
+first; they list any one-time steps.
 
 ### Uninstall
 
@@ -129,6 +220,25 @@ bot_token = "123456789:AAH..."
 chat_id = "-1001234567890"
 ```
 
+#### Response buttons (optional)
+
+Telegram alerts can carry buttons: `Block` on the brute-force digest, and
+`Ignore` / `Disconnect session` / `Disconnect and block` on suspicious SSH
+logins. They act at once, so only list people you trust:
+
+```toml
+[notifications.telegram]
+actions = true
+allowed_user_ids = [123456789]   # your Telegram user id (ask @userinfobot)
+
+[response]
+block_duration_hours = 24
+```
+
+Then run `sudo hermian enable` once to grant the firewall and kill
+capabilities. Presses from anyone else are refused and logged. List or lift
+blocks with `sudo hermian blocked` and `sudo hermian unblock <ip>`.
+
 Email (SMTP or sendmail) and webhooks (Slack, Discord, ntfy, generic JSON) are
 also supported. Their settings are in the same config file. HIGH and CRITICAL
 alerts trigger notifications by default.
@@ -153,14 +263,28 @@ Use `--json` with `status`, `alerts`, `show`, or `test` for scripts.
 `collect` gathers local context for an alert; it doesn't upload anything.
 
 The default 24-hour baseline learns SSH sources and network activity for novelty
-checks. Exceptions belong in the config's allowlist, with a `reason` for each one.
+checks; a source or destination is new the first time it's seen, not every time
+it reappears. Exceptions belong in the config's allowlist, with a `reason` for
+each one.
 
 Optional network isolation needs management CIDRs configured first. See
 [response settings and limits](PROJECT.md#response) before using it.
 
+## AI-assisted development
+
+Parts of the code, tests, and docs are written with AI assistance, and the
+project says so instead of hiding it. AI-assisted work can branch, test,
+commit, push, and open a PR; merging and releasing are done by hand and never
+by AI. Right now there's a single maintainer, who owns everything that merges;
+independent review is planned as the project grows. The full working rules are
+in [AGENTS.md](AGENTS.md).
+
 ## More
 
+- [Evidence](docs/EVIDENCE.md): what's been verified, where, and when.
 - [Project notes](PROJECT.md): architecture, detection rules, and limits.
+- [Burn-in matrix](docs/ROADMAP-BURN-IN.md): how this gets to production ready.
+- [False-positive log](docs/fp-log.md): every HIGH+ that wasn't real.
 - [Contributing](CONTRIBUTING.md): builds, tests, PRs, and releases.
 - [Changelog](CHANGELOG.md): what's changed.
 - [Security reports](SECURITY.md): please report vulnerabilities privately.

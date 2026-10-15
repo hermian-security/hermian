@@ -6,7 +6,8 @@ This is the plan for taking the beta from "one host, one afternoon" to
 author can execute it.
 
 Everything below has been exercised at least once on a real host
-(Ubuntu 22.04.5, kernel 5.15, 2 vCPU) except where marked **untested**.
+(Ubuntu 22.04.5, 2 vCPU; the CHANGELOG notes the kernel each run used)
+except where marked **untested**.
 
 ---
 
@@ -14,13 +15,13 @@ Everything below has been exercised at least once on a real host
 
 | Area | State | Evidence |
 |---|---|---|
-| Detection engine | 5 groups, 77 unit tests, clippy clean | `cargo test` |
-| Live attack matrix | 13/13 scenarios fire at expected severity | `tests/attacks/run_attack.sh` on host |
+| Detection engine | 5 groups, unit-tested, clippy clean | `cargo test` |
+| Live attack matrix | every `tests/run_suite.sh` scenario (7) fired at the expected severity in the beta.5 run | `tests/run_suite.sh` on host |
 | False positives | 0 HIGH+ across 26 admin/unattended operations | `tests/false_positives/*.sh` on host |
 | Overhead | 0.1 % CPU, 19 MB RSS, 80 k events/3 h | `hermian status` |
 | Packaging | `.deb` builds, installs, upgrades in place | `cargo deb` on host |
 | Notifications | Telegram + email verified through the daemon | `hermian notify-test` |
-| Field time | ~5 h on one host | `soak.jsonl` |
+| Field time | one production host since 2026-09-20 (was ~5 h after the first afternoon) | `soak.jsonl`, deployment notes |
 
 The gap to production is **breadth and time**, not features.
 
@@ -37,8 +38,14 @@ static prebuilt binary** from aya-rs releases (LLVM bundled, ~100 MB):
 
 ```bash
 curl -fsSL https://github.com/aya-rs/bpf-linker/releases/download/v0.11.1/bpf-linker-x86_64-unknown-linux-musl.tar.zst \
-  | sudo tar --zstd -x -C /usr/local/bin bpf-linker
+  -o /tmp/bl.tar.zst
+# Same checksum CI pins; this binary produces the object we ship.
+echo "e058a6aecc9e65fa4c977b298a8e4b738424d7629769fd352eed409fb57e16e8  /tmp/bl.tar.zst" | sha256sum -c -
+sudo tar --zstd -xf /tmp/bl.tar.zst -C /usr/local/bin bpf-linker
 ```
+
+The nightly is pinned too (`HERMIAN_EBPF_NIGHTLY=nightly-2026-09-17` in CI);
+that pair reproduces the vendored object byte for byte.
 
 The build has three tiers, tried in order:
 
@@ -53,18 +60,18 @@ The build has three tiers, tried in order:
 CI builds from source with `HERMIAN_EBPF_FROM_SOURCE=1` and fails if the
 vendored object is stale, so tier 2 can never drift.
 
-### 1.2 Local release build (any Linux, Rust >= 1.79)
+### 1.2 Local release build (any Linux, Rust >= 1.91)
 
 ```bash
 sudo apt install -y build-essential pkg-config libpam0g-dev   # Debian/Ubuntu
-cargo install cargo-deb --locked
+cargo install cargo-deb --version 3.8.0 --locked
 
 cargo build --release            # daemon + PAM module; uses vendored eBPF if needed
-cargo test --release             # 77 core + 12 daemon tests
-./target/release/hermian test    # 9 synthetic scenarios against the built binary
+cargo test --release             # core, daemon and PAM tests
+./target/release/hermian test    # synthetic scenarios against the built binary
 
-cargo deb -p hermian --no-build -o dist/          # dist/hermian_0.1.0-1_amd64.deb
-make release                                       # dist/hermian-0.1.0-linux-amd64.tar.gz
+make deb                                           # dist/hermian_<version>_<arch>.deb
+make release                                       # dist/hermian-<version>-linux-<arch>.tar.gz
 ```
 
 **Build on the oldest glibc you intend to support.** The `.deb` records the
@@ -77,14 +84,18 @@ builds run on `ubuntu-22.04` for this reason.
 
 `.github/workflows/release.yml` runs on every `v*` tag:
 
+0. Refuses the tag unless it matches the workspace version, sits on `main`,
+   and its commit has all five required CI checks green.
 1. Builds the eBPF object from source; fails if it differs from the vendored one.
 2. Builds `amd64` and `arm64` on Ubuntu 22.04 runners.
-3. Runs core tests and `hermian test` on the built binary.
-4. Produces `.deb` + `.tar.gz` per arch, `SHA256SUMS`, **Sigstore keyless
-   signatures** (`*.sigstore` bundles) and **GitHub build attestations**, both
-   bound to the repository's workflow identity - no long-lived key to protect.
+3. Runs clippy, the full test suite and `hermian test` on each built binary.
+4. Produces `.deb` + `.tar.gz` per arch plus `install.sh` (also served from
+   the release page), `SHA256SUMS`, **Sigstore keyless signatures**
+   (`*.sigstore` bundles) and **GitHub build attestations**, both bound to the
+   repository's workflow identity - no long-lived key to protect.
 5. Publishes a GitHub pre-release (tags containing `-`) or release, with the
-   CHANGELOG section for that version as the notes.
+   CHANGELOG section for that version as the notes plus that tag's
+   one-command install.
 
 The release procedure itself is in [CONTRIBUTING.md](../CONTRIBUTING.md#versioning-and-releases).
 arm64 and Sigstore have run on every tag since beta.2.
@@ -97,7 +108,7 @@ For the beta:
 | Artifact | Beta | Why |
 |---|---|---|
 | `.deb` (amd64, arm64) | **yes** | Target users are overwhelmingly Debian/Ubuntu VPS |
-| Signed tarball + `install.sh` | **yes** | Distro-agnostic fallback |
+| Signed tarball + `install.sh` | **yes** | Distro-agnostic install; the installer is a signed release asset too |
 | Sigstore instead of GPG | **yes** | Same guarantee, no key custody problem for a solo maintainer; GPG can be added later |
 | Signed apt repository | **next** | The only path that gets fixes onto hosts without anyone checking; see §1.5 |
 | `.rpm` | Phase 3 | Needs a Fedora/RHEL burn-in first (§3 below) |
@@ -150,8 +161,9 @@ sysctl fs.inotify.max_user_watches        # hermian enable raises this to 524288
 
 ### 2.2 Install
 
-Follow the [README install steps](../README.md#install) (Debian/Ubuntu or
-tarball), including the origin check. They're kept in one place on purpose.
+Run the [README install one-liner](../README.md#install) (Debian/Ubuntu or
+tarball). It checks the checksum and verifies origin when `cosign` or `gh` is
+present; `--dry-run` stops before installing. Steps stay in one place.
 
 Expected within 10 seconds of `sudo hermian status`: `PROTECTED`, all five rows `on`, `Kernel ... eBPF`.
 If you see `reduced: no eBPF`, read `journalctl -u hermian -n 20`; the two
@@ -177,14 +189,16 @@ sudo hermian notify-test      # must print SENT
 ### 2.4 Baseline
 
 The first 24 h are the learning window (SSH sources, network peers). Novelty
-rules stay quiet until it completes. On a freshly provisioned host with no
-history worth learning, `sudo hermian enable --no-baseline`.
+rules stay quiet until it completes. Learning continues afterwards, so a value
+is flagged the first time it's seen, not on every appearance. On a freshly
+provisioned host with no history worth learning, `sudo hermian enable
+--no-baseline`.
 
 ### 2.5 Upgrade
 
-Rerun the README install steps with the new `VER`; the package's postinst
-re-runs `enable` and restarts the daemon. Read the release notes first for
-one-time steps.
+Rerun the installer with the new tag (`--version vX.Y.Z`); the package's
+postinst re-runs `enable` and restarts the daemon. Read the release notes
+first for one-time steps.
 
 Verified: reinstall over a running daemon keeps state, alerts, baseline and
 the soak clock; the binary hash is refreshed so no false integrity alert.
@@ -207,7 +221,7 @@ cell is one disposable host.
 
 | # | Environment | Distro / kernel | Purpose | Status |
 |---|---|---|---|---|
-| A | idle VPS + sshd + nginx | Ubuntu 22.04 / 5.15 | reference | **running** since 2026-09-20 |
+| A | idle VPS + sshd + nginx | Ubuntu 22.04 | reference | **running** since 2026-09-20 |
 | B | active web | Debian 12 / 6.1, nginx + php-fpm under `wrk` 100 r/s | D1/D5 noise under real traffic | untested |
 | C | developer workstation | Ubuntu 24.04 / 6.8, cargo, npm, docker, VS Code | `/tmp` exec, LD_PRELOAD, docker parent chains | untested |
 | D | SSH-active + Ansible | Debian 12, 3 users, `ansible-pull` every 10 min | D2/D3 attribution under CM tooling | untested |
@@ -249,8 +263,8 @@ Every FP is a rule defect until proven otherwise:
 3. For (a)/(b): reproduce in a unit test in `hermian-core`, fix, rerun the
    suite, redeploy.
 
-Keep a `docs/fp-log.md` with one line per FP: host, rule, cause, fix. That
-log is the evidence behind any public claim about FP rate.
+Log every FP in [`docs/fp-log.md`](fp-log.md), one row each: host, rule,
+cause, fix. That log is the evidence behind any public claim about FP rate.
 
 ### 3.3 Latency check
 
@@ -272,10 +286,10 @@ On host A: ~2 s (400 ms inotify debounce + delivery).
 All of the following, with evidence linked from the release notes:
 
 - [ ] Hosts A-H each completed 72 h with 0 unexplained HIGH+.
-- [ ] Attack matrix 13/13 on every host, < 5 s each.
+- [ ] Every `tests/run_suite.sh` scenario passes on every host, < 5 s each.
 - [ ] CPU avg < 1 %, p99 < 5 %, RSS < 80 MB on every host.
 - [ ] `docs/fp-log.md` published; every entry closed.
-- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS`, `gh attestation verify` and `cosign verify-blob` on a clean machine.
+- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS`, `gh attestation verify` and `cosign verify-blob` on a clean machine, and the install one-liner's `--dry-run` is clean there.
 - [ ] Signed APT repository live; `apt upgrade` delivered a release to a test host.
 - [ ] `hermian uninstall` leaves nothing on every distro.
 - [ ] Two hosts the maintainer depends on have run the release build for 30 days.

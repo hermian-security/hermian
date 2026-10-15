@@ -1,0 +1,14 @@
+[Unit]
+Description=HERMIAN dead-man switch timer
+Documentation=https://github.com/hermian-security/hermian
+
+[Timer]
+# First check shortly after boot, then every minute. The watchdog itself
+# decides (heartbeat age, unit state); the timer only drives it.
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
+Unit=hermian-watchdog.service
+
+[Install]
+WantedBy=timers.target

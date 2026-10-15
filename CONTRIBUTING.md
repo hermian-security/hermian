@@ -82,7 +82,13 @@ Main requires these GitHub Actions checks:
 - daemon + eBPF (linux)
 
 Keep these job names stable. A rename must be coordinated with the required-check
-settings or PRs will remain blocked waiting for the old name.
+settings or PRs will remain blocked waiting for the old name. The release
+workflow checks the same five names on the tagged commit.
+
+Two more jobs run but aren't required yet: `supply chain (cargo-deny)`
+(advisories, yanked crates, licenses, sources; see `deny.toml`) and
+`msrv (1.91)`, which keeps `rust-version` honest. Making them required is a
+repository setting for the maintainer.
 
 Run relevant checks locally before opening a PR:
 
@@ -94,7 +100,8 @@ python3 -B -m unittest discover -s tests/helpers -p 'test_*.py' -v
 ```
 
 On Linux with the required toolchains, also run the daemon tests and the
-source-built eBPF checks used by .github/workflows/ci.yml. On Windows, python may
+source-built eBPF checks used by .github/workflows/ci.yml, and `cargo deny
+check` if you changed dependencies. On Windows, python may
 be the Python command, and Linux-specific verification must be delegated to CI.
 
 The scripts under tests/attacks and tests/false_positives modify real system files.
@@ -149,18 +156,21 @@ Cargo.lock to match (`cargo update --workspace`), and moves those notes into a
 dated `## x.y.z - YYYY-MM-DD` section. Don't mix the bump into the feat/fix PR.
 Don't run a blanket `cargo update` just to change the workspace version.
 
-That changelog section becomes the GitHub release notes verbatim, and the
-workflow fails without one. Put anything users must do once after upgrading
-under an `### Upgrade` heading in it. Install commands live only in the
-README's Install section; the release notes link to it at the tag.
+That changelog section becomes the body of the GitHub release notes, and the
+workflow fails without one. The workflow adds this tag's one-command install
+and a link to the README at the tag. Put anything users must do once after
+upgrading under an `### Upgrade` heading in it. Install commands otherwise
+live in the README's Install section.
 
 Release procedure:
 
 1. User-facing change is on `main` with green CI.
-2. Open `release/x.y.z` with the version bump, changelog move, and README
-   `VER=` pins (Install section).
+2. Open `release/x.y.z` with the version bump, changelog move, and the README
+   install pins (the one-liner URL and `VER=` in the manual steps).
 3. Merge it through the normal PR checks.
-4. Wait for CI on that `main` commit. A green PR build isn't enough.
+4. Wait for CI on that `main` commit. A green PR build isn't enough, and the
+   release workflow refuses a tag whose commit doesn't have all five required
+   checks green.
 5. Tag `v` + that exact version on that commit and push only that tag.
 6. Watch `release.yml`, then check the published files as the README describes
    (`sha256sum -c`, `gh attestation verify`, `cosign verify-blob`). Don't move a

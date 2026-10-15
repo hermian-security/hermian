@@ -1,7 +1,7 @@
 //! The long-running daemon: wires event sources into the engine and alerts
 //! into the notifier.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,8 +14,9 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    auditnetlink, authlog, config, configdiff, ebpf, fallback, isolate, notify, pamsock, paths,
-    procsrc, selfprotect, status, watchers,
+    auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
+    isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, status, tgbot,
+    watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -25,6 +26,9 @@ struct EngineState {
     ref_seq: u32,
     #[serde(default)]
     counters: Option<hermian_core::Counters>,
+    /// "Remind me in 7 days" on the root-password warning.
+    #[serde(default)]
+    root_warning_snoozed_until: Option<chrono::DateTime<Utc>>,
 }
 
 fn load_engine_state() -> Option<EngineState> {
@@ -38,6 +42,7 @@ fn save_engine_state(engine: &Engine) {
         ref_day: day.to_string(),
         ref_seq: seq,
         counters: Some(engine.counters.clone()),
+        root_warning_snoozed_until: engine.root_warning_snoozed_until,
     };
     if let Ok(text) = serde_json::to_string(&st) {
         let _ = config::write_secure(&paths::engine_state_file(), &text);
@@ -63,9 +68,19 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(paths::state_dir())?;
     fs::create_dir_all(paths::run_dir())?;
 
+    // The dead-man switch watches the heartbeat; the marker tells the next
+    // start whether this run stopped cleanly, and the watchdog leaves a note
+    // when it had to restart the previous one.
+    let unclean_prev = heartbeat::start(&paths::run_marker_file());
+    let watchdog_note = heartbeat::take_restart_note(&paths::watchdog_note_file());
+
     let mut engine = Engine::new(cfg.clone(), allowlist, baseline, host);
     if let Some(st) = load_engine_state() {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
+        engine.root_warning_snoozed_until = st.root_warning_snoozed_until;
+    }
+    if let Some(on) = sessions::root_password_login() {
+        engine.set_root_password_login(on);
     }
     engine.set_user_names(procsrc::load_user_names());
     for path in ["/etc/passwd", "/etc/group"] {
@@ -84,7 +99,11 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    rt.block_on(async_main(cfg, engine))
+    let result = rt.block_on(async_main(cfg, engine, unclean_prev, watchdog_note));
+    // Don't hang on a blocking-pool thread (the eBPF converter, a delivery in
+    // flight) once main is done.
+    rt.shutdown_timeout(Duration::from_secs(2));
+    result
 }
 
 struct Sources {
@@ -95,7 +114,12 @@ struct Sources {
     watch_health: Option<watchers::SharedWatchHealth>,
 }
 
-async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
+async fn async_main(
+    initial_cfg: Config,
+    mut engine: Engine,
+    unclean_prev: Option<String>,
+    watchdog_note: Option<String>,
+) -> Result<()> {
     let initial_notify = status::read_state()
         .map(|s| notify::NotifyState {
             last_delivery: s.last_delivery,
@@ -148,6 +172,75 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             ),
         );
     }
+    let missing: Vec<&str> = [
+        (integrity.binary_record_missing, "binary"),
+        (integrity.config_record_missing, "configuration"),
+    ]
+    .iter()
+    .filter(|(m, _)| *m)
+    .map(|(_, n)| *n)
+    .collect();
+    if !missing.is_empty() {
+        emit_self(
+            &notifier,
+            self_alert(
+                &mut engine,
+                Severity::High,
+                "HERMIAN integrity record missing",
+                &format!(
+                    "The stored hash for the {} was missing at startup, so it couldn't be checked. The current value has been recorded.",
+                    missing.join(" and ")
+                ),
+                "'hermian enable' records these hashes before the first start. A missing one means it was deleted (deleting it and swapping the binary would otherwise go unnoticed) or an upgrade skipped 'hermian enable'.",
+                &[
+                    "If you just upgraded from a tarball without 'hermian enable', re-run it.",
+                    "Otherwise verify the binary against the release checksums and review the config.",
+                ],
+                &[
+                    ("Binary hash", &integrity.binary_hash),
+                    ("Config hash", &integrity.config_hash),
+                ],
+                "selfprotect|record-missing",
+            ),
+        );
+    }
+
+    // --- Unclean restart ------------------------------------------------
+    if let Some(prev) = unclean_prev {
+        let (cause, cause_label) = match &watchdog_note {
+            Some(note) => (
+                format!(
+                    "The watchdog restarted it after it stopped responding ({})",
+                    note
+                ),
+                "Watchdog restart",
+            ),
+            None => (
+                "The process died without cleanup (crash, SIGKILL, or power loss).".to_string(),
+                "Unexpected stop",
+            ),
+        };
+        emit_self(
+            &notifier,
+            self_alert(
+                &mut engine,
+                Severity::High,
+                "HERMIAN restarted after an unclean shutdown",
+                &format!(
+                    "The previous run ({}) did not stop through systemd. {}. Activity between its last heartbeat and this start was not monitored.",
+                    prev.trim(),
+                    cause
+                ),
+                "A clean stop sends a 'HERMIAN is stopping' notice; a crash or kill cannot. Killing the security daemon is a cheap way to get an unmonitored window, so leftovers are reported rather than silently overwritten.",
+                &[
+                    "Check what happened right before: journalctl -u hermian -n 100.",
+                    "If this wasn't the watchdog reacting to a hang, treat it as suspicious.",
+                ],
+                &[("Previous run", prev.trim()), (cause_label, &cause)],
+                "selfprotect|unclean",
+            ),
+        );
+    }
 
     // --- Event sources ---------------------------------------------------
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(16384);
@@ -160,6 +253,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         watch_health: None,
     };
     let mut _ebpf_runtime: Option<ebpf::EbpfRuntime> = None;
+    let mut audit_thread: Option<std::thread::JoinHandle<()>> = None;
 
     if procsrc::kernel_supports_ebpf() {
         let (raw_tx, raw_rx) = mpsc::channel::<ebpf::RawEvent>(16384);
@@ -167,7 +261,11 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             Ok(runtime) => {
                 sources.ebpf = Some(runtime.attached.clone());
                 _ebpf_runtime = Some(runtime);
-                tokio::spawn(convert_ebpf_events(raw_rx, event_tx.clone()));
+                // Several /proc reads per event: on a blocking thread, not
+                // one of the runtime's two workers, so an exec storm can't
+                // stall the event loop (and back up into ring loss).
+                let tx = event_tx.clone();
+                tokio::task::spawn_blocking(move || convert_ebpf_events(raw_rx, tx));
             }
             Err(e) => {
                 // Verifier output can be thousands of lines; keep the first.
@@ -195,7 +293,10 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         fallback::spawn_proc_poller(event_tx.clone(), shutdown.clone())?;
         if auditnetlink::audit_usable() {
             match auditnetlink::spawn_audit_reader(event_tx.clone(), shutdown.clone()) {
-                Ok(()) => sources.audit = true,
+                Ok(handle) => {
+                    sources.audit = true;
+                    audit_thread = Some(handle);
+                }
                 Err(e) => log_daemon(Severity::Low, &format!("audit source unavailable: {:#}", e)),
             }
         } else {
@@ -232,9 +333,18 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             "no SSH authentication source (no auth.log, no journalctl, no PAM module); D2 auth coverage reduced",
         );
     }
-    let (listener_close_tx, mut listener_close_rx) = mpsc::channel::<(String, u16)>(256);
+    let (listener_close_tx, mut listener_close_rx) = mpsc::channel::<fallback::ListenerKey>(256);
     fallback::spawn_listener_poller(event_tx.clone(), listener_close_tx, shutdown.clone())?;
     fallback::spawn_suid_sweeper(event_tx.clone(), shutdown.clone())?;
+
+    // --- Telegram response buttons ---------------------------------------
+    // The poller follows config reloads through this shared copy; it idles
+    // while actions are off.
+    let tg_cfg = Arc::new(std::sync::Mutex::new(
+        initial_cfg.notifications.telegram.clone(),
+    ));
+    let (action_tx, mut action_rx) = mpsc::channel::<tgbot::ActionRequest>(64);
+    tgbot::spawn_poller(tg_cfg.clone(), action_tx, shutdown.clone())?;
 
     // --- Signals ---------------------------------------------------------
     use tokio::signal::unix::{signal, SignalKind};
@@ -243,13 +353,22 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigusr2 = signal(SignalKind::user_defined2())?;
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    let mut ticker = tokio::time::interval(heartbeat::INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut cpu_ring: VecDeque<f64> = VecDeque::new();
     let mut last_cpu = procsrc::self_cpu_sample();
     let mut first_tick = true;
     let mut current_cfg = initial_cfg;
+    // Hash of the config actually in effect. Reloads compare against this,
+    // not config.sha256: writing that file first, then the config, used to
+    // make the change skip both the reload and its alert.
+    let mut applied_hash = integrity.config_hash.clone();
+    let mut dropped_seen = health::snapshot();
+    let mut compat_seen: HashMap<String, bool> = HashMap::new();
+    // First pass shortly after start, then hourly.
+    let mut next_retention = std::time::Instant::now() + Duration::from_secs(60);
+    let mut hotplug_reported: Vec<u32> = Vec::new();
     let started_at = Utc::now();
     let config_path = paths::config_path();
 
@@ -278,6 +397,9 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         &cpu_ring,
         started_at,
     );
+    // Start the heartbeat before the first tick so the watchdog doesn't see
+    // a "never written" daemon during a slow startup.
+    let _ = heartbeat::touch(&paths::heartbeat_file());
     log_daemon(
         Severity::Info,
         &format!("HERMIAN {} started", hermian_core::VERSION),
@@ -289,29 +411,78 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                 let Some(ev) = maybe else { break };
                 if let Event::File(f) = &ev {
                     if std::path::Path::new(&f.path) == config_path {
-                        reload_config(&mut engine, &notifier, &mut current_cfg, "file change");
+                        reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "file change");
+                        sync_tg_cfg(&tg_cfg, &current_cfg);
                         continue;
                     }
                 }
-                if let Event::Exec(e) = &ev {
-                    seed_missing_ancestors(&mut engine, e);
+                if let (Event::Exec(e), true) = (&ev, sources.ebpf.is_some()) {
+                    check_compat_exec(&mut engine, &notifier, &mut compat_seen, e);
+                }
+                match &ev {
+                    Event::Exec(e) => seed_missing_ancestors(&mut engine, e.ppid, e.ts),
+                    // A process that forked without exec'ing (or started before
+                    // us and never exec'd since) isn't in the tree; without it
+                    // a connect or ptrace has no exe or chain, and a forked
+                    // child that calls itself "gdb" passed as a debugger.
+                    Event::Connect(c) => seed_process(&mut engine, c.pid, c.ts),
+                    Event::Ptrace(p) => seed_process(&mut engine, p.pid, p.ts),
+                    _ => {}
                 }
                 for alert in engine.process(ev) {
-                    let critical = alert.severity == Severity::Critical;
+                    let isolate = alert.auto_isolate_eligible();
+                    if alert.severity == Severity::Critical && !isolate
+                        && current_cfg.response.auto_isolate
+                    {
+                        log_daemon(
+                            Severity::High,
+                            &format!(
+                                "auto-isolate skipped for {}: the service in its chain isn't installed in a root-owned location",
+                                alert.ref_id
+                            ),
+                        );
+                    }
                     notifier.send(alert);
-                    if critical {
+                    if isolate {
                         isolate::auto_isolate_if_enabled(&current_cfg);
                     }
                 }
             }
-            Some((proto, port)) = listener_close_rx.recv() => {
-                engine.forget_listener(&proto, port);
+            Some((proto, addr, port)) = listener_close_rx.recv() => {
+                engine.forget_listener(&proto, addr, port);
+            }
+            Some(req) = action_rx.recv() => {
+                handle_action(&mut engine, &notifier, &current_cfg, req);
             }
             _ = ticker.tick() => {
+                // The dead-man switch reads this; it must be the first thing
+                // a slow tick refreshes.
+                let _ = heartbeat::touch(&paths::heartbeat_file());
                 let now = Utc::now();
                 engine.reap_exited(&procsrc::live_pids(), now);
                 for a in engine.tick(now) {
                     notifier.send(a);
+                }
+                let dropped_now = health::snapshot();
+                let grown = health::grown(&dropped_seen, &dropped_now);
+                if !grown.is_empty() {
+                    report_dropped_events(&mut engine, &notifier, &grown, &dropped_now);
+                }
+                dropped_seen = dropped_now;
+                let unmonitored = ebpf::unmonitored_cpus();
+                if !unmonitored.is_empty() && unmonitored != hotplug_reported {
+                    report_unmonitored_cpus(&mut engine, &notifier, &unmonitored);
+                }
+                hotplug_reported = unmonitored;
+                if std::time::Instant::now() >= next_retention {
+                    next_retention = std::time::Instant::now() + Duration::from_secs(3600);
+                    let days = current_cfg.general.alert_retention_days;
+                    tokio::task::spawn_blocking(move || retention::run(days));
+                    // sshd settings can change any time; recheck hourly.
+                    tokio::task::spawn_blocking(sessions::refresh_root_password_login);
+                }
+                if let Some(on) = sessions::cached_root_password_login() {
+                    engine.set_root_password_login(on);
                 }
                 let _ = config::save_baseline(&engine.baseline);
                 save_engine_state(&engine);
@@ -334,27 +505,289 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
             }
             _ = sigterm.recv() => {
                 log_daemon(Severity::Info, "SIGTERM received; shutting down");
+                announce_stop(&mut engine, &notifier, "SIGTERM").await;
                 break;
             }
             _ = sigint.recv() => {
+                announce_stop(&mut engine, &notifier, "SIGINT").await;
                 break;
             }
             _ = sighup.recv() => {
-                reload_config(&mut engine, &notifier, &mut current_cfg, "SIGHUP");
+                reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "SIGHUP");
+                sync_tg_cfg(&tg_cfg, &current_cfg);
             }
             _ = sigusr2.recv() => {
-                reload_config(&mut engine, &notifier, &mut current_cfg, "SIGUSR2");
+                reload_config(&mut engine, &notifier, &mut current_cfg, &mut applied_hash, "SIGUSR2");
+                sync_tg_cfg(&tg_cfg, &current_cfg);
             }
         }
     }
 
     shutdown.store(true, Ordering::Relaxed);
+    // Reaching here means a handled signal (SIGTERM/SIGINT) or a closed event
+    // channel: a clean stop. Crashes and SIGKILLs skip this, and the next
+    // start reports the leftover marker.
+    heartbeat::clean_stop(&paths::run_marker_file());
     let _ = config::save_baseline(&engine.baseline);
     save_engine_state(&engine);
     // Give the notifier a moment to flush persisted alerts.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // Let the audit thread notice and drop its socket, which removes our
+    // exec rule; returning first left the rule (and audit enabled) behind.
+    if let Some(h) = audit_thread {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !h.is_finished() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     Ok(())
 }
+
+/// Page when telemetry was dropped since the last tick. The engine's dedup
+/// window keeps a sustained loss to one alert per source every few minutes.
+fn report_dropped_events(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    grown: &[(String, u64)],
+    totals: &std::collections::BTreeMap<String, u64>,
+) {
+    for (source, n) in grown {
+        let total = totals.get(source).copied().unwrap_or(*n).to_string();
+        let recent = n.to_string();
+        emit_self(
+            notifier,
+            self_alert(
+                engine,
+                Severity::High,
+                "HERMIAN dropped telemetry",
+                &format!(
+                    "{} {} lost in the last interval ({} since start). Activity in that window may not have been seen.",
+                    recent, source, total
+                ),
+                "Buffers overflow under bursts of activity. A fork/exec or file-change flood is also a cheap way to slip something past a monitor, so losses are reported rather than just logged.",
+                &[
+                    "Check what was running at the time (load, a build, a backup, or something unexpected).",
+                    "Review 'hermian status' and recent alerts for that window.",
+                ],
+                &[("Source", source.as_str()), ("Lost", &recent), ("Since start", &total)],
+                &format!("selfprotect|dropped|{}", source),
+            ),
+        );
+    }
+}
+
+fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>, cfg: &Config) {
+    if let Ok(mut c) = shared.lock() {
+        *c = cfg.notifications.telegram.clone();
+    }
+}
+
+/// Carry out a Telegram button press that passed every check (see tgbot).
+///
+/// Quick engine-side choices (ignore, snooze) happen here; firewall and
+/// process work runs on a blocking thread, which then posts the outcome as
+/// a reply to the alert. Every press is also recorded as a local alert.
+fn handle_action(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    cfg: &Config,
+    req: tgbot::ActionRequest,
+) {
+    use hermian_core::ResponseAction as A;
+    let now = Utc::now();
+    let label = req.action.label();
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::Low,
+            &format!("Telegram response: {}", label),
+            &format!("{} chose '{}' on alert {}.", req.by, label, req.alert_ref),
+            "Recorded so every remote response has an audit trail.",
+            &["Undo a block with 'hermian unblock <ip>'; list them with 'hermian blocked'."],
+            &[("By", req.by.as_str()), ("Alert", req.alert_ref.as_str())],
+            &format!(
+                "selfprotect|tg-action|{}|{}",
+                req.alert_ref,
+                now.timestamp_nanos_opt().unwrap_or(0)
+            ),
+        ),
+    );
+    let tg = cfg.notifications.telegram.clone();
+    let settled = req.action.settles();
+    let mid = req.message_id;
+    let by = req.by.clone();
+    match req.action {
+        A::Ignore { sources, hours } => {
+            let text = if sources.is_empty() || hours == 0 {
+                format!("Ignored by {}.", by)
+            } else {
+                engine.ignore_sources(&sources, now + chrono::Duration::hours(i64::from(hours)));
+                format!(
+                    "Ignoring {} source(s) for {}h (by {}). Logins from them still alert.",
+                    sources.len(),
+                    hours,
+                    by
+                )
+            };
+            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+        }
+        A::SnoozeRootPasswordWarning { days } => {
+            engine.snooze_root_warning(now + chrono::Duration::days(i64::from(days)));
+            save_engine_state(engine);
+            let text = format!(
+                "Root password warning snoozed for {} days (by {}).",
+                days, by
+            );
+            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+        }
+        A::Block { sources } => {
+            for ip in &sources {
+                engine.brute.forget(ip);
+            }
+            let cfg = cfg.clone();
+            tokio::task::spawn_blocking(move || {
+                let hours = cfg.response.block_duration_hours;
+                let lines: Vec<String> = sources
+                    .iter()
+                    .map(|ip| match blocklist::block(*ip, hours, &cfg) {
+                        Ok(key) => format!("Blocked {} for {}h", key, hours),
+                        Err(e) => format!("{}: {:#}", ip, e),
+                    })
+                    .collect();
+                let text = format!("{} (by {})", lines.join("\n"), by);
+                log_daemon(Severity::High, &text.replace('\n', "; "));
+                tgbot::report(&tg, mid, &text, settled);
+            });
+        }
+        A::Disconnect {
+            source,
+            port,
+            user,
+            block,
+        } => {
+            let cfg = cfg.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut lines = Vec::new();
+                // Block first: otherwise the session can come right back.
+                if block {
+                    let hours = cfg.response.block_duration_hours;
+                    lines.push(match blocklist::block(source, hours, &cfg) {
+                        Ok(key) => format!("Blocked {} for {}h", key, hours),
+                        Err(e) => format!("Block failed: {:#}", e),
+                    });
+                }
+                lines.push(match sessions::disconnect(source, port) {
+                    Ok(d) => format!(
+                        "Disconnected {} from {} ({} connection(s), {} sshd process(es) stopped)",
+                        user,
+                        source,
+                        d.connections,
+                        d.processes.len()
+                    ),
+                    Err(e) => format!("Disconnect: {:#}", e),
+                });
+                let text = format!("{} (by {})", lines.join("\n"), by);
+                log_daemon(Severity::High, &text.replace('\n', "; "));
+                tgbot::report(&tg, mid, &text, settled);
+            });
+        }
+    }
+}
+
+/// Cap on remembered exe paths for the 32-bit check.
+const COMPAT_CACHE: usize = 4096;
+
+/// A 32-bit program on x86_64 uses compat syscalls, which the eBPF
+/// `sys_enter_*` hooks don't see: its connects and ptrace calls are
+/// invisible. Rare on servers, so each such program is logged once (LOW,
+/// not paged) to make the blind spot visible.
+fn check_compat_exec(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    seen: &mut HashMap<String, bool>,
+    e: &ExecEvent,
+) {
+    // Each exe is checked (and, if 32-bit, reported) once.
+    if seen.contains_key(&e.exe) {
+        return;
+    }
+    let compat = procsrc::is_compat_binary(&e.exe);
+    if seen.len() >= COMPAT_CACHE {
+        seen.clear();
+    }
+    seen.insert(e.exe.clone(), compat);
+    if !compat {
+        return;
+    }
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::Low,
+            "32-bit program started (partly unmonitored)",
+            &format!(
+                "{} (pid {}) is a 32-bit program. Its network connections and ptrace calls aren't visible to HERMIAN's eBPF hooks.",
+                e.exe, e.pid
+            ),
+            "32-bit programs make compat syscalls that the syscall tracepoints skip. Legitimate ones are rare on a 64-bit server, and attackers use them to get around syscall monitoring.",
+            &["Check what the program is and why it runs.", "Allowlist nothing here; just know its network activity isn't covered."],
+            &[("Executable", e.exe.as_str())],
+            &format!("selfprotect|compat|{}", e.exe),
+        ),
+    );
+}
+
+fn report_unmonitored_cpus(engine: &mut Engine, notifier: &notify::Notifier, cpus: &[u32]) {
+    let list = cpus
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::High,
+            "CPUs came online without eBPF monitoring",
+            &format!("CPU(s) {} came online after HERMIAN started and have no event reader.", list),
+            "Exec, connect and ptrace events on those CPUs are neither delivered nor counted as lost until the daemon restarts.",
+            &["Restart HERMIAN: systemctl restart hermian"],
+            &[("CPUs", list.as_str())],
+            &format!("selfprotect|hotplug|{}", list),
+        ),
+    );
+}
+
+/// Tell the alert channels the daemon is stopping, and give delivery a few
+/// seconds. A clean `systemctl stop` used to be silent remotely; that's the
+/// simplest way to blind a host. (A SIGKILL still can't be reported.)
+async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal: &str) {
+    let alert = self_alert(
+        engine,
+        Severity::High,
+        "HERMIAN is stopping",
+        &format!("The daemon received {} and is shutting down. Nothing is monitored until it starts again.", signal),
+        "Package upgrades and planned maintenance stop the daemon briefly. An unexplained stop means monitoring was switched off, which is often the first thing an intruder does.",
+        &[
+            "If this wasn't planned, check who stopped it: journalctl -u hermian, and your auth logs.",
+            "Start it again with 'systemctl start hermian'.",
+        ],
+        &[("Signal", signal)],
+        &format!("selfprotect|stop|{}", Utc::now().timestamp()),
+    );
+    if let Some(a) = alert {
+        let ref_id = a.ref_id.clone();
+        notifier.send(a);
+        notifier
+            .wait_delivered(&ref_id, Duration::from_secs(STOP_NOTICE_WAIT_SECS))
+            .await;
+    }
+}
+
+/// How long shutdown waits for the stop notice. The unit's TimeoutStopSec
+/// must be comfortably above this.
+const STOP_NOTICE_WAIT_SECS: u64 = 6;
 
 /// Walk up from `ev.ppid` and make sure every ancestor is present and current.
 ///
@@ -362,9 +795,8 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
 /// which is how nginx/postgres/php-fpm workers get their titles) or exec'd a
 /// new image since we last saw it. Ancestors are refreshed from /proc when the
 /// recorded comm no longer matches, so role classification uses the live name.
-fn seed_missing_ancestors(engine: &mut Engine, ev: &ExecEvent) {
-    let now = ev.ts;
-    let mut pid = ev.ppid;
+fn seed_missing_ancestors(engine: &mut Engine, ppid: u32, now: chrono::DateTime<Utc>) {
+    let mut pid = ppid;
     let mut depth = 0;
     while depth < 16 && pid > 1 {
         let known = engine.tree.get(pid).map(|p| (p.comm.clone(), p.ppid));
@@ -394,9 +826,30 @@ fn seed_missing_ancestors(engine: &mut Engine, ev: &ExecEvent) {
     }
 }
 
-async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sender<Event>) {
+/// Make sure `pid` itself (and its ancestry) is in the tree, reading /proc
+/// if we never saw it exec.
+fn seed_process(engine: &mut Engine, pid: u32, now: chrono::DateTime<Utc>) {
+    if pid <= 1 {
+        return;
+    }
+    let ppid = match engine.tree.get(pid) {
+        Some(p) => p.ppid,
+        None => match procsrc::proc_info(pid, now) {
+            Some(info) => {
+                let ppid = info.ppid;
+                engine.tree.upsert(info);
+                ppid
+            }
+            None => return,
+        },
+    };
+    seed_missing_ancestors(engine, ppid, now);
+}
+
+/// Runs on a blocking thread (see the caller).
+fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sender<Event>) {
     let self_pid = std::process::id();
-    while let Some(raw) = raw_rx.recv().await {
+    while let Some(raw) = raw_rx.blocking_recv() {
         let ev = match raw {
             ebpf::RawEvent::Exec(raw) => {
                 if raw.pid == self_pid {
@@ -433,6 +886,11 @@ async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mps
                     })
                 };
                 let (container, container_id) = procsrc::container_info(pid);
+                let exe = if deleted {
+                    exe
+                } else {
+                    procsrc::judged_exe(pid, &comm, &exe)
+                };
                 Event::Exec(ExecEvent {
                     ts: Utc::now(),
                     pid,
@@ -480,7 +938,7 @@ async fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mps
                 })
             }
         };
-        if tx.send(ev).await.is_err() {
+        if tx.blocking_send(ev).is_err() {
             return;
         }
     }
@@ -491,6 +949,7 @@ fn reload_config(
     engine: &mut Engine,
     notifier: &notify::Notifier,
     current_cfg: &mut Config,
+    applied_hash: &mut String,
     trigger: &str,
 ) {
     let path = paths::config_path();
@@ -514,7 +973,9 @@ fn reload_config(
         }
     };
     let new_hash = selfprotect::sha256_hex(text.as_bytes());
-    if new_hash == selfprotect::stored_config_hash().unwrap_or_default() {
+    // Compared with what's in effect, not with config.sha256 on disk, which
+    // anyone who can write the config can also rewrite first.
+    if new_hash == *applied_hash {
         // Touched but unchanged (editor re-save, SIGHUP with no edit).
         return;
     }
@@ -556,6 +1017,7 @@ fn reload_config(
             notifier.reconfigure(new_cfg.notifications.clone());
             *current_cfg = new_cfg;
             let _ = selfprotect::update_config_hash(&new_hash);
+            *applied_hash = new_hash.clone();
             emit_self(notifier, alert);
         }
         Err(e) => {
@@ -737,6 +1199,8 @@ fn write_status_snapshot(
         watches_active: wh.active,
         watches_failed: wh.failed,
         watch_error: wh.last_error.clone(),
+        heartbeat_age_secs: heartbeat::age(&paths::heartbeat_file(), std::time::SystemTime::now())
+            .map(|d| d.as_secs()),
         channels: cfg.notifications.channels.clone(),
         min_severity: cfg.notifications.min_severity.clone(),
         last_delivery: ns.last_delivery,
@@ -745,6 +1209,22 @@ fn write_status_snapshot(
         pending_notifications: ns.pending,
         last_notify_error: ns.last_error.clone(),
         delivered_per_channel: ns.per_channel.clone(),
+        dropped_per_channel: ns.dropped_by_channel.clone(),
+        events_dropped: health::snapshot(),
+        telegram_actions: if cfg.notifications.telegram.actions_enabled() {
+            format!(
+                "on ({} user{})",
+                cfg.notifications.telegram.allowed_user_ids.len(),
+                if cfg.notifications.telegram.allowed_user_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        } else {
+            "off".to_string()
+        },
+        telegram_poll_error: tgbot::last_poll_error(),
         config_hash: integrity.config_hash.clone(),
         binary_hash: integrity.binary_hash.clone(),
         integrity_ok: integrity.binary_ok && integrity.config_ok,

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::alert::Finding;
-use crate::detect::{writer_label, BurstTracker, Ctx};
+use crate::detect::{content_tag, writer_label, BurstTracker, Ctx};
 use crate::events::{
     is_editor_artifact, AuthEvent, AuthResult, DetectionId, FileEvent, FileKind, Severity,
 };
@@ -56,6 +56,8 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
         AuthResult::Success => {
             let recent = bursts.recent_failures(rhost, ev.ts, window);
             let after_burst = recent >= threshold;
+            let mut root_login: Option<Finding> = None;
+            let mut new_source: Option<Finding> = None;
             if after_burst {
                 let users = bursts.recent_users(rhost);
                 findings.push(
@@ -66,9 +68,10 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         &format!("d2|burst-success|{}", rhost),
                     )
                     .what(format!(
-                        "User '{}' authenticated from {} after {} failed attempts within {} \
+                        "User '{}' authenticated{} from {} after {} failed attempts within {} \
                          seconds{}.",
                         ev.user,
+                        ev.method.note(),
                         rhost,
                         recent,
                         ctx.cfg.ssh.failed_burst_window_secs,
@@ -82,11 +85,11 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     .fact("User", &ev.user)
                     .fact("Failed attempts", recent.to_string())
                     .why(
-                        "A login from an address that was just brute-forcing this host is the \
-                         credential-stuffing outcome, not the background noise of failed attempts.",
+                        "A login right after failed attempts from the same source usually means \
+                         one of those attempts worked. The failures alone were just noise.",
                     )
                     .actions([
-                        "Treat this session as hostile until proven otherwise.",
+                        "Confirm this session was expected before treating it as hostile.",
                         "Lock or rotate the account that succeeded and any others the source tried.",
                         "Block the source and review what the session did.",
                     ]),
@@ -97,13 +100,12 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 // HIGH the first time a source is seen; the same operator logging
                 // in again from the same place is context, not a new incident.
                 let seen_before = ctx.baseline.root_source_is_known(rhost);
-                let off_hours = ctx.is_off_hours(ev.ts);
-                let severity = if !seen_before || off_hours {
+                let severity = if !seen_before {
                     Severity::High
                 } else {
                     Severity::Info
                 };
-                findings.push(
+                root_login = Some(
                     Finding::new(
                         DetectionId::D2,
                         severity,
@@ -115,7 +117,8 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         &format!("d2|root-login|{}", rhost),
                     )
                     .what(format!(
-                        "root authenticated over SSH from {}{}.",
+                        "root authenticated over SSH{} from {}{}.",
+                        ev.method.note(),
                         rhost,
                         if seen_before {
                             ", a source that has logged in as root before"
@@ -124,7 +127,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         }
                     ))
                     .fact("Source", rhost.to_string())
-                    .fact("Timing", if off_hours { "off-hours" } else { "" })
                     .why(
                         "Direct root logins remove accountability and are the preferred target of \
                          credential attacks. If this host relies on them, set ssh.permit_root = true \
@@ -141,37 +143,35 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 && ctx.baseline.can_judge_novelty()
                 && !ctx.baseline.ssh_source_is_known(rhost)
             {
-                let off_hours = ctx.is_off_hours(ev.ts);
-                let elevated = ev.user == "root" || off_hours;
+                let elevated = ev.user == "root";
                 let severity = if elevated {
                     Severity::High
                 } else {
                     Severity::Low
                 };
-                findings.push(
+                new_source = Some(
                     Finding::new(
                         DetectionId::D2,
                         severity,
                         if elevated {
-                            "SSH login from a new source at an unusual time"
+                            "Root login from a new source"
                         } else {
                             "SSH login from a new source"
                         },
                         &format!("d2|new-source|{}|{}", rhost, ev.user),
                     )
                     .what(format!(
-                        "User '{}' authenticated from {}, a source never seen during the baseline \
-                         period{}.",
+                        "User '{}' authenticated{} from {}, a source never seen before.",
                         ev.user,
-                        rhost,
-                        if off_hours { " (off-hours)" } else { "" }
+                        ev.method.note(),
+                        rhost
                     ))
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
                     .why(
-                        "HERMIAN learned this host's SSH sources during its baseline period. A \
-                         first-time source combined with root access or off-hours timing deserves \
-                         a look.",
+                        "HERMIAN records every source it sees log in. A first-time source isn't \
+                         proof of anything by itself; it's just where a surprise login would show \
+                         up. Confirm it was expected.",
                     )
                     .actions([
                         "Confirm this login was expected.",
@@ -180,7 +180,32 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     ]),
                 );
             }
+            // One login, one alert. A root login from a never-seen source
+            // matches both rules above; keeping both sent two notifications
+            // for one event. The sharper finding wins (ties go to the root
+            // policy alert, which carries the novelty in its title anyway).
+            match (root_login, new_source) {
+                (Some(r), Some(n)) => findings.push(if n.severity > r.severity { n } else { r }),
+                (Some(r), None) => findings.push(r),
+                (None, Some(n)) => findings.push(n),
+                (None, None) => {}
+            }
         }
+    }
+    // A suspicious login (after a burst, from a new source, root from a new
+    // place) gets Ignore / Disconnect / Disconnect-and-block. A routine
+    // repeat (INFO) doesn't.
+    if ev.result == AuthResult::Success {
+        findings = findings
+            .into_iter()
+            .map(|f| {
+                if f.severity >= Severity::Low {
+                    login_offers(f, ev, rhost)
+                } else {
+                    f
+                }
+            })
+            .collect();
     }
     findings
 }
@@ -276,12 +301,14 @@ pub fn check_account_changes(
         Finding::new(
             DetectionId::D2,
             severity,
-            if change.privileged {
-                "Privileged group membership changed"
-            } else {
-                "System account database changed"
-            },
-            &format!("d2|account-change|{}", ev.path),
+            change.title,
+            // Keyed on what changed: a second, different change to the same
+            // file within the dedup window is its own alert.
+            &format!(
+                "d2|account-change|{}|{}",
+                ev.path,
+                content_tag(&change.summary)
+            ),
         )
         .what(format!("{}: {}", ev.path, change.summary))
         .fact("Path", &ev.path)
@@ -307,36 +334,148 @@ pub fn check_account_changes(
 pub struct AccountChange {
     pub summary: String,
     pub privileged: bool,
+    pub title: &'static str,
+}
+
+/// One /etc/passwd entry, as far as the diff cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdEntry {
+    uid: String,
+    gid: String,
+    home: String,
+    shell: String,
+}
+
+/// Numeric id 0, however it's written ("0", "00", " 0").
+fn is_zero_id(s: &str) -> bool {
+    s.trim().parse::<u64>() == Ok(0)
+}
+
+/// Shells that mean "no interactive login".
+pub fn is_nologin(shell: &str) -> bool {
+    let base = shell.rsplit('/').next().unwrap_or("");
+    shell.is_empty() || matches!(base, "nologin" | "false" | "sync" | "halt" | "shutdown")
+}
+
+/// Accounts that can log in: those with a real shell in /etc/passwd.
+pub fn login_users(passwd: &str) -> std::collections::HashSet<String> {
+    parse_passwd(passwd)
+        .into_iter()
+        .filter(|(_, e)| !is_nologin(&e.shell))
+        .map(|(n, _)| n)
+        .collect()
+}
+
+/// The three responses offered with a suspicious login.
+fn login_offers(f: Finding, ev: &AuthEvent, rhost: std::net::IpAddr) -> Finding {
+    use crate::response::ResponseAction;
+    f.offer(ResponseAction::Ignore {
+        sources: Vec::new(),
+        hours: 0,
+    })
+    .offer(ResponseAction::Disconnect {
+        source: rhost,
+        port: ev.port,
+        user: ev.user.clone(),
+        block: false,
+    })
+    .offer(ResponseAction::Disconnect {
+        source: rhost,
+        port: ev.port,
+        user: ev.user.clone(),
+        block: true,
+    })
+}
+
+fn parse_passwd(s: &str) -> Vec<(String, PasswdEntry)> {
+    s.lines()
+        .filter(|l| !l.trim_start().starts_with('#') && l.contains(':'))
+        .filter_map(|l| {
+            let mut it = l.split(':');
+            let name = it.next()?.to_string();
+            it.next()?;
+            let uid = it.next()?.to_string();
+            let gid = it.next().unwrap_or("").to_string();
+            it.next(); // gecos
+            let home = it.next().unwrap_or("").to_string();
+            let shell = it.next().unwrap_or("").trim().to_string();
+            Some((
+                name,
+                PasswdEntry {
+                    uid,
+                    gid,
+                    home,
+                    shell,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn diff_accounts(old: &str, new: &str) -> Option<AccountChange> {
-    let parse = |s: &str| -> Vec<(String, String)> {
-        s.lines()
-            .filter(|l| !l.trim_start().starts_with('#') && l.contains(':'))
-            .filter_map(|l| {
-                let mut it = l.split(':');
-                let name = it.next()?.to_string();
-                it.next()?;
-                let uid = it.next()?.to_string();
-                Some((name, uid))
-            })
-            .collect()
-    };
-    let old_map: HashMap<String, String> = parse(old).into_iter().collect();
-    let added: Vec<String> = parse(new)
-        .into_iter()
-        .filter(|(n, uid)| old_map.get(n.as_str()) != Some(uid))
-        .map(|(n, uid)| format!("{} (uid {})", n, uid))
-        .collect();
-    if added.is_empty() {
+    let old_map: HashMap<String, PasswdEntry> = parse_passwd(old).into_iter().collect();
+    let mut changes = Vec::new();
+    let mut privileged = false;
+    for (name, e) in parse_passwd(new) {
+        match old_map.get(&name) {
+            None => {
+                changes.push(format!("{} (uid {}) added", name, e.uid));
+                privileged |= is_zero_id(&e.uid) || is_zero_id(&e.gid);
+            }
+            Some(o) if o == &e => {}
+            Some(o) => {
+                let mut what = Vec::new();
+                if o.uid != e.uid {
+                    what.push(format!("uid {} -> {}", o.uid, e.uid));
+                    privileged |= is_zero_id(&e.uid);
+                }
+                if o.gid != e.gid {
+                    what.push(format!("gid {} -> {}", o.gid, e.gid));
+                    privileged |= is_zero_id(&e.gid);
+                }
+                if o.shell != e.shell {
+                    what.push(format!("shell {} -> {}", o.shell, e.shell));
+                    // A service account that suddenly gets a login shell is
+                    // a classic backdoor.
+                    privileged |= is_nologin(&o.shell) && !is_nologin(&e.shell);
+                }
+                if o.home != e.home {
+                    what.push(format!("home {} -> {}", o.home, e.home));
+                }
+                changes.push(format!("{} changed ({})", name, what.join(", ")));
+            }
+        }
+    }
+    if changes.is_empty() {
         return None;
     }
-    let privileged = added.iter().any(|a| a.contains("(uid 0)"));
     Some(AccountChange {
-        summary: format!("new or changed accounts: {}", added.join(", ")),
+        summary: format!("accounts: {}", changes.join("; ")),
         privileged,
+        title: if privileged {
+            "Privileged account added or changed"
+        } else {
+            "System account database changed"
+        },
     })
 }
+
+/// Groups whose members are root, or close to it: sudo/wheel/admin by
+/// policy, docker/lxd/incus/libvirt via the daemons they control, disk and
+/// shadow via raw access to block devices and password hashes.
+const PRIVILEGED_GROUPS: &[&str] = &[
+    "sudo",
+    "wheel",
+    "admin",
+    "root",
+    "docker",
+    "lxd",
+    "incus-admin",
+    "libvirt",
+    "disk",
+    "shadow",
+    "adm",
+];
 
 fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
     let parse = |s: &str| -> HashMap<String, Vec<String>> {
@@ -363,7 +502,7 @@ fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
     let new_map = parse(new);
     let mut changes = Vec::new();
     let mut privileged = false;
-    for target in ["sudo", "wheel", "admin", "root"] {
+    for target in PRIVILEGED_GROUPS.iter().copied() {
         let old_members = old_map.get(target).cloned().unwrap_or_default();
         let new_members = new_map.get(target).cloned().unwrap_or_default();
         let added: Vec<&String> = new_members
@@ -404,6 +543,11 @@ fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
         Some(AccountChange {
             summary: changes.join("; "),
             privileged,
+            title: if privileged {
+                "Privileged group membership changed"
+            } else {
+                "System account database changed"
+            },
         })
     }
 }
@@ -427,6 +571,37 @@ mod tests {
         let new = "root:x:0:0:root:/root:/bin/bash\ntoor:x:0:0::/root:/bin/bash\n";
         let diff = diff_accounts(old, new).expect("diff");
         assert!(diff.privileged);
+    }
+
+    #[test]
+    fn account_diff_flags_zero_uid_however_written() {
+        let old = "root:x:0:0:root:/root:/bin/bash\n";
+        let new = "root:x:0:0:root:/root:/bin/bash\nsvc:x:00:0::/:/bin/sh\n";
+        assert!(diff_accounts(old, new).unwrap().privileged);
+    }
+
+    #[test]
+    fn account_diff_flags_a_service_account_getting_a_shell() {
+        let old = "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n";
+        let new = "www-data:x:33:33:www-data:/var/www:/bin/bash\n";
+        let d = diff_accounts(old, new).unwrap();
+        assert!(d.privileged);
+        assert!(d.summary.contains("shell"), "{}", d.summary);
+        // Home and gid changes are reported too.
+        let moved = "www-data:x:33:0:www-data:/root:/usr/sbin/nologin\n";
+        let d = diff_accounts(old, moved).unwrap();
+        assert!(d.privileged, "gid 0");
+        assert!(d.summary.contains("home"), "{}", d.summary);
+    }
+
+    #[test]
+    fn group_diff_covers_root_equivalent_groups() {
+        for g in ["docker", "lxd", "disk", "shadow"] {
+            let old = format!("{}:x:999:\n", g);
+            let new = format!("{}:x:999:eve\n", g);
+            let d = diff_groups(&old, &new).unwrap_or_else(|| panic!("{}", g));
+            assert!(d.privileged, "{}", g);
+        }
     }
 
     #[test]

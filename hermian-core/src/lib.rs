@@ -13,6 +13,7 @@ pub mod detect;
 pub mod engine;
 pub mod events;
 pub mod proctree;
+pub mod response;
 pub mod selftest;
 
 pub use alert::{
@@ -23,9 +24,10 @@ pub use baseline::Baseline;
 pub use config::{Config, DEFAULT_CONFIG_TOML};
 pub use engine::{Counters, Engine, EngineFlaggedChain as FlaggedChain};
 pub use events::{
-    AuthEvent, AuthResult, ConnectEvent, DetectionId, Event, ExecEvent, FileEvent, FileKind,
-    ListenerEvent, ProcInfo, PtraceEvent, Severity, WriterInfo,
+    AuthEvent, AuthMethod, AuthResult, ConnectEvent, DetectionId, Event, ExecEvent, FileEvent,
+    FileKind, ListenerEvent, ProcInfo, PtraceEvent, Severity, WriterInfo,
 };
 pub use proctree::{role_of, ProcessTree, Role};
+pub use response::ResponseAction;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

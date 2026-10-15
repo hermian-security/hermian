@@ -17,11 +17,8 @@ use crate::notify::SendError;
 pub mod telegram {
     use super::*;
 
-    /// Telegram caps messages at 4096 chars; keep headroom for the pre block.
-    const MAX_TEXT: usize = 3800;
-
     /// Bot API base. Overridable for integration tests against a mock server.
-    fn api_base() -> String {
+    pub fn api_base() -> String {
         std::env::var("HERMIAN_TELEGRAM_API")
             .unwrap_or_else(|_| "https://api.telegram.org".to_string())
     }
@@ -30,11 +27,13 @@ pub mod telegram {
     fn redact(cfg: &TelegramCfg, e: impl std::fmt::Display) -> String {
         let s = e.to_string();
         // replace("") would insert "<token>" between every character.
-        if cfg.bot_token.is_empty() {
+        let s = if cfg.bot_token.is_empty() {
             s
         } else {
             s.replace(&cfg.bot_token, "<token>")
-        }
+        };
+        // And if the URL comes back escaped or normalised, drop its path.
+        crate::notify::webhook::strip_url_paths(&s)
     }
 
     /// Escape for Telegram's HTML parse mode.
@@ -44,17 +43,16 @@ pub mod telegram {
             .replace('>', "&gt;")
     }
 
-    fn glyph(s: Severity) -> &'static str {
+    /// A four-cell severity meter (filled cells count up with severity).
+    pub(super) fn meter(s: Severity) -> &'static str {
         match s {
-            Severity::Critical => "\u{1F534}", // red circle
-            Severity::High => "\u{1F7E0}",     // orange circle
-            Severity::Low => "\u{1F7E1}",      // yellow circle
-            Severity::Info => "\u{26AA}",      // white circle
+            Severity::Critical => "\u{25A0}\u{25A0}\u{25A0}\u{25A0}", // â– â– â– â–
+            Severity::High => "\u{25A0}\u{25A0}\u{25A0}\u{25A1}",     // â– â– â– â–¡
+            Severity::Low => "\u{25A0}\u{25A0}\u{25A1}\u{25A1}",      // â– â– â–¡â–¡
+            Severity::Info => "\u{25A0}\u{25A1}\u{25A1}\u{25A1}",     // â– â–¡â–¡â–¡
         }
     }
 
-    /// Build the HTML message body: a bold headline, the human summary, and
-    /// the full plain-theme alert in a monospace block.
     /// Cut `s` to at most `max` chars, marking the cut. Applied before
     /// escaping so an HTML entity is never split.
     fn clip(s: &str, max: usize) -> String {
@@ -66,59 +64,34 @@ pub mod telegram {
         out
     }
 
+    /// Build the HTML message body: the severity meter and host, the
+    /// headline, one or two sentences of what happened, and the
+    /// `hermian show` line. Evidence, the process chain, why it matters and
+    /// the recommended steps stay in the CLI; the message says what happened,
+    /// nothing more.
     pub fn body(alert: &Alert) -> String {
-        // Every piece is complete HTML, so skipping one never leaves an open
-        // tag; the footer is always kept. Facts can quote attacker-controlled
-        // file content, so without a budget one long line could push the
-        // message past Telegram's limit and get it rejected on every retry.
-        let footer = format!("\n<code>hermian show {}</code>", esc(&alert.ref_id));
         let mut out = format!(
-            "{} <b>HERMIAN {}</b> \u{00B7} <code>{}</code>\n<b>{}</b>\n",
-            glyph(alert.severity),
+            "<b>{} HERMIAN - {}</b>\nHost : {}",
+            meter(alert.severity),
             alert.severity.as_str(),
-            esc(&clip(&alert.host, 80)),
-            esc(&clip(&alert.title, 200))
+            esc(&clip(&alert.host, 60))
         );
-        let mut pieces = Vec::new();
+        if alert.repeats > 1 {
+            out.push_str(&format!("  (seen {} times)", alert.repeats));
+        }
+        if !alert.title.trim().is_empty() {
+            out.push_str(&format!(
+                "\n\n<b>{}</b>",
+                esc(&clip(alert.title.trim(), 160))
+            ));
+        }
         if !alert.what.is_empty() {
-            pieces.push(format!("{}\n", esc(&clip(&alert.what, 1200))));
+            out.push_str(&format!("\n{}", esc(&clip(&alert.what, 500))));
         }
-        if !alert.chain.is_empty() {
-            let chain: Vec<String> = alert
-                .chain
-                .iter()
-                .map(|n| format!("{}({})", n.comm, n.pid))
-                .collect();
-            pieces.push(format!(
-                "<i>chain:</i> <code>{}</code>\n",
-                esc(&clip(&chain.join(" \u{2192} "), 600))
-            ));
-        }
-        for f in &alert.facts {
-            pieces.push(format!(
-                "<i>{}:</i> <code>{}</code>\n",
-                esc(&clip(&f.label, 60)),
-                esc(&clip(&f.value, 400))
-            ));
-        }
-        if let Some(a) = alert.actions.first() {
-            pieces.push(format!("\n<b>Next:</b> {}\n", esc(&clip(a, 400))));
-        }
-        let footer_len = footer.chars().count();
-        for p in pieces {
-            if out.chars().count() + p.chars().count() + footer_len <= MAX_TEXT {
-                out.push_str(&p);
-            }
-        }
-        out.push_str(&footer);
-        // Full rendering as an expandable-ish block, if it fits.
-        let full = render(alert, Theme::Plain);
-        let budget = MAX_TEXT.saturating_sub(out.chars().count() + 20);
-        if full.chars().count() < budget {
-            out.push_str("\n\n<pre>");
-            out.push_str(&esc(&full));
-            out.push_str("</pre>");
-        }
+        out.push_str(&format!(
+            "\n\n<code>hermian show {}</code>",
+            esc(&alert.ref_id)
+        ));
         out
     }
 
@@ -134,12 +107,37 @@ pub mod telegram {
         if let Some(t) = cfg.message_thread_id {
             payload["message_thread_id"] = serde_json::json!(t);
         }
+        // Response buttons, when enabled and the alert offers any.
+        let buttons = if cfg.actions_enabled() && !alert.offers.is_empty() {
+            crate::tgbot::register(
+                &alert.ref_id,
+                &alert.offers,
+                cfg.action_ttl_mins,
+                chrono::Utc::now(),
+            )
+        } else {
+            Vec::new()
+        };
+        if !buttons.is_empty() {
+            payload["reply_markup"] = crate::tgbot::keyboard(&buttons);
+        }
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(cfg.timeout_secs.clamp(3, 60)))
             .user_agent(&format!("hermian/{}", hermian_core::VERSION))
             .build();
         match agent.post(&url).send_json(payload) {
-            Ok(_) => Ok(()),
+            Ok(resp) => {
+                if !buttons.is_empty() {
+                    if let Some(mid) = resp
+                        .into_json::<serde_json::Value>()
+                        .ok()
+                        .and_then(|v| v["result"]["message_id"].as_i64())
+                    {
+                        crate::tgbot::attach_message(&buttons, mid);
+                    }
+                }
+                Ok(())
+            }
             Err(ureq::Error::Status(code, resp)) => {
                 let detail = resp
                     .into_string()
@@ -359,7 +357,21 @@ pub mod email {
         .map_err(|e| format!("build message: {}", e))
     }
 
+    /// Credentials over a cleartext connection to another host give the
+    /// password to anyone on the path. Local relays (loopback) are fine.
+    pub fn cleartext_credentials(cfg: &EmailCfg) -> bool {
+        let local = matches!(cfg.smtp_host.as_str(), "localhost" | "127.0.0.1" | "::1")
+            || cfg.smtp_host.starts_with("127.");
+        cfg.smtp_security == "none" && !cfg.smtp_username.is_empty() && !local
+    }
+
     fn smtp(cfg: &EmailCfg) -> Result<SmtpTransport, String> {
+        if cleartext_credentials(cfg) {
+            return Err(
+                "refusing to send SMTP credentials without TLS; set smtp_security = \"starttls\" or \"tls\""
+                    .to_string(),
+            );
+        }
         let timeout = Some(Duration::from_secs(cfg.timeout_secs.clamp(5, 120)));
         let mut t = match cfg.smtp_security.as_str() {
             "tls" => {
@@ -449,6 +461,7 @@ mod tests {
             "x",
         )
         .what("A & B")
+        .why("Loader injection is a common persistence trick.")
         .fact("Preloads", "/tmp/evil.so")
         .action("Remove it.");
         Alert::from_finding(
@@ -466,7 +479,9 @@ mod tests {
         assert!(b.contains("A &amp; B"));
         assert!(!b.contains("<modified>"));
         assert!(b.chars().count() <= 4096);
-        assert!(b.contains("<pre>"));
+        assert!(!b.contains("<pre>"));
+        assert!(!b.contains("Loader injection"));
+        assert!(!b.contains("Remove it."));
     }
 
     #[test]
@@ -483,6 +498,86 @@ mod tests {
         // Never a dangling entity or tag.
         assert_eq!(b.matches("<code>").count(), b.matches("</code>").count());
         assert!(!b.contains("&am\n") && !b.contains("&l\n"));
+    }
+
+    #[test]
+    fn telegram_body_has_a_meter_and_no_emoji() {
+        let b = telegram::body(&alert());
+        // No emoji anywhere: severity is a word and a block meter.
+        assert!(!b.chars().any(|c| c as u32 >= 0x1F000), "{}", b);
+        assert!(
+            b.starts_with("<b>\u{25A0}\u{25A0}\u{25A0}\u{25A0} HERMIAN - CRITICAL</b>"),
+            "{}",
+            b
+        );
+        assert!(b.contains("Host : web-01"));
+        assert!(b.contains("<b>ld.so.preload &lt;modified&gt;</b>"));
+        assert!(b.contains("A &amp; B"));
+        // The why, the steps and the facts stay in the CLI.
+        assert!(!b.contains("Loader injection"));
+        assert!(!b.contains("Remove it."));
+        assert!(!b.contains("/tmp/evil.so"));
+        assert!(b.ends_with("<code>hermian show HER-2025-0101-007</code>"));
+    }
+
+    #[test]
+    fn meters_count_up_with_severity() {
+        assert_eq!(
+            telegram::meter(Severity::Critical),
+            "\u{25A0}\u{25A0}\u{25A0}\u{25A0}"
+        );
+        assert_eq!(
+            telegram::meter(Severity::High),
+            "\u{25A0}\u{25A0}\u{25A0}\u{25A1}"
+        );
+        assert_eq!(
+            telegram::meter(Severity::Low),
+            "\u{25A0}\u{25A0}\u{25A1}\u{25A1}"
+        );
+        assert_eq!(
+            telegram::meter(Severity::Info),
+            "\u{25A0}\u{25A1}\u{25A1}\u{25A1}"
+        );
+    }
+
+    #[test]
+    fn telegram_body_is_a_headline_and_a_sentence() {
+        let f = Finding::new(
+            DetectionId::D2,
+            Severity::Low,
+            "SSH login from a new source",
+            "x",
+        )
+        .what("User 'deploy' authenticated (key) from 1.2.3.4, a source never seen before.")
+        .fact("Source", "1.2.3.4")
+        .why("Some explanation that stays in the CLI.")
+        .action("Do something about it.");
+        let a = Alert::from_finding(f, "HER-2".into(), "web-01".into(), chrono::Utc::now());
+        let b = telegram::body(&a);
+        assert!(b.contains("<b>SSH login from a new source</b>"), "{}", b);
+        assert!(b.contains("authenticated (key) from 1.2.3.4"), "{}", b);
+        assert!(!b.contains("Some explanation"), "{}", b);
+        assert!(!b.contains("Do something"), "{}", b);
+        assert!(b.chars().count() < 400, "{}", b);
+    }
+
+    #[test]
+    fn smtp_credentials_need_tls_unless_local() {
+        let mut c = EmailCfg {
+            smtp_host: "mail.example.com".into(),
+            smtp_username: "u".into(),
+            smtp_security: "none".into(),
+            ..EmailCfg::default()
+        };
+        assert!(email::cleartext_credentials(&c));
+        c.smtp_security = "starttls".into();
+        assert!(!email::cleartext_credentials(&c));
+        c.smtp_security = "none".into();
+        c.smtp_host = "127.0.0.1".into();
+        assert!(!email::cleartext_credentials(&c));
+        c.smtp_host = "mail.example.com".into();
+        c.smtp_username.clear();
+        assert!(!email::cleartext_credentials(&c));
     }
 
     #[test]

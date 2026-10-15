@@ -1,0 +1,41 @@
+[Unit]
+Description=HERMIAN dead-man switch
+Documentation=https://github.com/hermian-security/hermian
+After=hermian.service
+# One-shot check: an alert and a restart attempt, or silence.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=%EXEC% watchdog
+# Alerts go to the journal as well as the configured channels.
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+
+# Shared with hermian.service (systemd reference-counts them). The watchdog
+# writes its alert records and rate-limit state here.
+StateDirectory=hermian
+StateDirectoryMode=0700
+LogsDirectory=hermian
+LogsDirectoryMode=0700
+
+# Only reads /etc (config, hashes), talks to systemd, and sends alerts.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# The daemon must see the real /tmp (see hermian.service); keep the same
+# view here so anything spawned by systemctl behaves the same.
+PrivateTmp=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

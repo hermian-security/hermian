@@ -10,12 +10,19 @@ pub struct Baseline {
     pub started_at: Option<DateTime<Utc>>,
     pub duration_hours: u32,
     pub complete: bool,
+    /// Successful SSH login sources, recorded for the lifetime of the install.
+    /// The learning window only gates when novelty is judged; learning keeps
+    /// going afterwards so a source is "new" exactly once, not every time it
+    /// appears after the window closed.
     pub known_ssh_sources: HashSet<IpAddr>,
+    /// Destinations of outbound connections, recorded lifetime-wide like
+    /// `known_ssh_sources`.
     pub known_dests: HashSet<IpAddr>,
+    /// Connecting programs (see `connector_key`), recorded lifetime-wide.
     pub known_connectors: HashSet<String>,
-    /// Sources that have successfully logged in as root. Unlike the sets above
-    /// this is recorded for the lifetime of the install, not just during the
-    /// learning window: it answers "has this happened before", not "is normal".
+    /// Sources that have successfully logged in as root. Separate from
+    /// `known_ssh_sources` so the root rule can ask "has this source ever
+    /// logged in as root", not just "is this source normal".
     #[serde(default)]
     pub root_sources: HashSet<IpAddr>,
     /// How `known_connectors` keys were built. Baselines written before the
@@ -31,6 +38,11 @@ pub struct Baseline {
 
 /// Current `known_connectors` key scheme: the connecting process's own exe.
 pub const CONNECTOR_SCHEME: u8 = 1;
+
+/// Most entries learned per set. A busy host (or a hostile one, during the
+/// learning window) could otherwise grow these, and baseline.json, without
+/// limit. Past the cap, unseen values are simply novel.
+pub const MAX_LEARNED: usize = 50_000;
 
 impl Default for Baseline {
     fn default() -> Self {
@@ -88,6 +100,9 @@ impl Baseline {
 
     /// Record a successful root login; returns true if the source was new.
     pub fn observe_root_source(&mut self, ip: IpAddr) -> bool {
+        if self.root_sources.len() >= MAX_LEARNED {
+            return false;
+        }
         self.root_sources.insert(ip)
     }
 
@@ -136,21 +151,23 @@ impl Baseline {
 
     pub fn observe_ssh_source(&mut self, ip: IpAddr, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete {
+        if self.known_ssh_sources.len() < MAX_LEARNED {
             self.known_ssh_sources.insert(ip);
         }
     }
 
     pub fn observe_dest(&mut self, ip: IpAddr, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete {
+        if self.known_dests.len() < MAX_LEARNED {
             self.known_dests.insert(ip);
         }
     }
 
+    /// The relearn window only suppresses judging (see `can_judge_connectors`);
+    /// observation itself is lifetime-wide like the other sets.
     pub fn observe_connector(&mut self, key: &str, now: DateTime<Utc>) {
         self.check_completion(now);
-        if !self.complete || self.relearning_connectors(now) {
+        if self.known_connectors.len() < MAX_LEARNED {
             self.known_connectors.insert(key.to_string());
         }
     }
@@ -235,9 +252,36 @@ mod tests {
         assert!(b.can_judge_connectors(later));
         assert!(b.connector_is_known("/usr/sbin/nginx|33"));
         b.observe_connector("/tmp/x|33", later);
-        assert!(!b.connector_is_known("/tmp/x|33"));
+        // Observation keeps recording after the window, so a reconnect from
+        // this program is known and won't be judged novel again.
+        assert!(b.connector_is_known("/tmp/x|33"));
         // Idempotent for current-scheme baselines.
         b.migrate_connectors(later);
         assert!(b.connector_is_known("/usr/sbin/nginx|33"));
+    }
+
+    /// The sets used to freeze when the learning window closed, so anything
+    /// first seen afterwards re-alerted on every later occurrence (a login
+    /// from one IP paged "new source" indefinitely). They now learn for the
+    /// lifetime of the install; only judgement waits for the window.
+    #[test]
+    fn known_sets_keep_learning_after_the_window() {
+        let t0 = now();
+        let mut b = Baseline::new(true, 24, t0);
+        let later = t0 + Duration::hours(25);
+        assert!(b.check_completion(later));
+        let src: IpAddr = "192.0.2.11".parse().unwrap();
+        let dst: IpAddr = "198.51.100.7".parse().unwrap();
+        assert!(!b.ssh_source_is_known(src));
+        assert!(!b.dest_is_known(dst));
+        assert!(!b.connector_is_known("/usr/bin/curl|0"));
+        b.observe_ssh_source(src, later);
+        b.observe_dest(dst, later);
+        b.observe_connector("/usr/bin/curl|0", later);
+        assert!(b.ssh_source_is_known(src));
+        assert!(b.dest_is_known(dst));
+        assert!(b.connector_is_known("/usr/bin/curl|0"));
+        // A value never observed is still novel.
+        assert!(!b.ssh_source_is_known("192.0.2.99".parse().unwrap()));
     }
 }

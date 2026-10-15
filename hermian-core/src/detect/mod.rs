@@ -1,10 +1,11 @@
+pub mod brute;
 pub mod d1;
 pub mod d2;
 pub mod d3;
 pub mod d4;
 pub mod d5;
 
-use chrono::{DateTime, Duration, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
@@ -14,6 +15,12 @@ use crate::baseline::Baseline;
 use crate::config::Config;
 use crate::events::{DetectionId, FileEvent, Severity, WriterInfo};
 use crate::proctree::ProcessTree;
+
+/// How long a D1 flag escalates related activity in its chain (connects,
+/// listeners, transient-dir execs). Two minutes was beaten by a `sleep 130`
+/// before the callback; flags no longer cover the service itself, so a
+/// longer window doesn't taint unrelated requests.
+pub const FLAG_WINDOW_SECS: i64 = 600;
 
 /// A process chain that a prior detection flagged; later detections use this to
 /// escalate related activity (e.g. a connect from a flagged web-shell chain).
@@ -62,20 +69,6 @@ impl Attribution {
 }
 
 impl<'a> Ctx<'a> {
-    pub fn is_off_hours(&self, now: DateTime<Utc>) -> bool {
-        let hour = now.hour();
-        let start = self.cfg.ssh.off_hours_start;
-        let end = self.cfg.ssh.off_hours_end;
-        if start == end {
-            return false;
-        }
-        if start < end {
-            hour >= start && hour < end
-        } else {
-            hour >= start || hour < end
-        }
-    }
-
     pub fn has_recent_flag(
         &self,
         pid: u32,
@@ -140,12 +133,34 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Short, stable tag for some content, for dedup signatures.
+///
+/// A signature like `d4|sudoers|<path>` folded a second, different change to
+/// the same file within the dedup window into the first ("new user mallory",
+/// then "mallory added to sudo" a minute later was silent). Rules that
+/// report on content add this tag so only identical content is deduplicated.
+/// FNV-1a: not a security boundary, just a cheap fingerprint.
+pub fn content_tag(content: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in content.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:016x}", h)
+}
+
 pub fn writer_label(writer: Option<&WriterInfo>) -> String {
     match writer {
         Some(w) => format!("{} (pid {})", w.comm, w.pid),
         None => "an unidentified process".to_string(),
     }
 }
+
+/// Most auth sources tracked at once.
+pub const MAX_BURST_SOURCES: usize = 20_000;
+/// Most attempt timestamps kept per source: one past the largest allowed
+/// `ssh.failed_burst_count`, so the threshold can always be reached.
+const MAX_ATTEMPTS_PER_SOURCE: usize = 10_001;
 
 /// Sliding-window counter keyed by source address.
 #[derive(Debug, Default)]
@@ -166,10 +181,28 @@ impl BurstTracker {
         window_secs: i64,
         user: &str,
     ) -> usize {
+        // Sources are attacker-chosen (an IPv6 scanner can rotate through a
+        // /64): bound the map by dropping the quietest source.
+        if !self.counts.contains_key(&ip) && self.counts.len() >= MAX_BURST_SOURCES {
+            let oldest = self
+                .counts
+                .iter()
+                .min_by_key(|(_, q)| q.back().copied())
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                self.counts.remove(&k);
+                self.users.remove(&k);
+            }
+        }
         let q = self.counts.entry(ip).or_default();
         q.push_back(now);
         let cutoff = now - Duration::seconds(window_secs);
         while q.front().map(|t| *t < cutoff).unwrap_or(false) {
+            q.pop_front();
+        }
+        // Only the count matters past the threshold; don't keep a timestamp
+        // per attempt of a flood.
+        while q.len() > MAX_ATTEMPTS_PER_SOURCE {
             q.pop_front();
         }
         if !user.is_empty() {
@@ -256,44 +289,24 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
 
-    fn ctx<'a>(
-        cfg: &'a Config,
-        tree: &'a ProcessTree,
-        baseline: &'a Baseline,
-        allowlist: &'a Allowlist,
-        flags: &'a VecDeque<FlaggedChain>,
-        users: &'a HashMap<u32, String>,
-        now: DateTime<Utc>,
-    ) -> Ctx<'a> {
-        Ctx {
-            tree,
-            baseline,
-            allowlist,
-            cfg,
-            flags,
-            user_names: users,
-            now,
-        }
+    #[test]
+    fn content_tags_differ_by_content() {
+        assert_eq!(content_tag("a"), content_tag("a"));
+        assert_ne!(
+            content_tag("eve ALL=(ALL) ALL"),
+            content_tag("eve ALL=(ALL) NOPASSWD: ALL")
+        );
     }
 
     #[test]
-    fn off_hours_window() {
-        let cfg = Config::default();
-        let tree = ProcessTree::new();
-        let baseline = Baseline::default();
-        let allowlist = Allowlist::default();
-        let flags = VecDeque::new();
-        let users = HashMap::new();
-        let t = Utc::now().with_hour(23).unwrap().with_minute(30).unwrap();
-        let c = ctx(&cfg, &tree, &baseline, &allowlist, &flags, &users, t);
-        assert!(c.is_off_hours(t));
-        assert!(!c.is_off_hours(Utc::now().with_hour(12).unwrap()));
-
-        let mut disabled = Config::default();
-        disabled.ssh.off_hours_start = 0;
-        disabled.ssh.off_hours_end = 0;
-        let c = ctx(&disabled, &tree, &baseline, &allowlist, &flags, &users, t);
-        assert!(!c.is_off_hours(t));
+    fn burst_sources_are_bounded() {
+        let mut b = BurstTracker::default();
+        let t = Utc::now();
+        for i in 0..(MAX_BURST_SOURCES as u32 + 10) {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(i));
+            b.record(ip, t + Duration::milliseconds(i64::from(i)), 60);
+        }
+        assert_eq!(b.len(), MAX_BURST_SOURCES);
     }
 
     #[test]

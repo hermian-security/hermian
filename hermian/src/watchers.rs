@@ -36,6 +36,10 @@ const WATCH_FILES: &[&str] = &[
     "/etc/gshadow",
     "/etc/ssh/sshd_config",
     "/etc/ssh/ssh_config",
+    "/etc/environment",
+    "/etc/rc.local",
+    "/etc/modules",
+    "/etc/security/pam_env.conf",
 ];
 
 const WATCH_DIRS: &[&str] = &[
@@ -47,15 +51,23 @@ const WATCH_DIRS: &[&str] = &[
     "/etc/cron.monthly",
     "/var/spool/cron",
     "/var/spool/cron/crontabs",
+    "/var/spool/cron/atjobs",
+    "/var/spool/at",
     "/etc/profile.d",
     "/etc/systemd/system",
+    "/usr/lib/systemd/system",
     "/etc/ld.so.conf.d",
     "/etc/sudoers.d",
     "/etc/ssh",
     "/etc/ssh/sshd_config.d",
     "/etc/ssh/ssh_config.d",
+    "/etc/pam.d",
+    "/etc/udev/rules.d",
+    "/etc/modules-load.d",
+    "/etc/security",
     "/root",
     "/root/.ssh",
+    "/root/.config/systemd/user",
 ];
 
 /// Files under a watched directory that we care about. Anything else in e.g.
@@ -69,6 +81,9 @@ fn is_interesting(path: &str) -> bool {
     match parent {
         "/etc" => WATCH_FILES.contains(&path),
         "/etc/ssh" => name == "sshd_config" || name == "ssh_config",
+        "/etc/security" => name == "pam_env.conf",
+        // ~/.config/systemd/user/<unit> for root and users.
+        p if p.ends_with("/.config/systemd/user") => true,
         "/root" => matches!(
             name,
             ".bashrc"
@@ -101,9 +116,13 @@ fn is_interesting(path: &str) -> bool {
         // Enable links and drop-ins. These dirs were already watched, but
         // their events were thrown away here.
         p if is_systemd_subdir(p) => true,
-        _ => WATCH_DIRS
-            .iter()
-            .any(|d| *d != "/etc" && *d != "/root" && *d != "/etc/ssh" && parent == *d),
+        _ => WATCH_DIRS.iter().any(|d| {
+            *d != "/etc"
+                && *d != "/root"
+                && *d != "/etc/ssh"
+                && *d != "/etc/security"
+                && parent == *d
+        }),
     }
 }
 
@@ -192,6 +211,14 @@ impl Watches {
     fn refresh(&mut self) {
         for p in WATCH_FILES.iter().chain(WATCH_DIRS.iter()) {
             self.add(Path::new(p));
+        }
+        // Vendor units on hosts where /lib isn't a symlink to /usr/lib (on
+        // merged-/usr hosts it's the same directory as /usr/lib/...).
+        if std::fs::symlink_metadata("/lib")
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
+            self.add(Path::new("/lib/systemd/system"));
         }
         for p in systemd_target_dirs() {
             self.add(&p);
@@ -290,22 +317,68 @@ fn systemd_target_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// A real directory, not a symlink to one: a symlinked home or `~/.ssh`
+/// would point a root-owned watch (and root reads) somewhere else.
+fn real_dir(p: &Path) -> bool {
+    std::fs::symlink_metadata(p)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+}
+
 fn user_home_watches() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/home") else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let home = e.path();
-        if !home.is_dir() {
-            continue;
-        }
-        out.push(home.clone());
-        let ssh_dir = home.join(".ssh");
-        if ssh_dir.is_dir() {
-            out.push(ssh_dir);
+    if let Ok(entries) = std::fs::read_dir("/home") {
+        for e in entries.flatten() {
+            let home = e.path();
+            if !real_dir(&home) {
+                continue;
+            }
+            out.push(home.clone());
+            for sub in [".ssh", ".config/systemd/user"] {
+                let d = home.join(sub);
+                if real_dir(&d) {
+                    out.push(d);
+                }
+            }
         }
     }
+    // Service accounts keep homes elsewhere (/var/www, /var/lib/postgresql):
+    // an authorized_keys there is as good a backdoor as one in /home.
+    for home in procsrc::read_file("/etc/passwd")
+        .map(|c| passwd_homes(&c))
+        .unwrap_or_default()
+    {
+        let d = home.join(".ssh");
+        if real_dir(&home) && real_dir(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// Home directories from /etc/passwd outside /home and /root (those are
+/// covered already), skipping `/` and the usual non-homes.
+fn passwd_homes(passwd: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = passwd
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.split(':').nth(5))
+        .map(str::trim)
+        .filter(|h| {
+            h.starts_with('/')
+                && *h != "/"
+                && *h != "/root"
+                && !h.starts_with("/home/")
+                && !matches!(
+                    *h,
+                    "/nonexistent" | "/dev/null" | "/bin" | "/sbin" | "/usr/sbin"
+                )
+                && !h.contains("/../")
+        })
+        .map(PathBuf::from)
+        .collect();
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -427,6 +500,7 @@ fn watcher_loop(
         // snapshot and queue those, rather than silently missing them.
         if overflowed {
             overflows += 1;
+            crate::health::INOTIFY_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
             let fresh = snapshot(&w);
             let changes = snapshot_changes(&known, &fresh);
             let now = Instant::now();
@@ -658,6 +732,17 @@ fn content_for(path: &str, is_config: bool) -> Option<String> {
         || name == "authorized_keys"
         || name == "authorized_keys2"
         || path.starts_with("/etc/systemd/system/")
+        || path.starts_with("/usr/lib/systemd/system/")
+        || path.starts_with("/lib/systemd/system/")
+        || path.contains("/.config/systemd/user/")
+        || path.starts_with("/etc/pam.d/")
+        || path == "/etc/environment"
+        || path == "/etc/security/pam_env.conf"
+        || path == "/etc/rc.local"
+        || path.starts_with("/etc/udev/rules.d/")
+        || path == "/etc/modules"
+        || path.starts_with("/etc/modules-load.d/")
+        || path.starts_with("/var/spool/at/")
         || name.starts_with(".bash")
         || name.starts_with(".z")
         || name == ".profile";
@@ -693,6 +778,29 @@ mod tests {
         assert!(!is_interesting("/etc/ssh/moduli"));
         assert!(!is_interesting("/root/notes.txt"));
         assert!(!is_interesting("/home/dev/project/.bashrc"));
+        // Surfaces added after review.
+        assert!(is_interesting("/etc/pam.d/sshd"));
+        assert!(is_interesting("/etc/environment"));
+        assert!(is_interesting("/etc/rc.local"));
+        assert!(is_interesting("/etc/udev/rules.d/99-x.rules"));
+        assert!(is_interesting("/etc/modules-load.d/x.conf"));
+        assert!(is_interesting("/etc/security/pam_env.conf"));
+        assert!(!is_interesting("/etc/security/limits.conf"));
+        assert!(is_interesting("/usr/lib/systemd/system/x.service"));
+        assert!(is_interesting("/root/.config/systemd/user/x.service"));
+        assert!(is_interesting("/home/dev/.config/systemd/user/x.service"));
+        assert!(is_interesting("/var/spool/cron/atjobs/a0001"));
+        assert!(is_interesting("/var/www/.ssh/authorized_keys"));
+    }
+
+    #[test]
+    fn service_account_homes_are_found() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n\
+                      nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n\
+                      dev:x:1000:1000::/home/dev:/bin/bash\n\
+                      odd:x:5:5::/:/bin/sh\n";
+        assert_eq!(passwd_homes(passwd), vec![PathBuf::from("/var/www")]);
     }
 
     #[test]

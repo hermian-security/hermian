@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::net::IpAddr;
 
 use crate::alert::{Alert, Finding, RefGen};
 use crate::allowlist::Allowlist;
@@ -14,8 +15,8 @@ use crate::detect::{self, BurstTracker, Ctx, FileSnapshots, FlaggedChain};
 use crate::events::{AuthResult, DetectionId, Event, Severity};
 use crate::proctree::ProcessTree;
 
-/// How long a D1 flag keeps escalating related activity.
-const FLAG_TTL_SECS: i64 = 600;
+/// How long a D1 flag is kept (the longest window any rule asks about).
+const FLAG_TTL_SECS: i64 = detect::FLAG_WINDOW_SECS;
 /// Processes not seen for this long are dropped from the tree.
 const TREE_RETENTION_HOURS: i64 = 48;
 /// Idle auth sources are forgotten after this long.
@@ -25,6 +26,8 @@ const BURST_RETENTION_SECS: i64 = 3600;
 const OPERATOR_WINDOW_SECS: i64 = 15;
 /// Event timestamps further ahead of the wall clock than this are clamped.
 pub const MAX_FUTURE_SKEW_SECS: i64 = 60;
+/// Event timestamps older than this (relative to the wall clock) are clamped.
+pub const MAX_PAST_SKEW_SECS: i64 = 86_400;
 /// Upper bound on remembered D1 flags; the oldest are dropped first.
 const MAX_FLAGS: usize = 4096;
 
@@ -70,8 +73,21 @@ pub struct Engine {
     pub flags: VecDeque<FlaggedChain>,
     pub bursts: BurstTracker,
     pub files: FileSnapshots,
-    pub listeners: HashMap<(String, u16), DateTime<Utc>>,
+    /// Known listeners by `(proto, address, port)`.
+    pub listeners: HashMap<(String, IpAddr, u16), DateTime<Utc>>,
     pub counters: Counters,
+    /// Accounts with a login shell (from /etc/passwd). Brute force counts
+    /// only when it names one of these, or root.
+    pub login_users: std::collections::HashSet<String>,
+    /// Failed logins against existing accounts, for the periodic digest.
+    pub brute: detect::brute::BruteDigest,
+    /// Sources an operator chose to ignore, until when.
+    pub ignored_sources: HashMap<IpAddr, DateTime<Utc>>,
+    /// Whether sshd lets root log in with a password (set by the daemon from
+    /// `sshd -T`).
+    pub root_password_login: bool,
+    /// The root-password warning is left out of digests until then.
+    pub root_warning_snoozed_until: Option<DateTime<Utc>>,
 }
 
 fn day_key(now: DateTime<Utc>) -> String {
@@ -101,7 +117,45 @@ impl Engine {
             files: FileSnapshots::default(),
             listeners: HashMap::new(),
             counters,
+            login_users: std::collections::HashSet::new(),
+            brute: detect::brute::BruteDigest::default(),
+            ignored_sources: HashMap::new(),
+            root_password_login: false,
+            root_warning_snoozed_until: None,
         }
+    }
+
+    /// Stop reporting failed logins from these sources until `until`.
+    /// Successful logins from them still alert.
+    pub fn ignore_sources(&mut self, sources: &[IpAddr], until: DateTime<Utc>) {
+        for ip in sources {
+            self.ignored_sources.insert(*ip, until);
+            self.brute.forget(ip);
+        }
+    }
+
+    pub fn source_ignored(&self, ip: &IpAddr, now: DateTime<Utc>) -> bool {
+        self.ignored_sources
+            .get(ip)
+            .is_some_and(|until| now < *until)
+    }
+
+    /// From `sshd -T`: root may log in with a password.
+    pub fn set_root_password_login(&mut self, enabled: bool) {
+        self.root_password_login = enabled;
+    }
+
+    /// Leave the root-password warning out of digests until `until`.
+    pub fn snooze_root_warning(&mut self, until: DateTime<Utc>) {
+        self.root_warning_snoozed_until = Some(until);
+    }
+
+    fn root_warning_due(&self, now: DateTime<Utc>) -> bool {
+        self.root_password_login
+            && self
+                .root_warning_snoozed_until
+                .map(|until| now >= until)
+                .unwrap_or(true)
     }
 
     /// Restore per-day state persisted by the daemon across restarts.
@@ -125,6 +179,9 @@ impl Engine {
     }
 
     pub fn seed_file_snapshot(&mut self, path: &str, content: String) {
+        if path == "/etc/passwd" {
+            self.login_users = detect::d2::login_users(&content);
+        }
         self.files.update(path, content);
     }
 
@@ -162,12 +219,18 @@ impl Engine {
     /// `wall` are clamped to `wall`.
     pub fn process_at(&mut self, mut ev: Event, wall: DateTime<Utc>) -> Vec<Alert> {
         let limit = wall + Duration::seconds(MAX_FUTURE_SKEW_SECS);
-        if ev.ts() > limit {
+        // Far-past timestamps are clamped too: window arithmetic on a date
+        // near chrono's minimum would overflow.
+        let floor = wall - Duration::seconds(MAX_PAST_SKEW_SECS);
+        if ev.ts() > limit || ev.ts() < floor {
             ev.set_ts(wall);
         }
         self.counters.record_event();
         let now = ev.ts();
-        self.counters.roll_day(&day_key(now));
+        // Daily counters and ref ids follow the wall clock, not event time: a
+        // late event just after midnight used to reset the day's sequence and
+        // reissue ref ids, overwriting earlier alert records.
+        self.counters.roll_day(&day_key(wall));
         self.prune_flags(now);
         self.baseline.check_completion(now);
 
@@ -230,6 +293,7 @@ impl Engine {
                         self.files.update(&e.path, content.clone());
                         if e.path == "/etc/passwd" {
                             self.user_names = parse_user_names(content);
+                            self.login_users = detect::d2::login_users(content);
                         }
                     }
                 }
@@ -246,6 +310,7 @@ impl Engine {
                         now,
                     };
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
+                    self.record_brute_force(&e, now);
                 }
                 if e.result == AuthResult::Success {
                     if let Some(ip) = e.rhost {
@@ -257,7 +322,7 @@ impl Engine {
                 }
             }
             Event::Listener(e) => {
-                let key = (e.proto.clone(), e.port);
+                let key = (e.proto.clone(), e.addr, e.port);
                 if self.listeners.contains_key(&key) {
                     self.listeners.insert(key, now);
                 } else {
@@ -269,7 +334,44 @@ impl Engine {
             }
         }
 
-        self.raise(findings, now)
+        self.raise(findings, now, wall)
+    }
+
+    /// Count a failed SSH login for the digest, if it named an account that
+    /// exists and can log in (or root), from a source nobody chose to ignore.
+    fn record_brute_force(&mut self, e: &crate::events::AuthEvent, now: DateTime<Utc>) {
+        if e.result == AuthResult::Success || (e.service != "sshd" && e.service != "ssh") {
+            return;
+        }
+        let Some(ip) = e.rhost else { return };
+        if self.allowlist.source_allowed(ip) || self.source_ignored(&ip, now) {
+            return;
+        }
+        if e.user == "root" || self.login_users.contains(&e.user) {
+            self.brute.record(ip, &e.user, now);
+        }
+    }
+
+    /// The brute-force digest, when its period is over and it found something.
+    fn brute_digest(&mut self, now: DateTime<Utc>) -> Option<Finding> {
+        if !self.cfg.detections.d2_auth {
+            return None;
+        }
+        let hours = self.cfg.ssh.brute_digest_hours.clamp(1, 24);
+        let (started, sources) = self
+            .brute
+            .take_if_due(now, Duration::hours(i64::from(hours)))?;
+        let sources = sources
+            .into_iter()
+            .filter(|(ip, _)| !self.source_ignored(ip, now))
+            .collect();
+        detect::brute::digest_finding(
+            started,
+            sources,
+            self.cfg.ssh.brute_min_attempts,
+            hours,
+            self.root_warning_due(now),
+        )
     }
 
     /// Periodic housekeeping; returns dedup summaries to deliver.
@@ -282,8 +384,12 @@ impl Engine {
         self.prune_flags(now);
         let listener_cutoff = now - Duration::hours(TREE_RETENTION_HOURS);
         self.listeners.retain(|_, t| *t >= listener_cutoff);
+        self.ignored_sources.retain(|_, until| now < *until);
 
         let mut alerts = Vec::new();
+        if let Some(digest) = self.brute_digest(now) {
+            alerts.extend(self.raise(vec![digest], now, now));
+        }
         for summary in self.dedup.tick(now) {
             let alert = Alert::from_finding(summary, self.refs.next(now), self.host.clone(), now);
             self.counters.record_alert(alert.severity);
@@ -301,8 +407,8 @@ impl Engine {
 
     /// Forget a listener so it will alert again if it reappears (called when
     /// the daemon observes the port closing).
-    pub fn forget_listener(&mut self, proto: &str, port: u16) {
-        self.listeners.remove(&(proto.to_string(), port));
+    pub fn forget_listener(&mut self, proto: &str, addr: IpAddr, port: u16) {
+        self.listeners.remove(&(proto.to_string(), addr, port));
     }
 
     /// Build an alert for an engine-external finding (self-protection, lifecycle).
@@ -322,9 +428,10 @@ impl Engine {
             if f.detection != DetectionId::D1 || f.severity < Severity::High {
                 continue;
             }
-            // Never flag init or long-lived service roots (sshd, cron, systemd):
-            // that would taint every process on the host. Keep only the
-            // suspicious tail of the chain.
+            // Never flag init or long-lived service roots (sshd, cron, systemd,
+            // the web server or database itself): that would taint every
+            // process on the host, or every request a web server handles for
+            // the next ten minutes. Keep only the suspicious tail of the chain.
             let pids: Vec<u32> = f
                 .pids
                 .iter()
@@ -340,6 +447,8 @@ impl Engine {
                                     crate::proctree::Role::System
                                         | crate::proctree::Role::Sshd
                                         | crate::proctree::Role::Cron
+                                        | crate::proctree::Role::WebServer
+                                        | crate::proctree::Role::Database
                                 ) && p.ppid != 0
                             })
                             .unwrap_or(true)
@@ -369,12 +478,17 @@ impl Engine {
         }
     }
 
-    fn raise(&mut self, findings: Vec<Finding>, now: DateTime<Utc>) -> Vec<Alert> {
+    fn raise(
+        &mut self,
+        findings: Vec<Finding>,
+        now: DateTime<Utc>,
+        wall: DateTime<Utc>,
+    ) -> Vec<Alert> {
         let mut alerts = Vec::new();
         for finding in findings {
             if let Decision::Emit = self.dedup.record(&finding.signature, now, &finding) {
                 let alert =
-                    Alert::from_finding(finding, self.refs.next(now), self.host.clone(), now);
+                    Alert::from_finding(finding, self.refs.next(wall), self.host.clone(), now);
                 self.counters.record_alert(alert.severity);
                 alerts.push(alert);
             }
@@ -703,6 +817,8 @@ mod tests {
                 rhost: Some(ip),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
+                port: None,
             }));
             infos += alerts
                 .iter()
@@ -720,8 +836,6 @@ mod tests {
     #[test]
     fn ssh_success_after_burst_is_high() {
         let mut eng = engine_without_baseline();
-        eng.cfg.ssh.off_hours_start = 0;
-        eng.cfg.ssh.off_hours_end = 0;
         let t = Utc::now();
         let ip: IpAddr = "198.51.100.77".parse().unwrap();
         for i in 0..5 {
@@ -732,6 +846,8 @@ mod tests {
                 rhost: Some(ip),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
+                port: None,
             }));
             assert!(!has(&a, DetectionId::D2, Severity::High), "{:?}", a);
         }
@@ -742,6 +858,8 @@ mod tests {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
+            port: None,
         }));
         assert!(
             has(&alerts, DetectionId::D2, Severity::High),
@@ -760,8 +878,6 @@ mod tests {
     #[test]
     fn ssh_success_without_burst_is_not_burst_high() {
         let mut eng = engine_without_baseline();
-        eng.cfg.ssh.off_hours_start = 0;
-        eng.cfg.ssh.off_hours_end = 0;
         let alerts = eng.process(Event::Auth(AuthEvent {
             ts: Utc::now(),
             result: AuthResult::Success,
@@ -769,6 +885,8 @@ mod tests {
             rhost: Some("198.51.100.9".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
+            port: None,
         }));
         assert!(
             !alerts.iter().any(|a| a.title.contains("burst")),
@@ -792,12 +910,11 @@ mod tests {
                 rhost: Some("198.51.100.5".parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
+                port: None,
             }))
         };
         let mut eng = engine_without_baseline();
-        // Deterministic: disable off-hours so wall-clock does not affect severity.
-        eng.cfg.ssh.off_hours_start = 0;
-        eng.cfg.ssh.off_hours_end = 0;
         assert!(has(&login(&mut eng), DetectionId::D2, Severity::High));
         // Same source again: context only (dedup would suppress anyway, so
         // advance past the window to observe the severity directly).
@@ -808,6 +925,8 @@ mod tests {
             rhost: Some("198.51.100.5".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
+            port: None,
         }));
         assert!(!has(&again, DetectionId::D2, Severity::High), "{:?}", again);
         let mut cfg = Config::default();
@@ -821,11 +940,75 @@ mod tests {
         assert!(login(&mut eng).is_empty());
     }
 
+    /// One login must not page twice: a root login from a never-seen source
+    /// matched both the root-policy and the novelty rule, and Telegram got
+    /// two messages for the same event.
+    #[test]
+    fn root_login_from_a_new_source_is_one_alert() {
+        let cfg = Config::default();
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
+        let alerts = eng.process(Event::Auth(AuthEvent {
+            ts: Utc::now(),
+            result: AuthResult::Success,
+            user: "root".into(),
+            rhost: Some("203.0.113.77".parse().unwrap()),
+            service: "sshd".into(),
+            tty: "ssh".into(),
+            method: AuthMethod::PublicKey,
+            port: None,
+        }));
+        let d2: Vec<_> = alerts
+            .iter()
+            .filter(|a| a.detection == DetectionId::D2)
+            .collect();
+        assert_eq!(d2.len(), 1, "{:?}", alerts);
+        assert_eq!(d2[0].severity, Severity::High);
+        assert!(d2[0].title.contains("new source"), "{:?}", d2[0].title);
+        assert!(d2[0].what.contains("(key)"), "{:?}", d2[0].what);
+    }
+
+    /// A source first seen after the learning window is novel once, then
+    /// known: the second login from it must not page again (it used to,
+    /// because the known-source set froze when the window closed).
+    #[test]
+    fn source_seen_after_window_stops_being_new() {
+        let cfg = Config::default();
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
+        let ip: IpAddr = "203.0.113.120".parse().unwrap();
+        let login = |eng: &mut Engine, t: DateTime<Utc>| {
+            eng.process(Event::Auth(AuthEvent {
+                ts: t,
+                result: AuthResult::Success,
+                user: "deploy".into(),
+                rhost: Some(ip),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+                method: AuthMethod::PublicKey,
+                port: None,
+            }))
+        };
+        let alerts = login(&mut eng, Utc::now());
+        assert!(
+            alerts.iter().any(|a| a.title.contains("new source")),
+            "{:?}",
+            alerts
+        );
+        // Well past the dedup window so only the rule's judgement matters.
+        let alerts = login(&mut eng, Utc::now() + Duration::seconds(600));
+        assert!(
+            !alerts.iter().any(|a| a.title.contains("new source")),
+            "{:?}",
+            alerts
+        );
+    }
+
     #[test]
     fn novel_source_with_baseline_fires() {
-        let mut cfg = Config::default();
-        cfg.ssh.off_hours_start = 22;
-        cfg.ssh.off_hours_end = 6;
+        let cfg = Config::default();
         let mut baseline = Baseline::new(true, 24, Utc::now());
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
@@ -838,6 +1021,8 @@ mod tests {
                 rhost: Some("203.0.113.9".parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
+                port: None,
             }),
         );
         assert!(has(&alerts, DetectionId::D2, Severity::Low), "{:?}", alerts);
@@ -1305,6 +1490,7 @@ mod tests {
             DetectionId::D4,
             Severity::High
         ));
+        eng.process(exec(t, 501, 1, 1000, "gdb", "/usr/bin/gdb"));
         assert!(eng.process(mk(501, "gdb", 16)).is_empty());
         // Non-attach requests are ignored.
         assert!(eng.process(mk(502, "weird", 3)).is_empty());
@@ -1324,7 +1510,8 @@ mod tests {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
-        eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron")); // no session anywhere
+        // Run by a package install (no session anywhere).
+        eng.process(exec(t, 400, 1, 0, "apt-get", "/usr/bin/apt-get"));
         eng.process(exec(t, 500, 400, 0, "useradd", "/usr/sbin/useradd"));
         let alerts = eng.process(Event::File(file(
             t + Duration::seconds(1),
@@ -1397,8 +1584,53 @@ mod tests {
     }
 
     #[test]
+    fn dns_to_a_learned_server_is_ignored_and_to_a_new_one_is_judged() {
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.known_dests.insert("1.1.1.1".parse().unwrap());
+        baseline.complete = true;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline,
+            "h".into(),
+        );
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 300, 1, 1000, "implant", "/home/eve/.cache/implant"));
+        let dns = |pid: u32, comm: &str, daddr: &str| {
+            Event::Connect(ConnectEvent {
+                ts: t,
+                pid,
+                uid: 1000,
+                daddr: daddr.parse().unwrap(),
+                dport: 53,
+                comm: comm.into(),
+                container: false,
+            })
+        };
+        // Learned destination: ignored, and the connector is learned with it.
+        assert!(eng.process(dns(300, "implant", "1.1.1.1")).is_empty());
+        // A never-seen program on port 53 to a never-seen destination is
+        // still judged.
+        eng.process(exec(t, 301, 1, 1000, "curl", "/usr/bin/curl"));
+        let fresh = eng.process(dns(301, "curl", "203.0.113.99"));
+        assert!(
+            fresh
+                .iter()
+                .any(|a| a.title == "First outbound connection from a program"),
+            "{:?}",
+            fresh
+        );
+        // Seen once, known afterwards: the next connect from it is not
+        // "first" again (the set used to freeze, re-alerting every time).
+        let again = eng.process(dns(301, "curl", "203.0.113.100"));
+        assert!(again.is_empty(), "{:?}", again);
+    }
+
+    #[test]
     fn dns_connects_are_ignored() {
         let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.known_dests.insert("1.1.1.1".parse().unwrap());
         baseline.complete = true;
         let mut eng = Engine::new(
             Config::default(),
@@ -1522,6 +1754,69 @@ mod tests {
     }
 
     #[test]
+    fn same_port_on_another_address_is_a_new_listener() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        let ev = |addr: &str| {
+            Event::Listener(ListenerEvent {
+                ts: t,
+                proto: "tcp".into(),
+                addr: addr.parse().unwrap(),
+                port: 8080,
+                pid: 0,
+                comm: "x".into(),
+            })
+        };
+        assert_eq!(eng.process(ev("127.0.0.1")).len(), 1);
+        assert_eq!(eng.process(ev("0.0.0.0")).len(), 1);
+        assert!(eng.process(ev("0.0.0.0")).is_empty());
+    }
+
+    #[test]
+    fn late_event_after_midnight_does_not_reuse_ref_ids() {
+        let mut eng = engine_without_baseline();
+        // Ten seconds past the coming midnight.
+        let wall = (Utc::now().date_naive() + chrono::Days::new(1))
+            .and_hms_opt(0, 0, 10)
+            .unwrap()
+            .and_utc();
+        let day = wall.format("%Y-%m%d").to_string();
+        let ev = |ts: DateTime<Utc>, port| {
+            Event::Listener(ListenerEvent {
+                ts,
+                proto: "tcp".into(),
+                addr: "0.0.0.0".parse().unwrap(),
+                port,
+                pid: 0,
+                comm: "x".into(),
+            })
+        };
+        let a = eng.process_at(ev(wall, 1), wall);
+        // An event stamped just before midnight, delivered after it.
+        let late = eng.process_at(ev(wall - Duration::seconds(20), 2), wall);
+        assert_ne!(a[0].ref_id, late[0].ref_id);
+        assert!(late[0].ref_id.contains(&day), "{}", late[0].ref_id);
+    }
+
+    #[test]
+    fn far_past_timestamps_are_clamped() {
+        let mut eng = engine_without_baseline();
+        let wall = Utc::now();
+        let a = eng.process_at(
+            Event::Listener(ListenerEvent {
+                ts: DateTime::<Utc>::MIN_UTC,
+                proto: "tcp".into(),
+                addr: "0.0.0.0".parse().unwrap(),
+                port: 9,
+                pid: 0,
+                comm: "x".into(),
+            }),
+            wall,
+        );
+        assert_eq!(a[0].ts, wall);
+    }
+
+    #[test]
     fn listener_alerts_once_until_forgotten() {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
@@ -1537,7 +1832,7 @@ mod tests {
         };
         assert_eq!(eng.process(ev()).len(), 1);
         assert!(eng.process(ev()).is_empty());
-        eng.forget_listener("tcp", 4444);
+        eng.forget_listener("tcp", "0.0.0.0".parse().unwrap(), 4444);
         // dedup window still open, so still suppressed by dedup - advance time.
         let later = t + Duration::seconds(400);
         let alerts = at(
@@ -1662,6 +1957,8 @@ mod tests {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
+            port: None,
         }));
         assert_eq!(eng.tree.len(), 1);
         assert_eq!(eng.bursts.len(), 1);

@@ -149,6 +149,8 @@ fn scenario_bruteforce() -> Vec<Alert> {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
+            port: None,
         })));
     }
     out.extend(eng.process(Event::Auth(AuthEvent {
@@ -158,6 +160,8 @@ fn scenario_bruteforce() -> Vec<Alert> {
         rhost: Some(ip),
         service: "sshd".into(),
         tty: "ssh".into(),
+        method: AuthMethod::PublicKey,
+        port: None,
     })));
     out
 }

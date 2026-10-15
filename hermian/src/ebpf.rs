@@ -227,7 +227,23 @@ fn report_lost(map: &str, cpu: u32, lost: usize, last_report: &mut Option<std::t
     }
 }
 
+/// CPUs that have perf readers. A CPU brought online later has none: its
+/// events are neither delivered nor counted as lost.
+static READER_CPUS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+
+/// Online CPUs without a reader (hot-plugged since the daemon started).
+/// Empty when eBPF isn't in use.
+pub fn unmonitored_cpus() -> Vec<u32> {
+    let Some(have) = READER_CPUS.get() else {
+        return Vec::new();
+    };
+    online_cpus()
+        .map(|cpus| cpus.into_iter().filter(|c| !have.contains(c)).collect())
+        .unwrap_or_default()
+}
+
 fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
+    let _ = READER_CPUS.set(online_cpus().map_err(|(_, e)| e)?);
     for (map_name, kind, pages) in [
         ("EXEC_EVENTS", MapKind::Exec, EXEC_PAGES),
         ("CONNECT_EVENTS", MapKind::Connect, OTHER_PAGES),
@@ -335,6 +351,111 @@ mod tests {
                 if let RawEvent::Exec(e) = ev {
                     if e.pid == pid {
                         assert_eq!(e.ld_preload, 1, "LD_PRELOAD not seen");
+                        break;
+                    }
+                }
+            }
+            drop(runtime);
+        });
+    }
+
+    /// LD_AUDIT counts like LD_PRELOAD, and the scan reaches past 32 vars.
+    #[test]
+    #[ignore]
+    fn ebpf_sees_ld_audit_past_many_vars() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(4096);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            let mut cmd = std::process::Command::new("/bin/true");
+            cmd.env_clear();
+            for i in 0..50 {
+                cmd.env(format!("HERMIAN_FILLER_{:02}", i), "x");
+            }
+            cmd.env("LD_AUDIT", "");
+            let child = cmd.spawn().unwrap();
+            let pid = child.id();
+            let _ = child.wait_with_output();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("no exec event for the test child")
+                    .unwrap();
+                if let RawEvent::Exec(e) = ev {
+                    if e.pid == pid {
+                        assert_eq!(e.ld_preload, 1, "LD_AUDIT not seen");
+                        break;
+                    }
+                }
+            }
+            drop(runtime);
+        });
+    }
+
+    /// A sockaddr_in that ends exactly at a page boundary, with nothing
+    /// mapped after it. The old fixed 28-byte read failed there and the
+    /// connect went unreported.
+    #[test]
+    #[ignore]
+    fn ebpf_sees_connect_with_sockaddr_at_page_end() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(4096);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            let page = crate::procsrc::page_size() as usize;
+            // SAFETY: anonymous mapping of two pages; the second is made
+            // inaccessible, and all access stays inside the first.
+            let port: u16 = unsafe {
+                let base = libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * page,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                ) as *mut u8;
+                assert!(!base.is_null() && base as isize != -1);
+                assert_eq!(
+                    libc::mprotect(base.add(page) as *mut libc::c_void, page, libc::PROT_NONE),
+                    0
+                );
+                let sa = base.add(page - std::mem::size_of::<libc::sockaddr_in>())
+                    as *mut libc::sockaddr_in;
+                let port = 47_000 + (std::process::id() % 1000) as u16;
+                (*sa).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*sa).sin_port = port.to_be();
+                (*sa).sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+                let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+                assert!(fd >= 0);
+                // Nothing listens: ECONNREFUSED is fine, the attempt is what counts.
+                libc::connect(
+                    fd,
+                    sa as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
+                libc::close(fd);
+                libc::munmap(base as *mut libc::c_void, 2 * page);
+                port
+            };
+            let me = std::process::id();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let ev = tokio::time::timeout_at(deadline, rx.recv())
+                    .await
+                    .expect("connect at a page end was not reported")
+                    .unwrap();
+                if let RawEvent::Connect(c) = ev {
+                    if c.pid == me && c.dport == port {
+                        assert_eq!(connect_to_ip(&c), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
                         break;
                     }
                 }
