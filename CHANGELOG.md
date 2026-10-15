@@ -6,11 +6,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
-## 0.1.0-beta.6 - 2026-10-15
+## 0.1.0-beta.7 - 2026-10-15
 
 The first release with the one-command installer: a dead-man switch, durable
 alert queues, Telegram response buttons, a brute-force digest, and hardening
 across the engine, collectors, isolation and packaging.
+
+v0.1.0-beta.6 was tagged but never published: its arm64 build failed on a
+lint that only fires on that architecture (#53). Everything below ships here.
 
 ### Added
 
@@ -231,6 +234,8 @@ across the engine, collectors, isolation and packaging.
 
 ### Changed
 
+- CI runs clippy on arm64 too, so architecture-specific problems fail the
+  pull request instead of the release (#53).
 - Destination novelty is judged by network, /24 for IPv4 and /64 for
   IPv6. An app server calling an API or CDN that rotates addresses inside
   a block paged HIGH "Web server connected to a new external destination"
