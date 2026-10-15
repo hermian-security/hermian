@@ -543,7 +543,7 @@ chat_id = ""                   # in quotes, e.g. "123456789" or "-1001234567890"
 silent_below_critical = true   # only CRITICAL makes a sound
 timeout_secs = 10
 # message_thread_id = 12345    # topic id, for forum-style supergroups
-# Response buttons (Block IP, Disconnect user...) under alerts that offer them.
+# Response buttons (Block IP, Disconnect session...) under alerts that offer them.
 # Only the Telegram user ids listed here can press them. Your id: message
 # @userinfobot. Re-run 'hermian enable' after turning this on (it grants the
 # daemon the firewall and kill capabilities these need).

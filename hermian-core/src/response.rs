@@ -41,7 +41,7 @@ impl ResponseAction {
                 format!("Block {}", sources[0])
             }
             ResponseAction::Block { sources } => format!("Block all ({})", sources.len()),
-            ResponseAction::Disconnect { block: false, .. } => "Disconnect user".to_string(),
+            ResponseAction::Disconnect { block: false, .. } => "Disconnect session".to_string(),
             ResponseAction::Disconnect { block: true, .. } => "Disconnect and block".to_string(),
             ResponseAction::SnoozeRootPasswordWarning { days } => {
                 format!("Remind me in {} days", days)

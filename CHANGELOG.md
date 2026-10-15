@@ -33,13 +33,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - The default config documents every option: what each detection group
   covers, `message_thread_id`, what `management_cidrs` is for, and an
   allowlist example for your own SSH sources.
-- Telegram alerts were rewritten to be short and scannable: a bold
-  severity-and-title line, a small `host · time` line, the summary, an
-  aligned fact table, one next step, and the rest (why it matters, the
-  remaining steps, the detection) in a collapsed block the reader taps to
-  expand. The emoji are gone and the whole alert is no longer repeated
-  underneath. The brute-force digest lists its sources on one line instead
-  of emitting a raw newline escape in the value.
+- Telegram alerts are short and scannable: a `■■■□ HERMIAN - HIGH` header
+  (filled cells count up with severity), `Host : web-01`, a `- title :` line,
+  the one-sentence summary, and only the evidence the summary doesn't already
+  state, then a divider, why it matters, the numbered steps, a divider and
+  the `hermian show` line. No emoji, and the whole alert is no longer repeated
+  underneath. The CLI keeps the full alert. The brute-force digest lists its
+  sources on one line instead of emitting a raw newline escape in the value,
+  and the disconnect button reads `Disconnect session`.
 - Alert retention: stored alerts and collect bundles older than
   `general.alert_retention_days` (default 90; 0 keeps them) are deleted
   hourly, and `alerts.log` rotates at 50 MB with three old copies kept.

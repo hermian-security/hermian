@@ -322,7 +322,7 @@ mod tests {
             let labels: Vec<String> = hit.offers.iter().map(|o| o.label()).collect();
             assert_eq!(
                 labels,
-                vec!["Ignore", "Disconnect user", "Disconnect and block"]
+                vec!["Ignore", "Disconnect session", "Disconnect and block"]
             );
             assert!(matches!(
                 hit.offers[2],
