@@ -56,6 +56,13 @@ Ubuntu 22.04.5, kernel 5.15.0-170, 2 vCPU. Sources: deployment notes and
   stale heartbeat and the watchdog restarted it (HER-WD-20261015-170218),
   heartbeat back to 0s. The durable alert queue is covered by tests but
   hasn't faced a real channel outage yet.
+- Once-per-sighting novelty verified on 2026-10-15 (deployed build, sha
+  `49dc976e…`): a root login from an operator IP that appeared after the
+  baseline window paged HIGH `Root login from a new source`
+  (HER-2026-1015-210), the IP was written to `baseline.json`, and the next
+  login from the same IP was INFO only (HER-2026-1015-211). Both summaries
+  named the auth method (`(key)`). Before this build the same login re-paged
+  HIGH every time.
 
 ## Numbers that looked inconsistent
 
