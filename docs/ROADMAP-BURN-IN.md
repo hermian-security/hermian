@@ -89,11 +89,13 @@ builds run on `ubuntu-22.04` for this reason.
 1. Builds the eBPF object from source; fails if it differs from the vendored one.
 2. Builds `amd64` and `arm64` on Ubuntu 22.04 runners.
 3. Runs clippy, the full test suite and `hermian test` on each built binary.
-4. Produces `.deb` + `.tar.gz` per arch, `SHA256SUMS`, **Sigstore keyless
-   signatures** (`*.sigstore` bundles) and **GitHub build attestations**, both
-   bound to the repository's workflow identity - no long-lived key to protect.
+4. Produces `.deb` + `.tar.gz` per arch plus `install.sh` (also served from
+   the release page), `SHA256SUMS`, **Sigstore keyless signatures**
+   (`*.sigstore` bundles) and **GitHub build attestations**, both bound to the
+   repository's workflow identity - no long-lived key to protect.
 5. Publishes a GitHub pre-release (tags containing `-`) or release, with the
-   CHANGELOG section for that version as the notes.
+   CHANGELOG section for that version as the notes plus that tag's
+   one-command install.
 
 The release procedure itself is in [CONTRIBUTING.md](../CONTRIBUTING.md#versioning-and-releases).
 arm64 and Sigstore have run on every tag since beta.2.
@@ -106,7 +108,7 @@ For the beta:
 | Artifact | Beta | Why |
 |---|---|---|
 | `.deb` (amd64, arm64) | **yes** | Target users are overwhelmingly Debian/Ubuntu VPS |
-| Signed tarball + `install.sh` | **yes** | Distro-agnostic fallback |
+| Signed tarball + `install.sh` | **yes** | Distro-agnostic install; the installer is a signed release asset too |
 | Sigstore instead of GPG | **yes** | Same guarantee, no key custody problem for a solo maintainer; GPG can be added later |
 | Signed apt repository | **next** | The only path that gets fixes onto hosts without anyone checking; see §1.5 |
 | `.rpm` | Phase 3 | Needs a Fedora/RHEL burn-in first (§3 below) |
@@ -159,8 +161,9 @@ sysctl fs.inotify.max_user_watches        # hermian enable raises this to 524288
 
 ### 2.2 Install
 
-Follow the [README install steps](../README.md#install) (Debian/Ubuntu or
-tarball), including the origin check. They're kept in one place on purpose.
+Run the [README install one-liner](../README.md#install) (Debian/Ubuntu or
+tarball). It checks the checksum and verifies origin when `cosign` or `gh` is
+present; `--dry-run` stops before installing. Steps stay in one place.
 
 Expected within 10 seconds of `sudo hermian status`: `PROTECTED`, all five rows `on`, `Kernel ... eBPF`.
 If you see `reduced: no eBPF`, read `journalctl -u hermian -n 20`; the two
@@ -193,9 +196,9 @@ provisioned host with no history worth learning, `sudo hermian enable
 
 ### 2.5 Upgrade
 
-Rerun the README install steps with the new `VER`; the package's postinst
-re-runs `enable` and restarts the daemon. Read the release notes first for
-one-time steps.
+Rerun the installer with the new tag (`--version vX.Y.Z`); the package's
+postinst re-runs `enable` and restarts the daemon. Read the release notes
+first for one-time steps.
 
 Verified: reinstall over a running daemon keeps state, alerts, baseline and
 the soak clock; the binary hash is refreshed so no false integrity alert.
@@ -286,7 +289,7 @@ All of the following, with evidence linked from the release notes:
 - [ ] Every `tests/run_suite.sh` scenario passes on every host, < 5 s each.
 - [ ] CPU avg < 1 %, p99 < 5 %, RSS < 80 MB on every host.
 - [ ] `docs/fp-log.md` published; every entry closed.
-- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS`, `gh attestation verify` and `cosign verify-blob` on a clean machine.
+- [ ] Release workflow ran green on a tag; artifacts verified with `sha256sum -c SHA256SUMS`, `gh attestation verify` and `cosign verify-blob` on a clean machine, and the install one-liner's `--dry-run` is clean there.
 - [ ] Signed APT repository live; `apt upgrade` delivered a release to a test host.
 - [ ] `hermian uninstall` leaves nothing on every distro.
 - [ ] Two hosts the maintainer depends on have run the release build for 30 days.

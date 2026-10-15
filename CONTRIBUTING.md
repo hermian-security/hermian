@@ -156,16 +156,17 @@ Cargo.lock to match (`cargo update --workspace`), and moves those notes into a
 dated `## x.y.z - YYYY-MM-DD` section. Don't mix the bump into the feat/fix PR.
 Don't run a blanket `cargo update` just to change the workspace version.
 
-That changelog section becomes the GitHub release notes verbatim, and the
-workflow fails without one. Put anything users must do once after upgrading
-under an `### Upgrade` heading in it. Install commands live only in the
-README's Install section; the release notes link to it at the tag.
+That changelog section becomes the body of the GitHub release notes, and the
+workflow fails without one. The workflow adds this tag's one-command install
+and a link to the README at the tag. Put anything users must do once after
+upgrading under an `### Upgrade` heading in it. Install commands otherwise
+live in the README's Install section.
 
 Release procedure:
 
 1. User-facing change is on `main` with green CI.
-2. Open `release/x.y.z` with the version bump, changelog move, and README
-   `VER=` pins (Install section).
+2. Open `release/x.y.z` with the version bump, changelog move, and the README
+   install pins (the one-liner URL and `VER=` in the manual steps).
 3. Merge it through the normal PR checks.
 4. Wait for CI on that `main` commit. A green PR build isn't enough, and the
    release workflow refuses a tag whose commit doesn't have all five required

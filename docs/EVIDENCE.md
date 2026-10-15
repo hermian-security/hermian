@@ -87,3 +87,7 @@ Older drafts disagree; this is the current reading:
 - A heartbeat or independent tamper monitor beyond the local watchdog.
 - Release verification reproduced on a clean machine: `sha256sum -c`,
   `gh attestation verify`, `cosign verify-blob`.
+- An install from a release-served `install.sh`: its remote path has only run
+  with `--dry-run` (in WSL, against the beta.5 assets; `gh` attestation and
+  checksums pass, and the checksum-only branch was exercised). No install from
+  a release asset yet.
