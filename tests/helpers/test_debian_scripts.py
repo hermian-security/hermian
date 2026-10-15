@@ -8,8 +8,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-DEBIAN = Path(__file__).resolve().parent.parent.parent / "packaging" / "debian"
+ROOT = Path(__file__).resolve().parent.parent.parent
+DEBIAN = ROOT / "packaging" / "debian"
 SED = shutil.which("sed")
+
+
+def case_block(text, label):
+    return text.split(label, 1)[1].split(";;", 1)[0]
+
+
+def unit_paths():
+    """Every systemd unit path `hermian enable` writes, from paths.rs."""
+    src = (ROOT / "hermian" / "src" / "paths.rs").read_text()
+    found = re.findall(r'"(/etc/systemd/system/[^"]+)"', src)
+    assert found, "no unit paths found in paths.rs"
+    return found
 
 
 class DebianScriptTests(unittest.TestCase):
@@ -18,6 +31,26 @@ class DebianScriptTests(unittest.TestCase):
         remove_block = text.split("remove|deconfigure)", 1)[1].split(";;", 1)[0]
         self.assertIn("nft delete table inet hermian", remove_block)
         self.assertNotIn("upgrade)", text)
+
+    def test_prerm_stops_the_watchdog_before_the_daemon(self):
+        # Left running after removal, the timer ran a missing binary every
+        # minute (and could restart the daemon mid-remove).
+        block = case_block((DEBIAN / "prerm").read_text(), "remove|deconfigure)")
+        timer = block.find("disable --now hermian-watchdog.timer")
+        daemon = block.find("disable --now hermian.service")
+        self.assertNotEqual(timer, -1, block)
+        self.assertNotEqual(daemon, -1, block)
+        self.assertLess(timer, daemon)
+        self.assertIn("nft delete table inet hermian_block", block)
+
+    def test_postrm_removes_every_unit_enable_writes(self):
+        text = (DEBIAN / "postrm").read_text()
+        helper = text.split("remove_units() {", 1)[1].split("\n}", 1)[0]
+        for path in unit_paths():
+            self.assertIn(path, helper)
+        for label in ("remove)", "purge)"):
+            self.assertIn("remove_units", case_block(text, label))
+        self.assertIn("/etc/sysctl.d/60-hermian.conf", case_block(text, "purge)"))
 
     def test_postrm_cleans_pam_on_remove_and_purge(self):
         text = (DEBIAN / "postrm").read_text()
