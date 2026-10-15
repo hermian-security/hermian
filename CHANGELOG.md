@@ -189,6 +189,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- Telegram alerts are down to the headline and a sentence or two: what
+  happened and where, then `hermian show`. Evidence, process chains, the why
+  and the steps were the same story three times in a chat window; they stay
+  in the CLI.
+- Alert copy says what was seen instead of what it might mean: an SSH login
+  from a new source is no longer called "unusual timing", and "assume the
+  host is compromised" reads "potentially" where the evidence is a change,
+  not an intrusion.
 - Releases need green CI: the release workflow checks the five required
   checks on the tagged commit before building. Release builds also run
   clippy and the full test suite on both amd64 and arm64.
@@ -207,6 +215,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   or config manager) is now reported when it rewrites `/etc/shadow`.
 - Email with `smtp_security = "none"` and a username now fails (with a clear
   error in `status`) unless the SMTP host is loopback.
+
+### Removed
+
+- Off-hours weighting for SSH logins. Administrators log in whenever they
+  need to; timing alone isn't evidence. Old `ssh.off_hours_start/end` keys
+  still parse but do nothing.
 
 ### Upgrade
 

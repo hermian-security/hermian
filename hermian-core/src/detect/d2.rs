@@ -84,11 +84,11 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     .fact("User", &ev.user)
                     .fact("Failed attempts", recent.to_string())
                     .why(
-                        "A login from an address that was just brute-forcing this host is the \
-                         credential-stuffing outcome, not the background noise of failed attempts.",
+                        "A login right after failed attempts from the same source usually means \
+                         one of those attempts worked. The failures alone were just noise.",
                     )
                     .actions([
-                        "Treat this session as hostile until proven otherwise.",
+                        "Confirm this session was expected before treating it as hostile.",
                         "Lock or rotate the account that succeeded and any others the source tried.",
                         "Block the source and review what the session did.",
                     ]),
@@ -99,8 +99,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 // HIGH the first time a source is seen; the same operator logging
                 // in again from the same place is context, not a new incident.
                 let seen_before = ctx.baseline.root_source_is_known(rhost);
-                let off_hours = ctx.is_off_hours(ev.ts);
-                let severity = if !seen_before || off_hours {
+                let severity = if !seen_before {
                     Severity::High
                 } else {
                     Severity::Info
@@ -126,7 +125,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         }
                     ))
                     .fact("Source", rhost.to_string())
-                    .fact("Timing", if off_hours { "off-hours" } else { "" })
                     .why(
                         "Direct root logins remove accountability and are the preferred target of \
                          credential attacks. If this host relies on them, set ssh.permit_root = true \
@@ -143,8 +141,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 && ctx.baseline.can_judge_novelty()
                 && !ctx.baseline.ssh_source_is_known(rhost)
             {
-                let off_hours = ctx.is_off_hours(ev.ts);
-                let elevated = ev.user == "root" || off_hours;
+                let elevated = ev.user == "root";
                 let severity = if elevated {
                     Severity::High
                 } else {
@@ -155,7 +152,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         DetectionId::D2,
                         severity,
                         if elevated {
-                            "SSH login from a new source at an unusual time"
+                            "Root login from a new source"
                         } else {
                             "SSH login from a new source"
                         },
@@ -163,17 +160,15 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     )
                     .what(format!(
                         "User '{}' authenticated from {}, a source never seen during the baseline \
-                         period{}.",
-                        ev.user,
-                        rhost,
-                        if off_hours { " (off-hours)" } else { "" }
+                         period.",
+                        ev.user, rhost
                     ))
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
                     .why(
                         "HERMIAN learned this host's SSH sources during its baseline period. A \
-                         first-time source combined with root access or off-hours timing deserves \
-                         a look.",
+                         first-time source isn't proof of anything by itself; it's just where a \
+                         surprise login would show up. Confirm it was expected.",
                     )
                     .actions([
                         "Confirm this login was expected.",

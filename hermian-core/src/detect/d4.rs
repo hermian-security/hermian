@@ -205,7 +205,7 @@ fn suid_in_transient(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         .actions([
             "Remove the setuid bit or delete the file immediately.",
             "Identify the process and user that created it.",
-            "Assume the creating account is compromised and audit it.",
+            "Treat the creating account as suspect and audit it.",
         ]),
     )
 }

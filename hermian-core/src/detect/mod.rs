@@ -5,7 +5,7 @@ pub mod d3;
 pub mod d4;
 pub mod d5;
 
-use chrono::{DateTime, Duration, FixedOffset, Timelike, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
@@ -43,8 +43,6 @@ pub struct Ctx<'a> {
     pub flags: &'a VecDeque<FlaggedChain>,
     pub user_names: &'a HashMap<u32, String>,
     pub now: DateTime<Utc>,
-    /// The host's local UTC offset, for off-hours judgments.
-    pub local_offset: FixedOffset,
 }
 
 /// How confident we are that a file change was made by an operator sitting at a
@@ -71,22 +69,6 @@ impl Attribution {
 }
 
 impl<'a> Ctx<'a> {
-    /// Off-hours in the host's local time (the config's hours are what an
-    /// operator would write: 22-6 local, not UTC).
-    pub fn is_off_hours(&self, now: DateTime<Utc>) -> bool {
-        let hour = now.with_timezone(&self.local_offset).hour();
-        let start = self.cfg.ssh.off_hours_start;
-        let end = self.cfg.ssh.off_hours_end;
-        if start == end {
-            return false;
-        }
-        if start < end {
-            hour >= start && hour < end
-        } else {
-            hour >= start || hour < end
-        }
-    }
-
     pub fn has_recent_flag(
         &self,
         pid: u32,
@@ -306,63 +288,6 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ctx<'a>(
-        cfg: &'a Config,
-        tree: &'a ProcessTree,
-        baseline: &'a Baseline,
-        allowlist: &'a Allowlist,
-        flags: &'a VecDeque<FlaggedChain>,
-        users: &'a HashMap<u32, String>,
-        now: DateTime<Utc>,
-    ) -> Ctx<'a> {
-        Ctx {
-            tree,
-            baseline,
-            allowlist,
-            cfg,
-            flags,
-            user_names: users,
-            now,
-            local_offset: FixedOffset::east_opt(0).unwrap(),
-        }
-    }
-
-    #[test]
-    fn off_hours_window() {
-        let cfg = Config::default();
-        let tree = ProcessTree::new();
-        let baseline = Baseline::default();
-        let allowlist = Allowlist::default();
-        let flags = VecDeque::new();
-        let users = HashMap::new();
-        let t = Utc::now().with_hour(23).unwrap().with_minute(30).unwrap();
-        let c = ctx(&cfg, &tree, &baseline, &allowlist, &flags, &users, t);
-        assert!(c.is_off_hours(t));
-        assert!(!c.is_off_hours(Utc::now().with_hour(12).unwrap()));
-
-        let mut disabled = Config::default();
-        disabled.ssh.off_hours_start = 0;
-        disabled.ssh.off_hours_end = 0;
-        let c = ctx(&disabled, &tree, &baseline, &allowlist, &flags, &users, t);
-        assert!(!c.is_off_hours(t));
-    }
-
-    #[test]
-    fn off_hours_follow_local_time() {
-        let cfg = Config::default(); // 22-6
-        let tree = ProcessTree::new();
-        let baseline = Baseline::default();
-        let allowlist = Allowlist::default();
-        let flags = VecDeque::new();
-        let users = HashMap::new();
-        // 20:00 UTC is 23:00 at UTC+3: off-hours there, not in UTC.
-        let t = Utc::now().with_hour(20).unwrap();
-        let mut c = ctx(&cfg, &tree, &baseline, &allowlist, &flags, &users, t);
-        assert!(!c.is_off_hours(t));
-        c.local_offset = FixedOffset::east_opt(3 * 3600).unwrap();
-        assert!(c.is_off_hours(t));
-    }
 
     #[test]
     fn content_tags_differ_by_content() {

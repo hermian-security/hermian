@@ -240,7 +240,7 @@ fn ld_preload(ev: &FileEvent, _ctx: &Ctx) -> Option<Finding> {
     )
     .actions([
         "Inspect the file now and remove any library you did not install.",
-        "Treat the host as compromised; the listed libraries can hide processes, files and sockets.",
+        "Treat the host as potentially compromised; the listed libraries can hide processes, files and sockets.",
         "Reboot into a known-good state once the entry is removed.",
     ]);
     if !libs.is_empty() {

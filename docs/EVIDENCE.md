@@ -12,8 +12,8 @@ completed a full field pass, not a fleet.
 
 | Suite | What it covers | Last result |
 |---|---|---|
-| `cargo test -p hermian-core --locked` | Detection engine, synthetic events | 158 passing, 2026-10-15 |
-| `cargo test -p hermian --locked` | Daemon logic (Linux only) | 104 passing, 7 ignored, 2026-10-15 |
+| `cargo test -p hermian-core --locked` | Detection engine, synthetic events | 156 passing, 2026-10-15 |
+| `cargo test -p hermian --locked` | Daemon logic (Linux only) | 103 passing, 7 ignored, 2026-10-15 |
 | PAM module tests | The PAM hook shim | 2 passing, 2026-10-15 |
 | `tests/helpers` | Suite plumbing (alert waits, disposable-host guard) | 20 passing, 3 skipped, 2026-10-15 |
 

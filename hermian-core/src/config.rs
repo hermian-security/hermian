@@ -46,8 +46,6 @@ pub enum ConfigError {
     EmailSmtpSecurity,
     #[error("notifications.email.smtp_username and smtp_password must be set together")]
     EmailSmtpAuth,
-    #[error("ssh.off_hours_start/end must be between 0 and 23")]
-    OffHours,
     #[error("response.auto_isolate requires at least one entry in response.management_cidrs")]
     IsolateWithoutCidrs,
     #[error("response.management_cidrs contains an invalid CIDR: '{0}'")]
@@ -121,7 +119,8 @@ pub struct SshCfg {
     pub permit_root: bool,
     pub failed_burst_count: u32,
     pub failed_burst_window_secs: u64,
-    /// Off-hours window in local time. Set start == end to disable.
+    /// Retained for compatibility: off-hours weighting was removed, so these
+    /// still accept old configs but no longer affect anything.
     pub off_hours_start: u32,
     pub off_hours_end: u32,
     /// Failed logins against *existing* accounts are summed up in a digest
@@ -412,9 +411,6 @@ impl Config {
                 return Err(ConfigError::Timeout(name));
             }
         }
-        if self.ssh.off_hours_start > 23 || self.ssh.off_hours_end > 23 {
-            return Err(ConfigError::OffHours);
-        }
         if self.notifications.channels.is_empty() {
             return Err(ConfigError::NoChannels);
         }
@@ -512,8 +508,6 @@ duration_hours = 24
 permit_root = false     # true suppresses the "root login over SSH" alert
 failed_burst_count = 5          # failures in the window; INFO until a login follows
 failed_burst_window_secs = 60
-off_hours_start = 22    # host local time; set start == end to disable off-hours weighting
-off_hours_end = 6
 brute_digest_hours = 2  # failed logins against existing accounts, summed up this often
 brute_min_attempts = 10 # failures a source needs in that period to be listed
 

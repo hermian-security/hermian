@@ -120,8 +120,8 @@ pub fn digest_finding(
     let warn_root = root_password_login;
     if warn_root {
         why.push_str(
-            " Root can log in over SSH with a password on this host, so a guessed root \
-             password is a full compromise.",
+            " Root can log in over SSH with a password on this host, so a single guessed \
+             password is enough to log in as root.",
         );
     }
     let mut f = Finding::new(
@@ -215,9 +215,7 @@ mod tests {
                               www-data:x:33:33::/var/www:/usr/sbin/nologin\n";
 
         fn engine() -> Engine {
-            let mut cfg = Config::default();
-            cfg.ssh.off_hours_start = 0;
-            cfg.ssh.off_hours_end = 0;
+            let cfg = Config::default();
             let allow = cfg.allowlist.clone();
             let mut b = Baseline::new(true, 24, Utc::now());
             b.complete = true;

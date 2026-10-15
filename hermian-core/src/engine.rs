@@ -1,7 +1,7 @@
 //! The detection engine: owns all state, consumes [`Event`]s, emits [`Alert`]s.
 //! Pure Rust, no I/O - everything here is unit-testable on any platform.
 
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{DateTime, Duration, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
 
@@ -76,8 +76,6 @@ pub struct Engine {
     /// Known listeners by `(proto, address, port)`.
     pub listeners: HashMap<(String, IpAddr, u16), DateTime<Utc>>,
     pub counters: Counters,
-    /// Host's local UTC offset (set by the daemon), for off-hours rules.
-    pub local_offset: FixedOffset,
     /// Accounts with a login shell (from /etc/passwd). Brute force counts
     /// only when it names one of these, or root.
     pub login_users: std::collections::HashSet<String>,
@@ -119,7 +117,6 @@ impl Engine {
             files: FileSnapshots::default(),
             listeners: HashMap::new(),
             counters,
-            local_offset: FixedOffset::east_opt(0).expect("zero offset is valid"),
             login_users: std::collections::HashSet::new(),
             brute: detect::brute::BruteDigest::default(),
             ignored_sources: HashMap::new(),
@@ -159,11 +156,6 @@ impl Engine {
                 .root_warning_snoozed_until
                 .map(|until| now >= until)
                 .unwrap_or(true)
-    }
-
-    /// The host's local UTC offset; off-hours windows are in local time.
-    pub fn set_local_offset(&mut self, offset: FixedOffset) {
-        self.local_offset = offset;
     }
 
     /// Restore per-day state persisted by the daemon across restarts.
@@ -210,7 +202,6 @@ impl Engine {
             flags: &self.flags,
             user_names: &self.user_names,
             now,
-            local_offset: self.local_offset,
         }
     }
 
@@ -317,7 +308,6 @@ impl Engine {
                         flags: &self.flags,
                         user_names: &self.user_names,
                         now,
-                        local_offset: self.local_offset,
                     };
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
                     self.record_brute_force(&e, now);
@@ -845,8 +835,6 @@ mod tests {
     #[test]
     fn ssh_success_after_burst_is_high() {
         let mut eng = engine_without_baseline();
-        eng.cfg.ssh.off_hours_start = 0;
-        eng.cfg.ssh.off_hours_end = 0;
         let t = Utc::now();
         let ip: IpAddr = "198.51.100.77".parse().unwrap();
         for i in 0..5 {
@@ -887,8 +875,6 @@ mod tests {
     #[test]
     fn ssh_success_without_burst_is_not_burst_high() {
         let mut eng = engine_without_baseline();
-        eng.cfg.ssh.off_hours_start = 0;
-        eng.cfg.ssh.off_hours_end = 0;
         let alerts = eng.process(Event::Auth(AuthEvent {
             ts: Utc::now(),
             result: AuthResult::Success,
@@ -924,9 +910,6 @@ mod tests {
             }))
         };
         let mut eng = engine_without_baseline();
-        // Deterministic: disable off-hours so wall-clock does not affect severity.
-        eng.cfg.ssh.off_hours_start = 0;
-        eng.cfg.ssh.off_hours_end = 0;
         assert!(has(&login(&mut eng), DetectionId::D2, Severity::High));
         // Same source again: context only (dedup would suppress anyway, so
         // advance past the window to observe the severity directly).
@@ -956,9 +939,7 @@ mod tests {
     /// two messages for the same event.
     #[test]
     fn root_login_from_a_new_source_is_one_alert() {
-        let mut cfg = Config::default();
-        cfg.ssh.off_hours_start = 0;
-        cfg.ssh.off_hours_end = 0;
+        let cfg = Config::default();
         let mut baseline = Baseline::new(true, 24, Utc::now());
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
@@ -982,9 +963,7 @@ mod tests {
 
     #[test]
     fn novel_source_with_baseline_fires() {
-        let mut cfg = Config::default();
-        cfg.ssh.off_hours_start = 22;
-        cfg.ssh.off_hours_end = 6;
+        let cfg = Config::default();
         let mut baseline = Baseline::new(true, 24, Utc::now());
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());

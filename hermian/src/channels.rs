@@ -17,9 +17,6 @@ use crate::notify::SendError;
 pub mod telegram {
     use super::*;
 
-    /// Telegram caps messages at 4096 chars; keep headroom for the pre block.
-    const MAX_TEXT: usize = 3800;
-
     /// Bot API base. Overridable for integration tests against a mock server.
     pub fn api_base() -> String {
         std::env::var("HERMIAN_TELEGRAM_API")
@@ -46,18 +43,6 @@ pub mod telegram {
             .replace('>', "&gt;")
     }
 
-    /// Facts beyond these go to `hermian show` instead of the message.
-    const MAX_FACT_ROWS: usize = 6;
-    /// Lines kept from one multi-line fact.
-    const MAX_FACT_LINES: usize = 4;
-    /// Text width of a fact value, so a table line fits a phone screen.
-    const FACT_W: usize = 30;
-    /// Facts labels are clipped here; keep it above the longest label in use.
-    const LABEL_W: usize = 12;
-    /// Separates the incident from the explanation, as a plain rule. U+2501.
-    const DIVIDER: &str = "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\
-                           \u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}";
-
     /// A four-cell severity meter (filled cells count up with severity).
     pub(super) fn meter(s: Severity) -> &'static str {
         match s {
@@ -79,151 +64,12 @@ pub mod telegram {
         out
     }
 
-    /// Wrap `text` to `width`, hard-splitting words that don't fit, keeping at
-    /// most `max_lines` lines. An explicit newline starts a new line. Runs on
-    /// unescaped text so escaping a whole line can never split an entity.
-    fn wrap_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for para in text.split('\n') {
-            let mut cur = String::new();
-            for word in para.split_whitespace() {
-                if word.chars().count() > width {
-                    if !cur.is_empty() {
-                        out.push(std::mem::take(&mut cur));
-                        if out.len() >= max_lines {
-                            return out;
-                        }
-                    }
-                    let mut chunk = String::new();
-                    for ch in word.chars() {
-                        chunk.push(ch);
-                        if chunk.chars().count() == width {
-                            out.push(std::mem::take(&mut chunk));
-                            if out.len() >= max_lines {
-                                return out;
-                            }
-                        }
-                    }
-                    cur = chunk;
-                    continue;
-                }
-                if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
-                    out.push(std::mem::take(&mut cur));
-                    if out.len() >= max_lines {
-                        return out;
-                    }
-                }
-                if !cur.is_empty() {
-                    cur.push(' ');
-                }
-                cur.push_str(word);
-            }
-            out.push(std::mem::take(&mut cur));
-            if out.len() >= max_lines {
-                break;
-            }
-        }
-        out.truncate(max_lines);
-        out
-    }
-
-    /// The evidence facts as an aligned monospace block, HTML-escaped. `None`
-    /// when there is nothing to show.
-    fn fact_table(rows: &[(String, String)]) -> Option<String> {
-        if rows.is_empty() {
-            return None;
-        }
-        let labels: Vec<String> = rows
-            .iter()
-            .take(MAX_FACT_ROWS)
-            .map(|(l, _)| esc(&clip(l, LABEL_W)))
-            .collect();
-        let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-        let mut lines: Vec<String> = Vec::new();
-        for ((_, value), label) in rows.iter().take(MAX_FACT_ROWS).zip(&labels) {
-            for (i, l) in wrap_lines(&clip(value, 400), FACT_W, MAX_FACT_LINES)
-                .iter()
-                .enumerate()
-            {
-                let pad = if i == 0 { label.as_str() } else { "" };
-                lines.push(format!("{:<w$}  {}", pad, esc(l), w = label_w));
-            }
-        }
-        if rows.len() > MAX_FACT_ROWS {
-            lines.push(format!("+{} more", rows.len() - MAX_FACT_ROWS));
-        }
-        Some(format!("<pre>{}</pre>", lines.join("\n")))
-    }
-
-    /// Evidence worth showing: the process chain when it has more than one
-    /// step, and any fact the title or summary doesn't already state. A fact
-    /// whose value is already in the sentence above it is the same thing twice;
-    /// `hermian show <ref>` always has the complete list.
-    fn extra_facts(alert: &Alert) -> Vec<(String, String)> {
-        let stated = format!("{} {}", alert.title, alert.what).to_lowercase();
-        let mut rows: Vec<(String, String)> = Vec::new();
-        if alert.chain.len() > 1 {
-            let chain: Vec<&str> = alert.chain.iter().map(|n| n.comm.as_str()).collect();
-            rows.push(("Chain".to_string(), chain.join(" \u{2192} ")));
-        }
-        for f in &alert.facts {
-            let v = f.value.trim();
-            if v.is_empty() || stated.contains(&v.to_lowercase()) {
-                continue;
-            }
-            rows.push((f.label.clone(), f.value.clone()));
-        }
-        rows
-    }
-
-    /// The explanation: a rule, why it matters, the recommended steps, a rule.
-    /// Empty when there is nothing to explain.
-    fn explanation(alert: &Alert) -> String {
-        if alert.why.is_empty() && alert.actions.is_empty() {
-            return String::new();
-        }
-        let mut s = format!("{}\n", DIVIDER);
-        if !alert.why.is_empty() {
-            s.push('\n');
-            s.push_str(&esc(&clip(&alert.why, 600)));
-            s.push('\n');
-        }
-        if !alert.actions.is_empty() {
-            s.push_str("\n<b>Also</b>\n");
-            for (i, a) in alert.actions.iter().take(5).enumerate() {
-                s.push_str(&format!("{}. {}\n", i + 1, esc(&clip(a, 180))));
-            }
-        }
-        s.push_str(&format!("\n{}", DIVIDER));
-        s
-    }
-
-    /// Build the HTML message body. Shape:
-    ///
-    /// ```text
-    /// â– â– â– â–¡ HERMIAN - HIGH
-    /// Host : web-01
-    ///
-    /// - SSH login after a failed-auth burst :
-    ///
-    /// root logged in from 198.51.100.7 shortly after 14 failed attempts.
-    ///
-    /// â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
-    /// A login from an address that was just brute-forcing this host ...
-    ///
-    /// Also
-    /// 1. ...
-    /// â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
-    ///
-    /// hermian show HER-...
-    /// ```
-    ///
-    /// The CLI keeps the full alert; this is the short form. Every piece is
-    /// complete HTML so skipping one never leaves a tag open, the footer is
-    /// always kept, and each field is clipped to a budget so a long
-    /// attacker-controlled value can't push the message past Telegram's limit.
+    /// Build the HTML message body: the severity meter and host, the
+    /// headline, one or two sentences of what happened, and the
+    /// `hermian show` line. Evidence, the process chain, why it matters and
+    /// the recommended steps stay in the CLI; the message says what happened,
+    /// nothing more.
     pub fn body(alert: &Alert) -> String {
-        let footer = format!("\n<code>hermian show {}</code>", esc(&alert.ref_id));
         let mut out = format!(
             "<b>{} HERMIAN - {}</b>\nHost : {}",
             meter(alert.severity),
@@ -233,30 +79,19 @@ pub mod telegram {
         if alert.repeats > 1 {
             out.push_str(&format!("  (seen {} times)", alert.repeats));
         }
-        out.push_str(&format!(
-            "\n\n- {} :\n",
-            esc(&clip(alert.title.trim(), 160))
-        ));
-
-        let mut pieces: Vec<String> = Vec::new();
+        if !alert.title.trim().is_empty() {
+            out.push_str(&format!(
+                "\n\n<b>{}</b>",
+                esc(&clip(alert.title.trim(), 160))
+            ));
+        }
         if !alert.what.is_empty() {
-            pieces.push(format!("\n{}\n", esc(&clip(&alert.what, 500))));
+            out.push_str(&format!("\n{}", esc(&clip(&alert.what, 500))));
         }
-        if let Some(t) = fact_table(&extra_facts(alert)) {
-            pieces.push(format!("\n{}\n", t));
-        }
-        let tail = explanation(alert);
-        if !tail.is_empty() {
-            pieces.push(format!("\n{}", tail));
-        }
-
-        let footer_len = footer.chars().count();
-        for p in pieces {
-            if out.chars().count() + p.chars().count() + footer_len <= MAX_TEXT {
-                out.push_str(&p);
-            }
-        }
-        out.push_str(&footer);
+        out.push_str(&format!(
+            "\n\n<code>hermian show {}</code>",
+            esc(&alert.ref_id)
+        ));
         out
     }
 
@@ -644,7 +479,9 @@ mod tests {
         assert!(b.contains("A &amp; B"));
         assert!(!b.contains("<modified>"));
         assert!(b.chars().count() <= 4096);
-        assert!(b.contains("<pre>"));
+        assert!(!b.contains("<pre>"));
+        assert!(!b.contains("Loader injection"));
+        assert!(!b.contains("Remove it."));
     }
 
     #[test]
@@ -674,11 +511,12 @@ mod tests {
             b
         );
         assert!(b.contains("Host : web-01"));
-        assert!(b.contains("- ld.so.preload &lt;modified&gt; :"));
-        assert!(b.contains("<b>Also</b>"));
-        assert!(b.contains("1. Remove it."));
-        // The full alert is not repeated; the CLI keeps that.
-        assert!(!b.contains("Recommended action"));
+        assert!(b.contains("<b>ld.so.preload &lt;modified&gt;</b>"));
+        assert!(b.contains("A &amp; B"));
+        // The why, the steps and the facts stay in the CLI.
+        assert!(!b.contains("Loader injection"));
+        assert!(!b.contains("Remove it."));
+        assert!(!b.contains("/tmp/evil.so"));
         assert!(b.ends_with("<code>hermian show HER-2025-0101-007</code>"));
     }
 
@@ -703,54 +541,27 @@ mod tests {
     }
 
     #[test]
-    fn facts_already_in_the_summary_are_not_repeated() {
+    fn telegram_body_is_a_headline_and_a_sentence() {
         let f = Finding::new(
             DetectionId::D2,
-            Severity::High,
-            "SSH login after a failed-auth burst",
+            Severity::Low,
+            "SSH login from a new source",
             "x",
         )
-        .what("User 'root' authenticated from 198.51.100.7 after 14 failed attempts.")
-        .fact("Source", "198.51.100.7")
-        .fact("User", "root")
-        .fact("Failed attempts", "14");
-        let a = Alert::from_finding(f, "HER-1".into(), "web-01".into(), chrono::Utc::now());
+        .what(
+            "User 'deploy' authenticated from 1.2.3.4, a source never seen during the baseline \
+             period.",
+        )
+        .fact("Source", "1.2.3.4")
+        .why("Some explanation that stays in the CLI.")
+        .action("Do something about it.");
+        let a = Alert::from_finding(f, "HER-2".into(), "web-01".into(), chrono::Utc::now());
         let b = telegram::body(&a);
-        assert!(!b.contains("<pre>"), "{}", b);
-        assert!(
-            b.contains("User 'root' authenticated from 198.51.100.7"),
-            "{}",
-            b
-        );
-        // A fact the sentence does not carry still shows.
-        let f2 = Finding::new(DetectionId::D1, Severity::Critical, "Web server chain", "x")
-            .what("nginx started a shell.")
-            .fact("File", "/tmp/.x");
-        let a2 = Alert::from_finding(f2, "HER-2".into(), "web-01".into(), chrono::Utc::now());
-        assert!(telegram::body(&a2).contains("/tmp/.x"));
-    }
-
-    #[test]
-    fn telegram_fact_table_is_aligned_and_capped() {
-        let mut f = Finding::new(DetectionId::D2, Severity::High, "SSH login", "x")
-            .fact("Source", "198.51.100.7")
-            .fact("User", "root");
-        for i in 0..10 {
-            f = f.fact(format!("Extra {}", i), "v");
-        }
-        let a = Alert::from_finding(f, "HER-1".into(), "web-01".into(), chrono::Utc::now());
-        let b = telegram::body(&a);
-        // Rows share one label column, and the extras collapse to a count.
-        let pre = &b[b.find("<pre>").unwrap() + 5..b.find("</pre>").unwrap()];
-        let src = pre.lines().find(|l| l.starts_with("Source")).unwrap();
-        let usr = pre.lines().find(|l| l.starts_with("User")).unwrap();
-        assert_eq!(
-            src.find("198").unwrap(),
-            usr.find("root").unwrap(),
-            "{}",
-            pre
-        );
-        assert!(b.contains("+6 more"), "{}", b);
+        assert!(b.contains("<b>SSH login from a new source</b>"), "{}", b);
+        assert!(b.contains("authenticated from 1.2.3.4"), "{}", b);
+        assert!(!b.contains("Some explanation"), "{}", b);
+        assert!(!b.contains("Do something"), "{}", b);
+        assert!(b.chars().count() < 400, "{}", b);
     }
 
     #[test]

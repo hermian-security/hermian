@@ -49,12 +49,6 @@ fn save_engine_state(engine: &Engine) {
     }
 }
 
-/// The host's current UTC offset (follows DST; refreshed every tick).
-fn local_offset() -> chrono::FixedOffset {
-    use chrono::Offset;
-    chrono::Local::now().offset().fix()
-}
-
 pub fn run() -> Result<()> {
     config::require_root()?;
     let cfg = config::load_config()?;
@@ -81,7 +75,6 @@ pub fn run() -> Result<()> {
     let watchdog_note = heartbeat::take_restart_note(&paths::watchdog_note_file());
 
     let mut engine = Engine::new(cfg.clone(), allowlist, baseline, host);
-    engine.set_local_offset(local_offset());
     if let Some(st) = load_engine_state() {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
         engine.root_warning_snoozed_until = st.root_warning_snoozed_until;
@@ -466,7 +459,6 @@ async fn async_main(
                 // a slow tick refreshes.
                 let _ = heartbeat::touch(&paths::heartbeat_file());
                 let now = Utc::now();
-                engine.set_local_offset(local_offset());
                 engine.reap_exited(&procsrc::live_pids(), now);
                 for a in engine.tick(now) {
                     notifier.send(a);
