@@ -15,7 +15,7 @@ Earlier release information remains in the repository's GitHub Releases and Git 
     `Block all` and `Ignore 2h`. It warns when root can log in with a
     password (checked with `sshd -T`), with a `Remind me in 7 days` button.
   - Suspicious logins (after a burst, from a new source, root from a new
-    place) get `Ignore`, `Disconnect user` and `Disconnect and block`.
+    place) get `Ignore`, `Disconnect session` and `Disconnect and block`.
   - Buttons act immediately, work only for the listed user ids in the
     configured chat, expire, and each works once. Presses are fetched by
     outbound polling, so nothing listens on the host. Each one is answered

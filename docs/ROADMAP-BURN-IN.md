@@ -21,7 +21,7 @@ except where marked **untested**.
 | Overhead | 0.1 % CPU, 19 MB RSS, 80 k events/3 h | `hermian status` |
 | Packaging | `.deb` builds, installs, upgrades in place | `cargo deb` on host |
 | Notifications | Telegram + email verified through the daemon | `hermian notify-test` |
-| Field time | ~5 h on one host | `soak.jsonl` |
+| Field time | one production host since 2026-09-20 (was ~5 h after the first afternoon) | `soak.jsonl`, deployment notes |
 
 The gap to production is **breadth and time**, not features.
 

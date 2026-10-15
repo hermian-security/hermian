@@ -2,12 +2,80 @@
 
 [![Hermian](docs/logo-text.svg)](https://hermian.me)
 
+[![CI](https://github.com/hermian-security/hermian/actions/workflows/ci.yml/badge.svg)](https://github.com/hermian-security/hermian/actions/workflows/ci.yml)
+[![Release](https://github.com/hermian-security/hermian/actions/workflows/release.yml/badge.svg)](https://github.com/hermian-security/hermian/releases)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A small Linux security daemon. Watches process chains, SSH activity, persistence
 changes, privilege escalation signals, and network activity. Alerts go to your
 logs, Telegram, email, or a webhook. No dashboard or central server needed.
 
-**Still in beta.** Start on a test host; coverage and false-positive rates need
-more field testing. See [project notes](PROJECT.md) for how it works and its limits.
+**Beta, validated on one host so far.** One host has completed the full attack
+and false-positive pass; a production VPS has been running it since
+September 2026. Broader testing across distros and time is in progress. Start
+on a test host. The verified numbers are in [docs/EVIDENCE.md](docs/EVIDENCE.md),
+and the known gaps are in [Limits](#limits).
+
+Here's what an alert looks like (Telegram; the CLI has the full record):
+
+```
+■■■■ HERMIAN - CRITICAL
+Host : web-01
+
+- Web server chain ran downloaded code :
+
+nginx started a shell that downloaded a file and is now running it as
+www-data.
+
+Chain  nginx → sh → curl → /tmp/.x
+File   /tmp/.x
+
+━━━━━━━━━━━━━━━━
+
+Web servers don't normally spawn shells. The chain then downloaded a
+file from the internet, which is the shape of a web shell dropped on a
+vulnerable app.
+
+Also
+1. Isolate the host unless this is expected.
+
+━━━━━━━━━━━━━━━━
+hermian show HER-2026-1006-415
+```
+
+## Who it is for
+
+- A VPS, a homelab, or a small set of servers you look after yourself.
+- People who want the alert in chat or logs, not another dashboard or account.
+- Opt-in response: block a source or disconnect a session from the alert, or
+  auto-isolate CRITICAL events, without a central control plane.
+
+## Who it is not for
+
+- Containers and Kubernetes: it watches the host, not what's inside pods.
+- Fleets and endpoint management: no central console, policy management, or
+  compliance reports.
+- Anything you can't test first: the burn-in matrix isn't finished, so don't
+  start on a host you can't afford to debug.
+
+## Limits
+
+- **One distro so far.** Only Ubuntu 22.04 hosts have run it in the field.
+  RHEL/SELinux, the older-kernel fallback, and arm64 are untested.
+- **It sees what it hooks.** Detection runs on kernel and log sources;
+  activity outside them is invisible, and separate rules can report one
+  incident.
+- **Delivery isn't durable.** Pending alerts sit in memory (500 max) and
+  don't survive a crash. Good enough for the default channels, not an outbox.
+- **No heartbeat.** It flags changes to itself and its config, but if the
+  daemon is SIGKILLed, nothing else is watching.
+- **Isolation isn't a cutoff.** `hermian isolate` installs an nftables ruleset
+  with documented exceptions, and auto-isolation reverts on a timer.
+- **Root owns the box.** Local hashes detect changes; they don't stop someone
+  who already has root.
+
+Architecture and detection details are in [PROJECT.md](PROJECT.md); plans and
+gaps are in [the burn-in matrix](docs/ROADMAP-BURN-IN.md).
 
 ## Install
 
@@ -132,7 +200,7 @@ chat_id = "-1001234567890"
 #### Response buttons (optional)
 
 Telegram alerts can carry buttons: `Block` on the brute-force digest, and
-`Ignore` / `Disconnect user` / `Disconnect and block` on suspicious SSH
+`Ignore` / `Disconnect session` / `Disconnect and block` on suspicious SSH
 logins. They act at once, so only list people you trust:
 
 ```toml
@@ -177,9 +245,21 @@ checks. Exceptions belong in the config's allowlist, with a `reason` for each on
 Optional network isolation needs management CIDRs configured first. See
 [response settings and limits](PROJECT.md#response) before using it.
 
+## AI-assisted development
+
+Parts of the code, tests, and docs are written with AI assistance, and the
+project says so instead of hiding it. AI-assisted work can branch, test,
+commit, push, and open a PR; merging and releasing are done by hand and never
+by AI. Right now there's a single maintainer, who owns everything that merges;
+independent review is planned as the project grows. The full working rules are
+in [AGENTS.md](AGENTS.md).
+
 ## More
 
+- [Evidence](docs/EVIDENCE.md): what's been verified, where, and when.
 - [Project notes](PROJECT.md): architecture, detection rules, and limits.
+- [Burn-in matrix](docs/ROADMAP-BURN-IN.md): how this gets to production ready.
+- [False-positive log](docs/fp-log.md): every HIGH+ that wasn't real.
 - [Contributing](CONTRIBUTING.md): builds, tests, PRs, and releases.
 - [Changelog](CHANGELOG.md): what's changed.
 - [Security reports](SECURITY.md): please report vulnerabilities privately.

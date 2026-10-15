@@ -182,7 +182,7 @@ alerts that offer responses carry inline buttons:
 | Alert | Buttons |
 | --- | --- |
 | Brute-force digest (failed logins against accounts that exist and have a login shell, or root; sent every `ssh.brute_digest_hours` only when a source reached `ssh.brute_min_attempts`) | `Block <ip>` for the top sources, `Block all`, `Ignore 2h`, and `Remind me in 7 days` when the digest warns that root can log in with a password |
-| Login after a burst, from a new source, or root from a new place | `Ignore`, `Disconnect user`, `Disconnect and block` |
+| Login after a burst, from a new source, or root from a new place | `Ignore`, `Disconnect session`, `Disconnect and block` |
 
 Buttons act immediately; there's no confirmation step. They only work for
 the listed Telegram user ids in the configured chat, expire after
@@ -266,7 +266,8 @@ wait accommodates pollers; it isn't a five-second latency test. Run attack and
 false-positive workloads only on disposable hosts: they modify real auth and
 persistence files.
 
-Field results so far come from one Ubuntu host. CPU under 1%, RSS under 80 MB,
+Field results so far come from Ubuntu 22.04 hosts; [docs/EVIDENCE.md](docs/EVIDENCE.md)
+records exactly what's verified and what isn't. CPU under 1%, RSS under 80 MB,
 and low false-positive rates are goals, not guarantees. The 20-second privilege
 sweep alone rules out a blanket five-second detection promise.
 
