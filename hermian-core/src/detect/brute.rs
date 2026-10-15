@@ -140,13 +140,13 @@ pub fn digest_finding(
         if period_hours == 1 { "" } else { "s" },
         started.format("%H:%M"),
     ))
-    .fact("Top sources", top.join("\n"))
+    .fact("Top sources", top.join("; "))
     .fact(
         "Accounts",
         accounts.iter().copied().collect::<Vec<_>>().join(", "),
     )
     .fact(
-        "Root password login",
+        "Root login",
         if warn_root {
             if root_targeted {
                 "ENABLED, and root is being tried"

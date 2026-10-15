@@ -1,4 +1,4 @@
-//! Outbound notification transports: Telegram and email.
+﻿//! Outbound notification transports: Telegram and email.
 //!
 //! Each `send` is synchronous and returns `Err(String)` with a one-line reason
 //! so the notifier can retry with backoff and surface it in `hermian status`.
@@ -46,17 +46,15 @@ pub mod telegram {
             .replace('>', "&gt;")
     }
 
-    fn glyph(s: Severity) -> &'static str {
-        match s {
-            Severity::Critical => "\u{1F534}", // red circle
-            Severity::High => "\u{1F7E0}",     // orange circle
-            Severity::Low => "\u{1F7E1}",      // yellow circle
-            Severity::Info => "\u{26AA}",      // white circle
-        }
-    }
+    /// Facts beyond these go to `hermian show` instead of the message.
+    const MAX_FACT_ROWS: usize = 6;
+    /// Lines kept from one multi-line fact.
+    const MAX_FACT_LINES: usize = 4;
+    /// Text width of a fact value, so a table line fits a phone screen.
+    const FACT_W: usize = 30;
+    /// Facts labels are clipped here; keep it above the longest label in use.
+    const LABEL_W: usize = 12;
 
-    /// Build the HTML message body: a bold headline, the human summary, and
-    /// the full plain-theme alert in a monospace block.
     /// Cut `s` to at most `max` chars, marking the cut. Applied before
     /// escaping so an HTML entity is never split.
     fn clip(s: &str, max: usize) -> String {
@@ -68,44 +66,162 @@ pub mod telegram {
         out
     }
 
+    /// Wrap `text` to `width`, hard-splitting words that don't fit, keeping at
+    /// most `max_lines` lines. An explicit newline starts a new line. Runs on
+    /// unescaped text so escaping a whole line can never split an entity.
+    fn wrap_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for para in text.split('\n') {
+            let mut cur = String::new();
+            for word in para.split_whitespace() {
+                if word.chars().count() > width {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                        if out.len() >= max_lines {
+                            return out;
+                        }
+                    }
+                    let mut chunk = String::new();
+                    for ch in word.chars() {
+                        chunk.push(ch);
+                        if chunk.chars().count() == width {
+                            out.push(std::mem::take(&mut chunk));
+                            if out.len() >= max_lines {
+                                return out;
+                            }
+                        }
+                    }
+                    cur = chunk;
+                    continue;
+                }
+                if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > width {
+                    out.push(std::mem::take(&mut cur));
+                    if out.len() >= max_lines {
+                        return out;
+                    }
+                }
+                if !cur.is_empty() {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+            }
+            out.push(std::mem::take(&mut cur));
+            if out.len() >= max_lines {
+                break;
+            }
+        }
+        out.truncate(max_lines);
+        out
+    }
+
+    /// The evidence facts as an aligned monospace block, HTML-escaped. `None`
+    /// when there is nothing to show.
+    fn fact_table(rows: &[(String, String)]) -> Option<String> {
+        if rows.is_empty() {
+            return None;
+        }
+        let labels: Vec<String> = rows
+            .iter()
+            .take(MAX_FACT_ROWS)
+            .map(|(l, _)| esc(&clip(l, LABEL_W)))
+            .collect();
+        let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let mut lines: Vec<String> = Vec::new();
+        for ((_, value), label) in rows.iter().take(MAX_FACT_ROWS).zip(&labels) {
+            for (i, l) in wrap_lines(&clip(value, 400), FACT_W, MAX_FACT_LINES)
+                .iter()
+                .enumerate()
+            {
+                let pad = if i == 0 { label.as_str() } else { "" };
+                lines.push(format!("{:<w$}  {}", pad, esc(l), w = label_w));
+            }
+        }
+        if rows.len() > MAX_FACT_ROWS {
+            lines.push(format!("+{} more", rows.len() - MAX_FACT_ROWS));
+        }
+        Some(format!("<pre>{}</pre>", lines.join("\n")))
+    }
+
+    /// The collapsed block under the message: why it matters, the steps after
+    /// the first, and the detection. The reader taps to expand it.
+    fn details(alert: &Alert) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if !alert.why.is_empty() {
+            parts.push(format!(
+                "<b>Why this matters</b>\n{}",
+                esc(&clip(&alert.why, 500))
+            ));
+        }
+        // The first step is the "Next" line above; the rest live here.
+        let rest: Vec<String> = alert
+            .actions
+            .iter()
+            .skip(1)
+            .take(4)
+            .enumerate()
+            .map(|(i, a)| format!("{}. {}", i + 2, clip(a, 160)))
+            .collect();
+        if !rest.is_empty() {
+            parts.push(format!("<b>Also</b>\n{}", esc(&rest.join("\n"))));
+        }
+        if alert.repeats > 1 {
+            parts.push(format!(
+                "<b>Seen</b>\n{} times in the deduplication window.",
+                alert.repeats
+            ));
+        }
+        parts.push(format!(
+            "<b>Detection</b>\n{} \u{00B7} {}",
+            esc(alert.detection.short()),
+            esc(&clip(alert.detection.name(), 80))
+        ));
+        Some(format!(
+            "<blockquote expandable>{}</blockquote>",
+            parts.join("\n\n")
+        ))
+    }
+
+    /// Build the HTML message body: a bold headline, the summary, an aligned
+    /// fact table, one next step, and a collapsed details block. The whole
+    /// alert is not repeated; `hermian show <ref>` has it.
     pub fn body(alert: &Alert) -> String {
         // Every piece is complete HTML, so skipping one never leaves an open
-        // tag; the footer is always kept. Facts can quote attacker-controlled
-        // file content, so without a budget one long line could push the
-        // message past Telegram's limit and get it rejected on every retry.
+        // tag and the footer is always kept. Facts can quote attacker
+        // controlled file content, so each piece is clipped to a budget: one
+        // long line mustn't push the message past Telegram's limit and get it
+        // rejected on every retry.
         let footer = format!("\n<code>hermian show {}</code>", esc(&alert.ref_id));
         let mut out = format!(
-            "{} <b>HERMIAN {}</b> \u{00B7} <code>{}</code>\n<b>{}</b>\n",
-            glyph(alert.severity),
+            "<b>{} \u{00B7} {}</b>\n<i>{} \u{00B7} {}</i>\n",
             alert.severity.as_str(),
-            esc(&clip(&alert.host, 80)),
-            esc(&clip(&alert.title, 200))
+            esc(&clip(alert.title.trim(), 160)),
+            esc(&clip(&alert.host, 60)),
+            alert.ts.format("%Y-%m-%d %H:%M UTC")
         );
-        let mut pieces = Vec::new();
-        if !alert.what.is_empty() {
-            pieces.push(format!("{}\n", esc(&clip(&alert.what, 1200))));
-        }
+
+        let mut rows: Vec<(String, String)> = Vec::new();
         if !alert.chain.is_empty() {
-            let chain: Vec<String> = alert
-                .chain
-                .iter()
-                .map(|n| format!("{}({})", n.comm, n.pid))
-                .collect();
-            pieces.push(format!(
-                "<i>chain:</i> <code>{}</code>\n",
-                esc(&clip(&chain.join(" \u{2192} "), 600))
-            ));
+            let chain: Vec<&str> = alert.chain.iter().map(|n| n.comm.as_str()).collect();
+            rows.push(("Chain".to_string(), chain.join(" > ")));
         }
         for f in &alert.facts {
-            pieces.push(format!(
-                "<i>{}:</i> <code>{}</code>\n",
-                esc(&clip(&f.label, 60)),
-                esc(&clip(&f.value, 400))
-            ));
+            rows.push((f.label.clone(), f.value.clone()));
+        }
+
+        let mut pieces: Vec<String> = Vec::new();
+        if !alert.what.is_empty() {
+            pieces.push(format!("{}\n", esc(&clip(&alert.what, 500))));
+        }
+        if let Some(t) = fact_table(&rows) {
+            pieces.push(format!("{}\n", t));
         }
         if let Some(a) = alert.actions.first() {
-            pieces.push(format!("\n<b>Next:</b> {}\n", esc(&clip(a, 400))));
+            pieces.push(format!("\n<b>Next:</b> {}", esc(&clip(a, 200))));
         }
+        if let Some(d) = details(alert) {
+            pieces.push(format!("\n\n{}", d));
+        }
+
         let footer_len = footer.chars().count();
         for p in pieces {
             if out.chars().count() + p.chars().count() + footer_len <= MAX_TEXT {
@@ -113,14 +229,6 @@ pub mod telegram {
             }
         }
         out.push_str(&footer);
-        // Full rendering as an expandable-ish block, if it fits.
-        let full = render(alert, Theme::Plain);
-        let budget = MAX_TEXT.saturating_sub(out.chars().count() + 20);
-        if full.chars().count() < budget {
-            out.push_str("\n\n<pre>");
-            out.push_str(&esc(&full));
-            out.push_str("</pre>");
-        }
         out
     }
 
@@ -490,6 +598,7 @@ mod tests {
             "x",
         )
         .what("A & B")
+        .why("Loader injection is a common persistence trick.")
         .fact("Preloads", "/tmp/evil.so")
         .action("Remove it.");
         Alert::from_finding(
@@ -524,6 +633,43 @@ mod tests {
         // Never a dangling entity or tag.
         assert_eq!(b.matches("<code>").count(), b.matches("</code>").count());
         assert!(!b.contains("&am\n") && !b.contains("&l\n"));
+    }
+
+    #[test]
+    fn telegram_body_has_no_emoji_and_collapses_details() {
+        let b = telegram::body(&alert());
+        // No emoji anywhere: severity is a word.
+        assert!(!b.chars().any(|c| c as u32 >= 0x1F000));
+        assert!(b.starts_with("<b>CRITICAL \u{00B7} "), "{}", b);
+        assert!(b.contains("<b>Next:</b> Remove it."));
+        // Long-form lives in a collapsed block, not in the message body.
+        assert!(b.contains("<blockquote expandable>"));
+        assert!(b.contains("<b>Why this matters</b>"));
+        assert!(!b.contains("Recommended action"));
+        assert!(b.ends_with("<code>hermian show HER-2025-0101-007</code>"));
+    }
+
+    #[test]
+    fn telegram_fact_table_is_aligned_and_capped() {
+        let mut f = Finding::new(DetectionId::D2, Severity::High, "SSH login", "x")
+            .fact("Source", "198.51.100.7")
+            .fact("User", "root");
+        for i in 0..10 {
+            f = f.fact(format!("Extra {}", i), "v");
+        }
+        let a = Alert::from_finding(f, "HER-1".into(), "web-01".into(), chrono::Utc::now());
+        let b = telegram::body(&a);
+        // Rows share one label column, and the extras collapse to a count.
+        let pre = &b[b.find("<pre>").unwrap() + 5..b.find("</pre>").unwrap()];
+        let src = pre.lines().find(|l| l.starts_with("Source")).unwrap();
+        let usr = pre.lines().find(|l| l.starts_with("User")).unwrap();
+        assert_eq!(
+            src.find("198").unwrap(),
+            usr.find("root").unwrap(),
+            "{}",
+            pre
+        );
+        assert!(b.contains("+6 more"), "{}", b);
     }
 
     #[test]
