@@ -208,6 +208,18 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   both the root-policy finding and the new-source finding, which meant two
   Telegram messages for one event. The sharper finding is kept; ties keep
   the root-policy alert.
+- `apt remove` stops and deletes the watchdog timer too. It used to keep
+  firing every minute against the removed binary. Remove and purge now
+  match `hermian uninstall`, including the Telegram block table and, on
+  purge, the inotify sysctl file.
+- `install.sh` piped into `sh` always downloads and verifies. A file named
+  `hermian` in the current directory used to switch it to local mode and
+  get installed as root unchecked. Local mode now means the script sits in
+  an extracted tarball, and `--version` there is an error.
+- After a crash, the "unclean shutdown" alert quotes the panic (thread and
+  message) instead of guessing between a crash, a kill and power loss.
+- Two Telegram `Block` presses at the same moment can't create the block
+  table twice.
 
 ### Changed
 
