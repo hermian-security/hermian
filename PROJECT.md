@@ -58,8 +58,10 @@ A web server spawning a shell is HIGH. A normal shell under an SSH session
 isn't. File rules also distinguish operator edits from unattended writes.
 
 Roles that exempt a process (package and config managers, user tools,
-debuggers, session daemons) need its executable in a root-owned system
-directory; a binary merely named `dpkg` doesn't count. Script tools such as
+debuggers, session daemons) need its executable in a system directory that
+root really owns (the file and every directory above it, none writable by
+anyone else); a binary merely named `dpkg`, or one in a deploy user's
+`/opt/app`, doesn't count. Script tools such as
 dnf or Debian's adduser run under an interpreter, so the script's own path
 (from the command line) has to be in such a directory. Build tools that
 excuse LD_PRELOAD (make, cargo, fakeroot...) follow the same rule. A TTY or

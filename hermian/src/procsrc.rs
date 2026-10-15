@@ -196,6 +196,76 @@ pub fn argv_of(pid: u32) -> Vec<String> {
 /// so a shell script at `/tmp/dnf` isn't trusted as the package manager.
 /// See [`hermian_core::proctree::script_tool_exe`].
 pub fn judged_exe(pid: u32, comm: &str, exe: &str) -> String {
+    mark_unowned(script_exe(pid, comm, exe), root_owned_cached)
+}
+
+/// Prefix put on an exe the engine would trust by path but that root doesn't
+/// actually own. No trusted-dir check accepts it.
+pub const NOT_ROOT_OWNED: &str = "(not root-owned) ";
+
+/// The engine trusts install dirs (`/usr/bin/`, `/opt/`...) by path alone.
+/// `/opt/<app>` is often a deploy user's, so `/opt/app/bin/apt` passed as
+/// the package manager. Only paths root really owns keep that trust.
+fn mark_unowned(exe: String, root_owned: impl Fn(&str) -> bool) -> String {
+    if hermian_core::proctree::is_trusted_exe(&exe) && !root_owned(&exe) {
+        format!("{}{}", NOT_ROOT_OWNED, exe)
+    } else {
+        exe
+    }
+}
+
+/// `path` and every directory above it are owned by root, and nobody else
+/// can replace them: no group (other than root) or world write, except on
+/// sticky directories like `/nix/store` (1775 root:nixbld), where others
+/// can't rename or delete root's entries.
+pub fn root_owned_path(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = Some(std::path::Path::new(path));
+    while let Some(cur) = p {
+        if cur.as_os_str().is_empty() {
+            break;
+        }
+        let Ok(m) = fs::metadata(cur) else {
+            return false;
+        };
+        let mode = m.mode();
+        let others_write = mode & 0o002 != 0 || (mode & 0o020 != 0 && m.gid() != 0);
+        let sticky_dir = m.is_dir() && mode & 0o1000 != 0;
+        if m.uid() != 0 || (others_write && !sticky_dir) {
+            return false;
+        }
+        p = cur.parent();
+    }
+    true
+}
+
+/// [`root_owned_path`] with a short cache: it runs on every exec.
+fn root_owned_cached(path: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    const TTL: Duration = Duration::from_secs(60);
+    const MAX: usize = 4096;
+    static CACHE: OnceLock<Mutex<HashMap<String, (bool, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(c) = cache.lock() {
+        if let Some((owned, at)) = c.get(path) {
+            if at.elapsed() < TTL {
+                return *owned;
+            }
+        }
+    }
+    let owned = root_owned_path(path);
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= MAX {
+            c.clear();
+        }
+        c.insert(path.to_string(), (owned, Instant::now()));
+    }
+    owned
+}
+
+fn script_exe(pid: u32, comm: &str, exe: &str) -> String {
     let unchanged = hermian_core::proctree::script_tool_exe(comm, exe, &[]);
     if unchanged == exe {
         // Not a script tool under an interpreter: no need to read cmdline.
@@ -638,6 +708,34 @@ pub fn current_exe_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn trusted_paths_root_does_not_own_lose_their_trust() {
+        let unowned = mark_unowned("/opt/app/bin/apt".into(), |_| false);
+        assert_eq!(unowned, "(not root-owned) /opt/app/bin/apt");
+        assert!(!hermian_core::proctree::is_trusted_exe(&unowned));
+        assert_eq!(mark_unowned("/usr/bin/apt".into(), |_| true), "/usr/bin/apt");
+        // Untrusted paths stay as they are; nothing to downgrade.
+        assert_eq!(mark_unowned("/tmp/apt".into(), |_| false), "/tmp/apt");
+    }
+
+    #[test]
+    fn ownership_walks_every_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(root_owned_path("/usr/bin/env"));
+        let dir = scratch("owned");
+        let f = dir.join("tool");
+        fs::write(&f, "x").unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            // Our own file and directory: not root's.
+            assert!(!root_owned_path(f.to_str().unwrap()));
+        }
+        // A binary anyone can rewrite never counts, whoever owns it.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!root_owned_path(f.to_str().unwrap()));
+        assert!(!root_owned_path("/nonexistent/hermian/tool"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("hermian-{}-{}", name, std::process::id()));

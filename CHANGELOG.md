@@ -119,6 +119,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   `ct state established` rule kept every flow from before the alert alive,
   a reverse shell included. Now only management CIDRs keep their sessions,
   and DNS, metadata and notification endpoints get their replies.
+- Trusted install paths are checked for ownership, not just their prefix.
+  A tool under `/opt/<app>` owned by a deploy user (or any file or parent
+  directory someone other than root can rewrite) no longer earns a package
+  manager's or admin tool's exemption.
 
 ### Fixed
 
