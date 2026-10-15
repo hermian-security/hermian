@@ -17,6 +17,10 @@ rust-version = "1.91"
 opt-level = 3
 lto = true
 codegen-units = 1
+# On purpose: with unwinding, a panicking collector thread or notifier task
+# dies alone and the daemon runs on half-blind without saying so. Aborting
+# brings systemd's restart and the "unclean shutdown" page, which quotes the
+# panic (heartbeat::install_panic_note). Tests always unwind regardless.
 panic = "abort"
 strip = "symbols"
 debug = 0
