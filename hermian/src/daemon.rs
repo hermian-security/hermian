@@ -101,8 +101,12 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    let cause = unclean_prev
-        .map(|prev| (prev, unclean_cause(panic_note.as_deref(), watchdog_note.as_deref())));
+    let cause = unclean_prev.map(|prev| {
+        (
+            prev,
+            unclean_cause(panic_note.as_deref(), watchdog_note.as_deref()),
+        )
+    });
     let result = rt.block_on(async_main(cfg, engine, cause));
     // Don't hang on a blocking-pool thread (the eBPF converter, a delivery in
     // flight) once main is done.

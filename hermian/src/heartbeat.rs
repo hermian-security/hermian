@@ -89,7 +89,11 @@ pub fn install_panic_note(path: std::path::PathBuf) {
 
 /// One line, so it fits in an alert fact.
 fn panic_note(thread: &str, info: &str) -> String {
-    format!("panic in thread '{}': {}\n", thread, info.replace('\n', " "))
+    format!(
+        "panic in thread '{}': {}\n",
+        thread,
+        info.replace('\n', " ")
+    )
 }
 
 /// Read and delete the watchdog's restart note.

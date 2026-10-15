@@ -558,7 +558,9 @@ mod tests {
         assert!(input.contains(
             "ip saddr 192.0.2.53 meta l4proto { udp, tcp } th sport 53 ct state established accept"
         ));
-        assert!(input.contains("ip saddr 149.154.167.220 tcp sport 443 ct state established accept"));
+        assert!(
+            input.contains("ip saddr 149.154.167.220 tcp sport 443 ct state established accept")
+        );
         assert!(s.contains("ct state related meta l4proto { icmp, ipv6-icmp } accept"));
     }
 

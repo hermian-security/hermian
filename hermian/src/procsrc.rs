@@ -714,7 +714,10 @@ mod tests {
         let unowned = mark_unowned("/opt/app/bin/apt".into(), |_| false);
         assert_eq!(unowned, "(not root-owned) /opt/app/bin/apt");
         assert!(!hermian_core::proctree::is_trusted_exe(&unowned));
-        assert_eq!(mark_unowned("/usr/bin/apt".into(), |_| true), "/usr/bin/apt");
+        assert_eq!(
+            mark_unowned("/usr/bin/apt".into(), |_| true),
+            "/usr/bin/apt"
+        );
         // Untrusted paths stay as they are; nothing to downgrade.
         assert_eq!(mark_unowned("/tmp/apt".into(), |_| false), "/tmp/apt");
     }
