@@ -77,7 +77,17 @@ fn table_exists() -> bool {
     nft(&["list", "table", "inet", TABLE]).is_ok()
 }
 
+/// Serializes changes: two button presses at once each run on their own
+/// blocking thread, and both could see no table and create it, doubling
+/// its rules.
+static NFT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn nft_lock() -> std::sync::MutexGuard<'static, ()> {
+    NFT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Create the table once. Re-declaring it would append its rules again.
+/// Call with [`nft_lock`] held.
 fn ensure_table() -> Result<()> {
     if table_exists() {
         return Ok(());
@@ -168,6 +178,7 @@ pub fn block(ip: IpAddr, hours: u32, cfg: &Config) -> Result<String> {
     if let Some(why) = refusal(ip, cfg) {
         anyhow::bail!("not blocking: {}", why);
     }
+    let _guard = nft_lock();
     ensure_table()?;
     let (set, key) = block_key(ip);
     // Remove first so the timeout starts over; it's fine if it wasn't there.
@@ -192,6 +203,7 @@ pub fn block(ip: IpAddr, hours: u32, cfg: &Config) -> Result<String> {
 
 pub fn unblock(ip: IpAddr) -> Result<String> {
     let (set, key) = block_key(ip);
+    let _guard = nft_lock();
     if !table_exists() {
         anyhow::bail!("nothing is blocked");
     }
@@ -354,6 +366,22 @@ mod tests {
         assert_eq!(block(v6, 1, &c).unwrap(), "2001:db8:9:9::/64");
         // Re-blocking refreshes rather than failing.
         block(v4, 24, &c).unwrap();
+        // Two presses at once (the table is gone first) mustn't both create
+        // it and double its rules; checked below.
+        remove_table();
+        let presses: Vec<_> = ["198.51.100.8", "198.51.100.9"]
+            .iter()
+            .map(|ip| {
+                let c = c.clone();
+                let ip: IpAddr = ip.parse().unwrap();
+                std::thread::spawn(move || block(ip, 24, &c))
+            })
+            .collect();
+        for p in presses {
+            p.join().unwrap().unwrap();
+        }
+        block(v4, 24, &c).unwrap();
+        block(v6, 1, &c).unwrap();
         // Refused addresses never reach nft.
         assert!(block("203.0.113.5".parse().unwrap(), 24, &c).is_err());
         let l = list().unwrap();
@@ -368,6 +396,8 @@ mod tests {
         let rules = nft(&["list", "table", "inet", TABLE]).unwrap();
         assert_eq!(rules.matches("ip saddr @v4 drop").count(), 1, "{}", rules);
         unblock(v4).unwrap();
+        unblock("198.51.100.8".parse().unwrap()).unwrap();
+        unblock("198.51.100.9".parse().unwrap()).unwrap();
         unblock("2001:db8:9:9::abcd".parse().unwrap()).unwrap();
         assert!(list().unwrap().is_empty());
         remove_table();
