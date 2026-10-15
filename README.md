@@ -86,7 +86,7 @@ You'll need Linux, systemd, and kernel 5.4+. eBPF needs 5.8+; older kernels use
 reduced coverage. Builds target amd64 and arm64.
 
 ```bash
-curl -fsSL https://github.com/hermian-security/hermian/releases/download/v0.1.0-beta.5/install.sh | sudo sh
+curl -fsSL https://github.com/hermian-security/hermian/releases/download/v0.1.0-beta.6/install.sh | sudo sh
 ```
 
 The script is served from the release it installs: on Debian/Ubuntu it takes
@@ -112,7 +112,7 @@ upgrading.
 ### Debian / Ubuntu
 
 ```bash
-VER=v0.1.0-beta.5
+VER=v0.1.0-beta.6
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 cd /tmp
 curl -fsSLO "$BASE/SHA256SUMS"
@@ -128,7 +128,7 @@ can read; from your home directory apt still installs, with a warning.
 ### Other systemd distros
 
 ```bash
-VER=v0.1.0-beta.5
+VER=v0.1.0-beta.6
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 cd /tmp
