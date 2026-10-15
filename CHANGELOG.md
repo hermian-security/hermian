@@ -33,14 +33,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - The default config documents every option: what each detection group
   covers, `message_thread_id`, what `management_cidrs` is for, and an
   allowlist example for your own SSH sources.
-- Telegram alerts are short and scannable: a `■■■□ HERMIAN - HIGH` header
-  (filled cells count up with severity), `Host : web-01`, a `- title :` line,
-  the one-sentence summary, and only the evidence the summary doesn't already
-  state, then a divider, why it matters, the numbered steps, a divider and
-  the `hermian show` line. No emoji, and the whole alert is no longer repeated
-  underneath. The CLI keeps the full alert. The brute-force digest lists its
-  sources on one line instead of emitting a raw newline escape in the value,
-  and the disconnect button reads `Disconnect session`.
+- Telegram alerts open with a `■■■□ HERMIAN - HIGH` header (filled cells
+  count up with severity), `Host : web-01`, the bold title, and a sentence
+  or two: what happened and where, then a `hermian show` line. Evidence,
+  process chains, the why and the steps stay in the CLI; they were the same
+  story three times in a chat window. No emoji, and the whole alert is
+  no longer repeated underneath. The brute-force digest lists its sources
+  on one line instead of emitting a raw newline escape in the value, and
+  the disconnect button reads `Disconnect session`.
 - Alert retention: stored alerts and collect bundles older than
   `general.alert_retention_days` (default 90; 0 keeps them) are deleted
   hourly, and `alerts.log` rotates at 50 MB with three old copies kept.
@@ -115,7 +115,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   rsync cron job touching `/tmp` was CRITICAL), and a unit is only flagged
   when the program, not an option like `--socket /tmp/x`, sits in `/tmp`.
   `base64 -d | sh` and a cron job running a `/tmp` binary are flagged.
-- Off-hours windows are in the host's local time, not UTC.
+- Known SSH sources, destinations, and connector programs are recorded for
+  the lifetime of the install. They used to freeze when the baseline window
+  closed, so a source first seen after it (a new ISP address, a jump host)
+  paged `new source` on every login, and programs re-alerted as `first
+  outbound` on every connect. Novelty now means first sighting, so each is
+  reported once.
 - Dedup signatures, auth sources and learned baseline sets are capped, so
   attacker-chosen paths or rotating IPv6 sources can't grow memory without
   bound. Far-past event timestamps are clamped like future ones.
@@ -189,10 +194,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
-- Telegram alerts are down to the headline and a sentence or two: what
-  happened and where, then `hermian show`. Evidence, process chains, the why
-  and the steps were the same story three times in a chat window; they stay
-  in the CLI.
+- Login alerts name the SSH auth method when the log has it: `(key)` or
+  `(password)` after "authenticated" (keyboard-interactive counts as
+  password). Nothing is claimed when the method is unknown.
 - Alert copy says what was seen instead of what it might mean: an SSH login
   from a new source is no longer called "unusual timing", and "assume the
   host is compromised" reads "potentially" where the evidence is a change,

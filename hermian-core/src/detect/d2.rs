@@ -68,9 +68,10 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         &format!("d2|burst-success|{}", rhost),
                     )
                     .what(format!(
-                        "User '{}' authenticated from {} after {} failed attempts within {} \
+                        "User '{}' authenticated{} from {} after {} failed attempts within {} \
                          seconds{}.",
                         ev.user,
+                        ev.method.note(),
                         rhost,
                         recent,
                         ctx.cfg.ssh.failed_burst_window_secs,
@@ -116,7 +117,8 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         &format!("d2|root-login|{}", rhost),
                     )
                     .what(format!(
-                        "root authenticated over SSH from {}{}.",
+                        "root authenticated over SSH{} from {}{}.",
+                        ev.method.note(),
                         rhost,
                         if seen_before {
                             ", a source that has logged in as root before"
@@ -159,16 +161,17 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         &format!("d2|new-source|{}|{}", rhost, ev.user),
                     )
                     .what(format!(
-                        "User '{}' authenticated from {}, a source never seen during the baseline \
-                         period.",
-                        ev.user, rhost
+                        "User '{}' authenticated{} from {}, a source never seen before.",
+                        ev.user,
+                        ev.method.note(),
+                        rhost
                     ))
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
                     .why(
-                        "HERMIAN learned this host's SSH sources during its baseline period. A \
-                         first-time source isn't proof of anything by itself; it's just where a \
-                         surprise login would show up. Confirm it was expected.",
+                        "HERMIAN records every source it sees log in. A first-time source isn't \
+                         proof of anything by itself; it's just where a surprise login would show \
+                         up. Confirm it was expected.",
                     )
                     .actions([
                         "Confirm this login was expected.",

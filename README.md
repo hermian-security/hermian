@@ -241,7 +241,9 @@ Use `--json` with `status`, `alerts`, `show`, or `test` for scripts.
 `collect` gathers local context for an alert; it doesn't upload anything.
 
 The default 24-hour baseline learns SSH sources and network activity for novelty
-checks. Exceptions belong in the config's allowlist, with a `reason` for each one.
+checks; a source or destination is new the first time it's seen, not every time
+it reappears. Exceptions belong in the config's allowlist, with a `reason` for
+each one.
 
 Optional network isolation needs management CIDRs configured first. See
 [response settings and limits](PROJECT.md#response) before using it.

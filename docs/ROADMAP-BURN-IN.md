@@ -186,8 +186,10 @@ sudo hermian notify-test      # must print SENT
 ### 2.4 Baseline
 
 The first 24 h are the learning window (SSH sources, network peers). Novelty
-rules stay quiet until it completes. On a freshly provisioned host with no
-history worth learning, `sudo hermian enable --no-baseline`.
+rules stay quiet until it completes. Learning continues afterwards, so a value
+is flagged the first time it's seen, not on every appearance. On a freshly
+provisioned host with no history worth learning, `sudo hermian enable
+--no-baseline`.
 
 ### 2.5 Upgrade
 

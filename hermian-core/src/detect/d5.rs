@@ -82,8 +82,7 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 &format!("d5|web-new-dest|{}", ev.daddr),
             )
             .what(format!(
-                "{} (under {}) connected to {}, a destination never observed during the \
-                 baseline period.",
+                "{} (under {}) connected to {}, a destination never seen before.",
                 ev.comm, web.comm, dest
             ))
             .chain(ctx.chain_nodes(ev.pid))

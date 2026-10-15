@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use hermian_core::{AuthEvent, AuthResult, Event};
+use hermian_core::{AuthEvent, AuthMethod, AuthResult, Event};
 use tokio::sync::mpsc;
 
 use crate::paths;
@@ -137,6 +137,7 @@ pub fn parse_pam_payload(payload: &str) -> Option<AuthEvent> {
         rhost,
         service,
         tty,
+        method: AuthMethod::Unknown,
         port: None,
     })
 }

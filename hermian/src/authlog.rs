@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use hermian_core::{AuthEvent, AuthResult, Event};
+use hermian_core::{AuthEvent, AuthMethod, AuthResult, Event};
 use tokio::sync::mpsc;
 
 const AUTH_LOG_CANDIDATES: &[&str] = &["/var/log/auth.log", "/var/log/secure"];
@@ -254,6 +254,7 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
     if lower.starts_with("accepted ") {
         // Accepted publickey for alice from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:...
         let user = word_after(msg, " for ")?;
+        let method = AuthMethod::from_ssh_word(msg.split_whitespace().nth(1).unwrap_or(""));
         return Some(AuthEvent {
             ts,
             result: AuthResult::Success,
@@ -261,6 +262,7 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method,
             port: extract_port(msg),
         });
     }
@@ -284,6 +286,7 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
             port: extract_port(msg),
         });
     }
@@ -381,10 +384,18 @@ mod tests {
         assert_eq!(a.user, "alice");
         assert_eq!(a.rhost, Some("10.0.0.5".parse().unwrap()));
         assert_eq!(a.port, Some(51234));
+        assert_eq!(a.method, AuthMethod::PublicKey);
         assert_eq!(
             a.ts.format("%Y-%m-%dT%H:%M").to_string(),
             "2024-01-15T10:20"
         );
+
+        let p = parse_line(
+            "Jan 15 10:20:30 web sshd[1234]: Accepted password for bob from 10.0.0.6 port 2 ssh2",
+        )
+        .unwrap();
+        assert_eq!(p.method, AuthMethod::Password);
+        assert_eq!(p.method.note(), " (password)");
 
         let f = parse_line("Jan 15 10:20:30 web sshd[1234]: Failed password for root from 198.51.100.7 port 4 ssh2").unwrap();
         assert_eq!(f.result, AuthResult::Failure);

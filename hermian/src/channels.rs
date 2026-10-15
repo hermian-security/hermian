@@ -548,17 +548,14 @@ mod tests {
             "SSH login from a new source",
             "x",
         )
-        .what(
-            "User 'deploy' authenticated from 1.2.3.4, a source never seen during the baseline \
-             period.",
-        )
+        .what("User 'deploy' authenticated (key) from 1.2.3.4, a source never seen before.")
         .fact("Source", "1.2.3.4")
         .why("Some explanation that stays in the CLI.")
         .action("Do something about it.");
         let a = Alert::from_finding(f, "HER-2".into(), "web-01".into(), chrono::Utc::now());
         let b = telegram::body(&a);
         assert!(b.contains("<b>SSH login from a new source</b>"), "{}", b);
-        assert!(b.contains("authenticated from 1.2.3.4"), "{}", b);
+        assert!(b.contains("authenticated (key) from 1.2.3.4"), "{}", b);
         assert!(!b.contains("Some explanation"), "{}", b);
         assert!(!b.contains("Do something"), "{}", b);
         assert!(b.chars().count() < 400, "{}", b);

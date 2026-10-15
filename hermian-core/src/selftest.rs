@@ -149,6 +149,7 @@ fn scenario_bruteforce() -> Vec<Alert> {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
             port: None,
         })));
     }
@@ -159,6 +160,7 @@ fn scenario_bruteforce() -> Vec<Alert> {
         rhost: Some(ip),
         service: "sshd".into(),
         tty: "ssh".into(),
+        method: AuthMethod::PublicKey,
         port: None,
     })));
     out

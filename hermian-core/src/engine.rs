@@ -817,6 +817,7 @@ mod tests {
                 rhost: Some(ip),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
                 port: None,
             }));
             infos += alerts
@@ -845,6 +846,7 @@ mod tests {
                 rhost: Some(ip),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
                 port: None,
             }));
             assert!(!has(&a, DetectionId::D2, Severity::High), "{:?}", a);
@@ -856,6 +858,7 @@ mod tests {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
             port: None,
         }));
         assert!(
@@ -882,6 +885,7 @@ mod tests {
             rhost: Some("198.51.100.9".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
             port: None,
         }));
         assert!(
@@ -906,6 +910,7 @@ mod tests {
                 rhost: Some("198.51.100.5".parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
                 port: None,
             }))
         };
@@ -920,6 +925,7 @@ mod tests {
             rhost: Some("198.51.100.5".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
             port: None,
         }));
         assert!(!has(&again, DetectionId::D2, Severity::High), "{:?}", again);
@@ -950,6 +956,7 @@ mod tests {
             rhost: Some("203.0.113.77".parse().unwrap()),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::PublicKey,
             port: None,
         }));
         let d2: Vec<_> = alerts
@@ -959,6 +966,44 @@ mod tests {
         assert_eq!(d2.len(), 1, "{:?}", alerts);
         assert_eq!(d2[0].severity, Severity::High);
         assert!(d2[0].title.contains("new source"), "{:?}", d2[0].title);
+        assert!(d2[0].what.contains("(key)"), "{:?}", d2[0].what);
+    }
+
+    /// A source first seen after the learning window is novel once, then
+    /// known: the second login from it must not page again (it used to,
+    /// because the known-source set froze when the window closed).
+    #[test]
+    fn source_seen_after_window_stops_being_new() {
+        let cfg = Config::default();
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
+        let ip: IpAddr = "203.0.113.120".parse().unwrap();
+        let login = |eng: &mut Engine, t: DateTime<Utc>| {
+            eng.process(Event::Auth(AuthEvent {
+                ts: t,
+                result: AuthResult::Success,
+                user: "deploy".into(),
+                rhost: Some(ip),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+                method: AuthMethod::PublicKey,
+                port: None,
+            }))
+        };
+        let alerts = login(&mut eng, Utc::now());
+        assert!(
+            alerts.iter().any(|a| a.title.contains("new source")),
+            "{:?}",
+            alerts
+        );
+        // Well past the dedup window so only the rule's judgement matters.
+        let alerts = login(&mut eng, Utc::now() + Duration::seconds(600));
+        assert!(
+            !alerts.iter().any(|a| a.title.contains("new source")),
+            "{:?}",
+            alerts
+        );
     }
 
     #[test]
@@ -976,6 +1021,7 @@ mod tests {
                 rhost: Some("203.0.113.9".parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
                 port: None,
             }),
         );
@@ -1551,19 +1597,23 @@ mod tests {
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
         eng.process(exec(t, 300, 1, 1000, "implant", "/home/eve/.cache/implant"));
-        let dns = |daddr: &str| {
+        let dns = |pid: u32, comm: &str, daddr: &str| {
             Event::Connect(ConnectEvent {
                 ts: t,
-                pid: 300,
+                pid,
                 uid: 1000,
                 daddr: daddr.parse().unwrap(),
                 dport: 53,
-                comm: "implant".into(),
+                comm: comm.into(),
                 container: false,
             })
         };
-        assert!(eng.process(dns("1.1.1.1")).is_empty());
-        let fresh = eng.process(dns("203.0.113.99"));
+        // Learned destination: ignored, and the connector is learned with it.
+        assert!(eng.process(dns(300, "implant", "1.1.1.1")).is_empty());
+        // A never-seen program on port 53 to a never-seen destination is
+        // still judged.
+        eng.process(exec(t, 301, 1, 1000, "curl", "/usr/bin/curl"));
+        let fresh = eng.process(dns(301, "curl", "203.0.113.99"));
         assert!(
             fresh
                 .iter()
@@ -1571,6 +1621,10 @@ mod tests {
             "{:?}",
             fresh
         );
+        // Seen once, known afterwards: the next connect from it is not
+        // "first" again (the set used to freeze, re-alerting every time).
+        let again = eng.process(dns(301, "curl", "203.0.113.100"));
+        assert!(again.is_empty(), "{:?}", again);
     }
 
     #[test]
@@ -1903,6 +1957,7 @@ mod tests {
             rhost: Some(ip),
             service: "sshd".into(),
             tty: "ssh".into(),
+            method: AuthMethod::Unknown,
             port: None,
         }));
         assert_eq!(eng.tree.len(), 1);

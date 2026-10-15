@@ -232,6 +232,7 @@ mod tests {
                 rhost: Some(ip.parse().unwrap()),
                 service: "sshd".into(),
                 tty: "ssh".into(),
+                method: AuthMethod::Unknown,
                 port: Some(50_000),
             })
         }

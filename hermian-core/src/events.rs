@@ -227,6 +227,41 @@ impl AuthResult {
     }
 }
 
+/// How a login authenticated, when the source log says. Failures and paths
+/// that don't carry it (PAM socket) are `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    Password,
+    PublicKey,
+    /// Keyboard-interactive is usually a password challenge under another
+    /// name; alerts say "(password)".
+    KeyboardInteractive,
+    Unknown,
+}
+
+impl AuthMethod {
+    /// Map the word sshd logs after "Accepted " ("publickey", "password",
+    /// "keyboard-interactive/pam", ...) to a method.
+    pub fn from_ssh_word(word: &str) -> AuthMethod {
+        match word {
+            "publickey" => AuthMethod::PublicKey,
+            "password" => AuthMethod::Password,
+            "keyboard-interactive/pam" | "keyboard-interactive" => AuthMethod::KeyboardInteractive,
+            _ => AuthMethod::Unknown,
+        }
+    }
+
+    /// One-word note for alert text: " (key)", " (password)", or empty when
+    /// unknown. Deliberately terse; the CLI explains details if needed.
+    pub fn note(&self) -> &'static str {
+        match self {
+            AuthMethod::PublicKey => " (key)",
+            AuthMethod::Password | AuthMethod::KeyboardInteractive => " (password)",
+            AuthMethod::Unknown => "",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthEvent {
     pub ts: DateTime<Utc>,
@@ -235,6 +270,8 @@ pub struct AuthEvent {
     pub rhost: Option<IpAddr>,
     pub service: String,
     pub tty: String,
+    /// How the login authenticated ("(key)" / "(password)" in alerts).
+    pub method: AuthMethod,
     /// The client's source port, when the log line has it. Together with
     /// `rhost` it identifies the session, so a response can disconnect that
     /// login and not every session of the same user.
