@@ -225,11 +225,15 @@ doesn't isolate, so a local user can't trigger it by naming a program
 `nginx`. Genuine means the binary in a root-owned location is named like the
 service, or a trusted interpreter (gunicorn, puma, tomcat) runs it under a
 system account (uid < 1000).
-The rules keep loopback, established flows, management CIDRs, DHCP, IPv6
-neighbour discovery, DNS to the resolvers in resolv.conf, cloud instance
-metadata (169.254.169.254, which some providers need for SSH logins), and TCP
-to the notification endpoints resolved at isolation time. Routed traffic
-(containers, VMs) is dropped too. It isn't a complete network cutoff.
+The rules keep loopback, management CIDRs, DHCP, IPv6 neighbour discovery,
+DNS to the resolvers in resolv.conf, cloud instance metadata
+(169.254.169.254, which some providers need for SSH logins), and TCP to the
+notification endpoints resolved at isolation time. Connections already open
+to anywhere else are cut, so a reverse shell started before the alert
+doesn't survive it; an SSH session from outside the management CIDRs drops
+too. Routed traffic (containers, VMs) is dropped as well. It isn't a
+complete network cutoff: Telegram, webhook and SMTP endpoints stay reachable
+so alerts still go out, and code on the host could use them too.
 Catch-all CIDRs (`0.0.0.0/0`, `::/0`) are rejected since they'd make
 isolation a no-op.
 

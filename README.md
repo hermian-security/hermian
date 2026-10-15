@@ -71,7 +71,9 @@ hermian show HER-2026-1006-415
   heartbeat, pages when it goes stale, and restarts it; a killed daemon is
   reported on its next start. It isn't an out-of-band monitor.
 - **Isolation isn't a cutoff.** `hermian isolate` installs an nftables ruleset
-  with documented exceptions, and auto-isolation reverts on a timer.
+  with documented exceptions, and auto-isolation reverts on a timer. Open
+  connections outside your management CIDRs are cut, but alert endpoints
+  (Telegram, webhook, SMTP) stay reachable, for anything on the host.
 - **Root owns the box.** Local hashes detect changes; they don't stop someone
   who already has root.
 

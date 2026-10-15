@@ -115,6 +115,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   minutes (was two, beaten by a `sleep 130`).
 - A setuid file under `/opt` (vendor helpers like chrome-sandbox) is HIGH,
   not CRITICAL. The default config shows how to allowlist PHP `mail()`.
+- Isolation cuts connections that were already open. A blanket
+  `ct state established` rule kept every flow from before the alert alive,
+  a reverse shell included. Now only management CIDRs keep their sessions,
+  and DNS, metadata and notification endpoints get their replies.
 
 ### Fixed
 
@@ -244,6 +248,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - Stored alerts older than 90 days are deleted within an hour of upgrading.
   To keep them, set `general.alert_retention_days = 0` (or back up
   `/var/lib/hermian/alerts/`) first.
+- Isolation now drops SSH sessions that don't come from
+  `response.management_cidrs`. If you rely on auto-isolation, make sure the
+  address you manage the host from is in that list.
 
 ## 0.1.0-beta.5 - 2026-09-23
 
