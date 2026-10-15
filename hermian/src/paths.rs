@@ -5,6 +5,8 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/hermian";
 pub const DEFAULT_LOG_DIR: &str = "/var/log/hermian";
 pub const DEFAULT_RUN_DIR: &str = "/run/hermian";
 pub const UNIT_PATH: &str = "/etc/systemd/system/hermian.service";
+pub const WATCHDOG_UNIT_PATH: &str = "/etc/systemd/system/hermian-watchdog.service";
+pub const WATCHDOG_TIMER_PATH: &str = "/etc/systemd/system/hermian-watchdog.timer";
 pub const PAM_MODULE_PATH: &str = "/usr/lib/security/pam_hermian.so";
 
 fn env_path(var: &str, default: &str) -> PathBuf {
@@ -56,6 +58,36 @@ pub fn binary_hash_file() -> PathBuf {
 
 pub fn config_hash_file() -> PathBuf {
     state_dir().join("config.sha256")
+}
+
+/// The daemon's heartbeat (run dir: it dies with the boot, by design).
+pub fn heartbeat_file() -> PathBuf {
+    run_dir().join("heartbeat")
+}
+
+/// Marker recording the current run; a leftover means the last stop was dirty.
+pub fn run_marker_file() -> PathBuf {
+    state_dir().join("running")
+}
+
+/// Note the watchdog leaves before restarting a wedged daemon.
+pub fn watchdog_note_file() -> PathBuf {
+    state_dir().join("watchdog-note")
+}
+
+/// Rate-limit state for the watchdog's alerts.
+pub fn watchdog_state_file() -> PathBuf {
+    state_dir().join("watchdog.json")
+}
+
+/// Alerts a channel still owes the last time it queued them, one directory
+/// per channel.
+pub fn pending_dir() -> PathBuf {
+    state_dir().join("pending")
+}
+
+pub fn pending_dir_channel(name: &str) -> PathBuf {
+    pending_dir().join(name)
 }
 
 pub fn alerts_log() -> PathBuf {

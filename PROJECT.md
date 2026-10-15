@@ -137,13 +137,16 @@ Default local outputs are journald and `/var/log/hermian/alerts.log`. Optional
 channels are Telegram, SMTP/sendmail, webhooks, and stdout, gated by `min_severity`.
 Use `hermian notify-test` to check them.
 
-Delivery retries use backoff and track which channels still need an alert. The
-pending queue holds up to 500 alerts in memory; it isn't a durable outbox.
-`status` shows pending deliveries and errors. A prolonged failure is logged locally.
+Delivery retries use backoff and track which channels still need an alert.
+Pending alerts are written to per-channel queues on disk (500 each) and
+reloaded after a restart, so delivery is at-least-once: a crash mid-send can
+duplicate an alert, never lose one. `status` shows pending deliveries and
+errors. A prolonged failure is logged locally.
 
 ## Host changes
 
-`hermian enable` creates the systemd unit and root-only config/state/log dirs,
+`hermian enable` creates the systemd units (the daemon and the watchdog
+timer) and root-only config/state/log dirs,
 records binary/config hashes, initializes the baseline, and starts the daemon.
 It also raises low inotify limits. Re-run it after a source or tarball upgrade;
 the Debian package handles this itself.
@@ -162,9 +165,12 @@ controls root. Nothing auto-updates.
 
 A clean stop (`systemctl stop`, SIGTERM) pages HIGH before exiting, so package
 upgrades send one too. The unit restarts the daemon after any other exit and
-never gives up. A SIGKILL can't be reported, and there's no independent
-tamper monitor or heartbeat. Dropped telemetry (full eBPF rings, inotify
-overflows, audit ENOBUFS) pages HIGH and shows in `status`.
+never gives up. Crashes are covered by the dead-man switch: the daemon writes
+a heartbeat every tick, `hermian-watchdog.timer` checks it every minute, pages
+HIGH and restarts a wedged daemon, and the next start pages HIGH about the
+unclean shutdown. It's a systemd timer on the same host, not an out-of-band
+monitor. Dropped telemetry (full eBPF rings, inotify overflows, audit ENOBUFS)
+pages HIGH and shows in `status`.
 
 PAM integration is opt-in via `hermian enable --with-pam`. The module sends auth
 metadata, doesn't read passwords, and returns `PAM_IGNORE`.

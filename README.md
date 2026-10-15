@@ -65,10 +65,11 @@ hermian show HER-2026-1006-415
 - **It sees what it hooks.** Detection runs on kernel and log sources;
   activity outside them is invisible, and separate rules can report one
   incident.
-- **Delivery isn't durable.** Pending alerts sit in memory (500 max) and
-  don't survive a crash. Good enough for the default channels, not an outbox.
-- **No heartbeat.** It flags changes to itself and its config, but if the
-  daemon is SIGKILLed, nothing else is watching.
+- **Delivery is at-least-once.** Pending alerts are queued per channel on
+  disk (500 each) and survive a restart; a crash mid-send can duplicate one.
+- **The dead-man switch is local.** A systemd timer checks the daemon's
+  heartbeat, pages when it goes stale, and restarts it; a killed daemon is
+  reported on its next start. It isn't an out-of-band monitor.
 - **Isolation isn't a cutoff.** `hermian isolate` installs an nftables ruleset
   with documented exceptions, and auto-isolation reverts on a timer.
 - **Root owns the box.** Local hashes detect changes; they don't stop someone

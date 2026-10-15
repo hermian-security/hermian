@@ -32,6 +32,9 @@ pub struct StatusState {
     pub watches_active: usize,
     pub watches_failed: usize,
     pub watch_error: String,
+    /// Age of the dead-man switch's heartbeat file, if it exists.
+    #[serde(default)]
+    pub heartbeat_age_secs: Option<u64>,
     pub channels: Vec<String>,
     pub min_severity: String,
     pub last_delivery: Option<DateTime<Utc>>,
@@ -76,6 +79,7 @@ impl Default for StatusState {
             watches_active: 0,
             watches_failed: 0,
             watch_error: String::new(),
+            heartbeat_age_secs: None,
             channels: Vec::new(),
             min_severity: String::new(),
             last_delivery: None,
@@ -178,6 +182,13 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
         None => st.dim(&state.baseline_state),
     };
     out.push_str(&st.row("Baseline", &baseline));
+    out.push('\n');
+    let heartbeat = match state.heartbeat_age_secs {
+        Some(s) if s <= crate::heartbeat::STALE.as_secs() => st.dim(&format!("{}s ago", s)),
+        Some(s) => st.warn(&format!("{}m {:02}s stale", s / 60, s % 60)),
+        None => st.dim("n/a"),
+    };
+    out.push_str(&st.row("Heartbeat", &heartbeat));
     out.push_str("\n\n");
 
     out.push_str(&st.heading("Today"));
@@ -342,8 +353,9 @@ pub fn state_unreadable() -> bool {
     )
 }
 
-/// `systemctl is-active hermian`, which needs no privileges.
-fn unit_state() -> String {
+/// `systemctl is-active hermian`, which needs no privileges. Also used by
+/// the watchdog to judge the unit state.
+pub(crate) fn unit_state() -> String {
     std::process::Command::new("systemctl")
         .args(["is-active", "hermian"])
         .output()

@@ -48,6 +48,9 @@ pub enum Cmd {
     /// Run the daemon (used by the systemd unit)
     #[command(hide = true)]
     Run,
+    /// Dead-man switch (used by the hermian-watchdog systemd timer)
+    #[command(hide = true)]
+    Watchdog,
 }
 
 #[derive(clap::Args)]

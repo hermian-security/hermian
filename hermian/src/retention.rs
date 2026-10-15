@@ -75,6 +75,9 @@ pub fn run(retention_days: u32) {
         let age = Duration::from_secs(u64::from(retention_days) * 86_400);
         removed += prune_older_than(&crate::paths::alerts_dir(), age, now);
         removed += prune_older_than(&crate::paths::collections_dir(), age, now);
+        // Undelivered queue copies: a channel that has been broken for the
+        // whole retention window shouldn't grow the disk without bound.
+        removed += prune_older_than(&crate::paths::pending_dir(), age, now);
     }
     let rotated = rotate_if_large(&crate::paths::alerts_log(), MAX_LOG_BYTES, KEEP_ROTATED);
     if removed > 0 || rotated {

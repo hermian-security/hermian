@@ -14,6 +14,10 @@ use crate::ui::Style;
 use crate::{config, paths, procsrc, selfprotect, status};
 
 const UNIT_TEMPLATE: &str = include_str!("../../packaging/systemd/hermian.service");
+const WATCHDOG_UNIT_TEMPLATE: &str =
+    include_str!("../../packaging/systemd/hermian-watchdog.service");
+const WATCHDOG_TIMER_TEMPLATE: &str =
+    include_str!("../../packaging/systemd/hermian-watchdog.timer");
 const SYSCTL_TEMPLATE: &str = include_str!("../../packaging/sysctl/60-hermian.conf");
 const SYSCTL_PATH: &str = "/etc/sysctl.d/60-hermian.conf";
 
@@ -64,6 +68,16 @@ fn render_unit(exec_path: &str, isolation_enabled: bool, actions_enabled: bool) 
         .replace("%EXEC%", exec_path)
         .replace("%CAP_BOUNDING%", &format!("CapabilityBoundingSet={}", caps))
         .replace("%CAP_AMBIENT%", &format!("AmbientCapabilities={}", caps))
+}
+
+/// The watchdog runs as a plain root oneshot via a timer: it pages and
+/// restarts the daemon when the heartbeat goes stale, so it must not share
+/// the daemon's fate (crash, capabilities, memory limits).
+fn render_watchdog_units(exec_path: &str) -> (String, String) {
+    (
+        WATCHDOG_UNIT_TEMPLATE.replace("%EXEC%", exec_path),
+        WATCHDOG_TIMER_TEMPLATE.to_string(),
+    )
 }
 
 pub fn run(args: &EnableArgs) -> Result<()> {
@@ -119,6 +133,20 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         fs::set_permissions(paths::UNIT_PATH, fs::Permissions::from_mode(0o644))?;
     }
 
+    let (watchdog_unit, watchdog_timer) = render_watchdog_units(&exe_s);
+    for (path, content) in [
+        (paths::WATCHDOG_UNIT_PATH, &watchdog_unit),
+        (paths::WATCHDOG_TIMER_PATH, &watchdog_timer),
+    ] {
+        if fs::read_to_string(path)
+            .map(|c| c != *content)
+            .unwrap_or(true)
+        {
+            fs::write(path, content)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+        }
+    }
+
     // An existing hook is refreshed too, so upgrades (the package's postinst
     // runs `enable` without --with-pam) pick up placement fixes.
     if args.with_pam
@@ -137,6 +165,12 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         run_systemctl(&["restart", "hermian"])?;
     } else if run_systemctl(&["enable", "--now", "hermian"]).is_err() {
         run_systemctl(&["start", "hermian"])?;
+    }
+    // The dead-man switch: a timer, not part of the daemon, so it still runs
+    // when the daemon can't. Failure to enable it shouldn't abort an
+    // otherwise finished install.
+    if let Err(e) = run_systemctl(&["enable", "--now", "hermian-watchdog.timer"]) {
+        eprintln!("hermian: could not enable the watchdog timer: {:#}", e);
     }
 
     wait_for_startup()?;
@@ -317,6 +351,15 @@ mod tests {
         let actions = render_unit("/usr/bin/hermian", false, true);
         assert!(actions.contains("CAP_NET_ADMIN") && actions.contains("CAP_KILL"));
         assert!(actions.contains("ExecStart=/usr/bin/hermian run"));
+    }
+
+    #[test]
+    fn watchdog_units_watch_this_binary() {
+        let (unit, timer) = render_watchdog_units("/usr/bin/hermian");
+        assert!(unit.contains("ExecStart=/usr/bin/hermian watchdog"));
+        assert!(unit.contains("Type=oneshot"));
+        assert!(timer.contains("Unit=hermian-watchdog.service"));
+        assert!(timer.contains("OnUnitActiveSec=60s"));
     }
 
     #[test]

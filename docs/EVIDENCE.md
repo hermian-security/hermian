@@ -12,8 +12,8 @@ completed a full field pass, not a fleet.
 
 | Suite | What it covers | Last result |
 |---|---|---|
-| `cargo test -p hermian-core --locked` | Detection engine, synthetic events | 157 passing, 2026-10-15 |
-| `cargo test -p hermian --locked` | Daemon logic (Linux only) | 96 passing, 2026-10-15 |
+| `cargo test -p hermian-core --locked` | Detection engine, synthetic events | 158 passing, 2026-10-15 |
+| `cargo test -p hermian --locked` | Daemon logic (Linux only) | 104 passing, 7 ignored, 2026-10-15 |
 | PAM module tests | The PAM hook shim | 2 passing, 2026-10-15 |
 | `tests/helpers` | Suite plumbing (alert waits, disposable-host guard) | 20 passing, 3 skipped, 2026-10-15 |
 
@@ -66,10 +66,11 @@ Older drafts disagree; this is the current reading:
 
 - Any distro but Ubuntu 22.04: RHEL family with SELinux, the kernel 5.4
   fallback path, and arm64 are untested.
-- Automatic isolation and Telegram action buttons under real incidents
-  (unit tests only so far).
-- Durable delivery: pending alerts queue in memory, 500 max
-  (PROJECT.md, "Alerts and delivery").
-- A heartbeat or independent tamper monitor (PROJECT.md lists this as a gap).
+- Automatic isolation under a real incident (unit tests only). Telegram
+  buttons have been pressed live on the production VPS, but not during an
+  actual attack.
+- The dead-man switch and durable alert queues are new (2026-10-15) and
+  haven't been exercised against a live failure yet.
+- A heartbeat or independent tamper monitor beyond the local watchdog.
 - Release verification reproduced on a clean machine: `sha256sum -c`,
   `gh attestation verify`, `cosign verify-blob`.

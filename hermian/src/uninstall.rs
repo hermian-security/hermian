@@ -26,10 +26,13 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     }
 
     // Stop the daemon first: lifting isolation while it still runs left a
-    // window for it to isolate the host again.
-    let _ = std::process::Command::new("systemctl")
-        .args(["disable", "--now", "hermian"])
-        .output();
+    // window for it to isolate the host again. The watchdog timer goes too,
+    // or it would point at a binary that is about to disappear.
+    for unit in ["hermian-watchdog.timer", "hermian"] {
+        let _ = std::process::Command::new("systemctl")
+            .args(["disable", "--now", unit])
+            .output();
+    }
     // Never leave a host isolated by a tool that is about to disappear, and
     // drop the blocks made with the Telegram buttons too.
     let _ = isolate::remove_isolation();
@@ -37,6 +40,8 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
 
     for path in [
         paths::UNIT_PATH.to_string(),
+        paths::WATCHDOG_UNIT_PATH.to_string(),
+        paths::WATCHDOG_TIMER_PATH.to_string(),
         "/etc/sysctl.d/60-hermian.conf".to_string(),
         paths::config_path().to_string_lossy().into_owned(),
         crate::enable::backup_path(&paths::config_path())

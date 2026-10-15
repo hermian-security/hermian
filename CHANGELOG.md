@@ -44,6 +44,15 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - Alert retention: stored alerts and collect bundles older than
   `general.alert_retention_days` (default 90; 0 keeps them) are deleted
   hourly, and `alerts.log` rotates at 50 MB with three old copies kept.
+- The dead-man switch: the daemon writes a heartbeat to its run directory
+  every 30 s, and a new `hermian-watchdog` systemd timer (installed by
+  `hermian enable`, checked every minute) pages HIGH and restarts the
+  daemon when the heartbeat goes stale. A crash or SIGKILL is reported on
+  the next start. `status` shows the heartbeat age.
+- Durable alert queues: alerts waiting for a notifying channel are written
+  to `state/pending/<channel>/` and reloaded after a restart, so delivery
+  is at-least-once (a crash mid-send can duplicate an alert, never lose
+  one). Retention prunes them with the rest of the store.
 
 ### Security
 

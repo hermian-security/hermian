@@ -14,8 +14,9 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, isolate, notify,
-    pamsock, paths, procsrc, retention, selfprotect, sessions, status, tgbot, watchers,
+    auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
+    isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, status, tgbot,
+    watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -73,6 +74,12 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(paths::state_dir())?;
     fs::create_dir_all(paths::run_dir())?;
 
+    // The dead-man switch watches the heartbeat; the marker tells the next
+    // start whether this run stopped cleanly, and the watchdog leaves a note
+    // when it had to restart the previous one.
+    let unclean_prev = heartbeat::start(&paths::run_marker_file());
+    let watchdog_note = heartbeat::take_restart_note(&paths::watchdog_note_file());
+
     let mut engine = Engine::new(cfg.clone(), allowlist, baseline, host);
     engine.set_local_offset(local_offset());
     if let Some(st) = load_engine_state() {
@@ -99,7 +106,7 @@ pub fn run() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    let result = rt.block_on(async_main(cfg, engine));
+    let result = rt.block_on(async_main(cfg, engine, unclean_prev, watchdog_note));
     // Don't hang on a blocking-pool thread (the eBPF converter, a delivery in
     // flight) once main is done.
     rt.shutdown_timeout(Duration::from_secs(2));
@@ -114,7 +121,12 @@ struct Sources {
     watch_health: Option<watchers::SharedWatchHealth>,
 }
 
-async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
+async fn async_main(
+    initial_cfg: Config,
+    mut engine: Engine,
+    unclean_prev: Option<String>,
+    watchdog_note: Option<String>,
+) -> Result<()> {
     let initial_notify = status::read_state()
         .map(|s| notify::NotifyState {
             last_delivery: s.last_delivery,
@@ -196,6 +208,43 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                     ("Config hash", &integrity.config_hash),
                 ],
                 "selfprotect|record-missing",
+            ),
+        );
+    }
+
+    // --- Unclean restart ------------------------------------------------
+    if let Some(prev) = unclean_prev {
+        let (cause, cause_label) = match &watchdog_note {
+            Some(note) => (
+                format!(
+                    "The watchdog restarted it after it stopped responding ({})",
+                    note
+                ),
+                "Watchdog restart",
+            ),
+            None => (
+                "The process died without cleanup (crash, SIGKILL, or power loss).".to_string(),
+                "Unexpected stop",
+            ),
+        };
+        emit_self(
+            &notifier,
+            self_alert(
+                &mut engine,
+                Severity::High,
+                "HERMIAN restarted after an unclean shutdown",
+                &format!(
+                    "The previous run ({}) did not stop through systemd. {}. Activity between its last heartbeat and this start was not monitored.",
+                    prev.trim(),
+                    cause
+                ),
+                "A clean stop sends a 'HERMIAN is stopping' notice; a crash or kill cannot. Killing the security daemon is a cheap way to get an unmonitored window, so leftovers are reported rather than silently overwritten.",
+                &[
+                    "Check what happened right before: journalctl -u hermian -n 100.",
+                    "If this wasn't the watchdog reacting to a hang, treat it as suspicious.",
+                ],
+                &[("Previous run", prev.trim()), (cause_label, &cause)],
+                "selfprotect|unclean",
             ),
         );
     }
@@ -311,7 +360,7 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigusr2 = signal(SignalKind::user_defined2())?;
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    let mut ticker = tokio::time::interval(heartbeat::INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut cpu_ring: VecDeque<f64> = VecDeque::new();
@@ -355,6 +404,9 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
         &cpu_ring,
         started_at,
     );
+    // Start the heartbeat before the first tick so the watchdog doesn't see
+    // a "never written" daemon during a slow startup.
+    let _ = heartbeat::touch(&paths::heartbeat_file());
     log_daemon(
         Severity::Info,
         &format!("HERMIAN {} started", hermian_core::VERSION),
@@ -410,6 +462,9 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
                 handle_action(&mut engine, &notifier, &current_cfg, req);
             }
             _ = ticker.tick() => {
+                // The dead-man switch reads this; it must be the first thing
+                // a slow tick refreshes.
+                let _ = heartbeat::touch(&paths::heartbeat_file());
                 let now = Utc::now();
                 engine.set_local_offset(local_offset());
                 engine.reap_exited(&procsrc::live_pids(), now);
@@ -477,6 +532,10 @@ async fn async_main(initial_cfg: Config, mut engine: Engine) -> Result<()> {
     }
 
     shutdown.store(true, Ordering::Relaxed);
+    // Reaching here means a handled signal (SIGTERM/SIGINT) or a closed event
+    // channel: a clean stop. Crashes and SIGKILLs skip this, and the next
+    // start reports the leftover marker.
+    heartbeat::clean_stop(&paths::run_marker_file());
     let _ = config::save_baseline(&engine.baseline);
     save_engine_state(&engine);
     // Give the notifier a moment to flush persisted alerts.
@@ -1148,6 +1207,8 @@ fn write_status_snapshot(
         watches_active: wh.active,
         watches_failed: wh.failed,
         watch_error: wh.last_error.clone(),
+        heartbeat_age_secs: heartbeat::age(&paths::heartbeat_file(), std::time::SystemTime::now())
+            .map(|d| d.as_secs()),
         channels: cfg.notifications.channels.clone(),
         min_severity: cfg.notifications.min_severity.clone(),
         last_delivery: ns.last_delivery,
