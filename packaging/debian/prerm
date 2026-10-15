@@ -3,11 +3,16 @@ set -e
 
 case "$1" in
     remove|deconfigure)
+        # The watchdog timer first: left running, it would start the daemon
+        # again, and after removal it would run a binary that's gone.
+        systemctl disable --now hermian-watchdog.timer >/dev/null 2>&1 || true
         systemctl disable --now hermian.service >/dev/null 2>&1 || true
         # Never leave a host isolated by a tool that's about to disappear
-        # (hermian uninstall does the same). Upgrades keep isolation as is.
+        # (hermian uninstall does the same), and drop the Telegram blocks too.
+        # Upgrades keep both as they are.
         if command -v nft >/dev/null 2>&1; then
             nft delete table inet hermian >/dev/null 2>&1 || true
+            nft delete table inet hermian_block >/dev/null 2>&1 || true
         fi
     ;;
 esac
