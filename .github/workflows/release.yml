@@ -178,9 +178,12 @@ jobs:
           VERSION=${GITHUB_REF_NAME#v}
           DIR=hermian-${VERSION}-linux-${{ matrix.arch }}
           mkdir -p dist/$DIR
+          # The installer ships as a release asset and inside the tarball,
+          # with the release tag as its default version.
+          sed "s/^DEFAULT_VERSION=.*/DEFAULT_VERSION=$GITHUB_REF_NAME/" packaging/install.sh > dist/install.sh
           cp target/${{ matrix.target }}/release/hermian dist/$DIR/
           cp target/${{ matrix.target }}/release/libpam_hermian.so dist/$DIR/
-          cp packaging/install.sh LICENSE README.md dist/$DIR/
+          cp dist/install.sh LICENSE README.md dist/$DIR/
           tar -C dist -czf dist/$DIR.tar.gz $DIR
           rm -rf dist/$DIR
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -210,7 +213,7 @@ jobs:
         working-directory: dist
         run: |
           sha256sum * > SHA256SUMS
-          for f in *.tar.gz *.deb SHA256SUMS; do
+          for f in install.sh *.tar.gz *.deb SHA256SUMS; do
             cosign sign-blob --yes "$f" --bundle "$f.sigstore"
           done
           ls -la
@@ -240,9 +243,15 @@ jobs:
             echo
             echo "## Install"
             echo
-            echo "Follow the [install steps for this release](https://github.com/$REPO/blob/$TAG/README.md#install)"
-            echo "with \`VER=$TAG\`. They cover Debian/Ubuntu, other systemd distros,"
-            echo "checking where the files came from (\`gh\` or \`cosign\`), and upgrading."
+            echo '```'
+            echo "curl -fsSL https://github.com/$REPO/releases/download/$TAG/install.sh | sudo sh"
+            echo '```'
+            echo
+            echo "The installer ships with this tag: it picks the .deb or the tarball,"
+            echo "checks \`SHA256SUMS\` (and verifies it with \`cosign\` or \`gh\` when installed),"
+            echo "and takes \`--dry-run\` and \`--version\`. Prefer to inspect first?"
+            echo "Download \`install.sh\` from these assets, read it, then run it."
+            echo "Manual steps and what setup changes: [README](https://github.com/$REPO/blob/$TAG/README.md#install)."
           } >> notes.md
           cat notes.md
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2

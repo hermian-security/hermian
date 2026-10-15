@@ -83,9 +83,28 @@ gaps are in [the burn-in matrix](docs/ROADMAP-BURN-IN.md).
 You'll need Linux, systemd, and kernel 5.4+. eBPF needs 5.8+; older kernels use
 reduced coverage. Builds target amd64 and arm64.
 
+```bash
+curl -fsSL https://github.com/hermian-security/hermian/releases/download/v0.1.0-beta.5/install.sh | sudo sh
+```
+
+The script is served from the release it installs: on Debian/Ubuntu it takes
+the `.deb` (apt starts the daemon), elsewhere the tarball. It always checks
+`SHA256SUMS`, and verifies the release's provenance with `cosign` or the
+GitHub CLI when either is installed; without them it says so and continues
+with the checksum alone. `--dry-run` downloads and verifies, then prints what
+would change; `--version vX.Y.Z` picks another release. The same tag works
+for installing and upgrading.
+
+Prefer to inspect first? Download `install.sh` from the
+[release](https://github.com/hermian-security/hermian/releases) assets, read
+it, then run it.
+
+<details>
+<summary>Verify manually</summary>
+
 Pin a release tag (the newest is on the
 [releases page](https://github.com/hermian-security/hermian/releases)); don't
-script against `latest`. The commands below work the same for installing and
+script against `latest`. These commands work the same for installing and
 upgrading.
 
 ### Debian / Ubuntu
@@ -146,6 +165,8 @@ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore \
 Run it before `sha256sum -c`: a verified `SHA256SUMS` then vouches for every
 file it lists.
 
+</details>
+
 ### What setup does
 
 HERMIAN runs as root. Setup creates its config, state, logs, and systemd unit,
@@ -156,8 +177,9 @@ errors. Details are in [project notes](PROJECT.md#host-changes).
 ### Upgrade
 
 Nothing updates itself yet (a signed APT repository is planned). Watch the
-repository's releases, then rerun the install commands with the new `VER`.
-Read that release's notes first; they list any one-time steps.
+repository's releases, then rerun the installer for the new tag (`--version
+vX.Y.Z`, or `VER=vX.Y.Z` in the manual steps). Read that release's notes
+first; they list any one-time steps.
 
 ### Uninstall
 

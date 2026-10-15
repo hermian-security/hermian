@@ -53,6 +53,15 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   to `state/pending/<channel>/` and reloaded after a restart, so delivery
   is at-least-once (a crash mid-send can duplicate an alert, never lose
   one). Retention prunes them with the rest of the store.
+- Releases ship an `install.sh` next to the binaries, and the README leads
+  with one command: `curl -fsSL .../releases/download/vX.Y.Z/install.sh |
+  sudo sh`. It's served from the same tag it installs, picks the `.deb` on
+  Debian/Ubuntu or the tarball elsewhere, always checks `SHA256SUMS`, and
+  verifies it with `cosign` or `gh` when installed (checksum-only, with a
+  warning, otherwise). It takes `--version` and `--dry-run`, and the whole
+  script runs from one function so a truncated download can't half-run.
+  Manual steps and the strict verification flow moved into the README's
+  "Verify manually" details.
 
 ### Security
 
