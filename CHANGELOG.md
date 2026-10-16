@@ -6,6 +6,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.9 - 2026-10-16
+
+An installer fix for hosts moving from the tarball to the `.deb`.
+
 ### Fixed
 
 - Moving from the tarball to the `.deb` with `install.sh` left the old
