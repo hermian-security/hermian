@@ -1,10 +1,8 @@
+<!-- The #gh-*-mode-only fragments follow GitHub's theme setting; <picture>
+     follows the OS, which showed the white logo on GitHub's light theme. -->
 <p>
-  <a href="https://hermian.me">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.svg">
-      <img src="docs/brand/lockup-light.svg" alt="Hermian" height="56">
-    </picture>
-  </a>
+  <a href="https://hermian.me#gh-light-mode-only"><img src="docs/brand/lockup-light.svg#gh-light-mode-only" alt="Hermian" height="56"></a>
+  <a href="https://hermian.me#gh-dark-mode-only"><img src="docs/brand/lockup-dark.svg#gh-dark-mode-only" alt="Hermian" height="56"></a>
 </p>
 
 **Silent by default. Loud when it matters.**
@@ -307,11 +305,7 @@ after removing secrets and private details.
 
 ---
 
-<a href="https://hermian.me">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/company-lockup-dark.svg">
-    <img src="docs/brand/company-lockup-light.svg" alt="Hermian Security" height="24">
-  </picture>
-</a>
+<a href="https://hermian.me#gh-light-mode-only"><img src="docs/brand/company-lockup-light.svg#gh-light-mode-only" alt="Hermian Security" height="24"></a>
+<a href="https://hermian.me#gh-dark-mode-only"><img src="docs/brand/company-lockup-dark.svg#gh-dark-mode-only" alt="Hermian Security" height="24"></a>
 
 Hermian is made by Hermian Security and licensed under [Apache-2.0](LICENSE).
