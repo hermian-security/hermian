@@ -1,93 +1,151 @@
-# Evidence
+Hermian evidence
+================
 
-What Hermian has actually been verified to do, where, and when. This is the
-source of truth for numbers in the README, release notes, and PROJECT.md. If a
-number isn't here, treat it as unproven.
+What Hermian has been verified to do, where and when, what isn't proven
+yet, and what has to happen before v0.1.0. Numbers in the README, the
+website and release notes come from here. If a number isn't here, treat it
+as unproven.
 
-The project is in beta; the [burn-in matrix](ROADMAP-BURN-IN.md#3-burn-in-matrix-phase-2-gate)
-is in progress. "Validated on one host" means exactly that: one host has
-completed a full field pass, not a fleet.
 
-## Build and tests
+1. Tests
 
-| Suite | What it covers | Last result |
-|---|---|---|
-| `cargo test -p hermian-core --locked` | Detection engine, synthetic events | 158 passing, 2026-10-15 |
-| `cargo test -p hermian --locked` | Daemon logic (Linux only) | 103 passing, 7 ignored, 2026-10-15 |
-| PAM module tests | The PAM hook shim | 2 passing, 2026-10-15 |
-| `tests/helpers` | Suite plumbing (alert waits, disposable-host guard) | 20 passing, 3 skipped, 2026-10-15 |
+Last run 2026-10-16, on every change in CI:
 
-CI runs all of these on every change. Synthetic tests don't prove live
-collection works on a host; the field runs below are what covers that.
+- hermian-core (detection engine, synthetic events): 165 passing.
+- hermian (daemon, Linux only): 127 passing, 7 ignored.
+- hermian-pam (the PAM hook): 2 passing.
+- tests/helpers (installer, packaging, suite plumbing): 41 passing.
 
-## Field runs
+These don't prove live collection works on a host. The field runs below do.
 
-### Burn-in host (September 2026)
 
-Ubuntu 22.04, kernel 6.8, 2 vCPU. Sources: CHANGELOG 0.1.0-beta.5 and
-[ROADMAP-BURN-IN.md](ROADMAP-BURN-IN.md).
+2. Field runs
 
-- Attack suite: 7 of 7 scenarios fired at the expected severity. The seven:
-  web-shell chain, SSH key injection, cron persistence, systemd unit,
-  `ld.so.preload`, fileless exec, setuid drop.
-- False positives: 0 HIGH+ across 26 admin and unattended operations (idle,
-  admin edits, web, dev, ansible, CI workloads).
-- Overhead: around 0.1% CPU, 19 MB RSS, ~80k events over 3 hours.
-- Detection to Telegram: ~2 s in one measured run (400 ms inotify debounce
-  plus delivery). One measurement, not a percentile; the setuid sweep can
-  take ~20 s by design.
+Host A, the burn-in host (September 2026). Ubuntu 22.04, kernel 6.8,
+2 vCPU.
 
-### Production VPS (soaking since 2026-09-20)
+- Attack suite: 7 of 7 scenarios fired at the expected severity (web shell
+  chain, SSH key injection, cron, systemd unit, ld.so.preload, fileless
+  exec, setuid drop).
+- False positives: 0 HIGH or CRITICAL across 26 admin and unattended
+  operations.
+- Overhead: about 0.1% CPU and 19 MB of memory, 80,000 events in 3 hours.
+- Detection to Telegram: about 2 seconds, in one measured run (400 ms of
+  inotify debounce plus delivery). The setuid sweep can take up to 20 s by
+  design.
 
-Ubuntu 22.04.5, kernel 5.15.0-170, 2 vCPU. Sources: deployment notes and
-`hermian status`.
+The maintainer's VPS (since 2026-09-20). Ubuntu 22.04.5, kernel 5.15.0-170,
+2 vCPU. Day-to-day host until 2026-10-16, a disposable test host since.
 
-- Installed as beta.2, upgraded in place twice since, once with a config
-  merge that added new settings as comments (backup kept, reload reported no
-  functional change).
-- Running since 2026-09-20 apart from upgrade restarts; real HIGH alerts
-  delivered and reviewed (root SSH login from a new source, brute-force
-  digests).
-- No attack or false-positive workloads were run here; it's a production
-  host, not a disposable one.
-- Dead-man switch exercised on 2026-10-15 (deployed build, sha `180f15d6…`):
-  SIGKILLing the daemon paged HIGH on the next start (unclean shutdown,
-  HER-2026-1015-188); freezing it with SIGSTOP paged HIGH after 3m42s of
-  stale heartbeat and the watchdog restarted it (HER-WD-20261015-170218),
-  heartbeat back to 0s. The durable alert queue is covered by tests but
-  hasn't faced a real channel outage yet.
-- Once-per-sighting novelty verified on 2026-10-15 (deployed build, sha
-  `49dc976e…`): a root login from an operator IP that appeared after the
-  baseline window paged HIGH `Root login from a new source`
-  (HER-2026-1015-210), the IP was written to `baseline.json`, and the next
-  login from the same IP was INFO only (HER-2026-1015-211). Both summaries
-  named the auth method (`(key)`). Before this build the same login re-paged
-  HIGH every time.
+- Upgraded in place release after release, from beta.2 to beta.11, once
+  with a config merge that added new settings as comments.
+- Dead-man switch (2026-10-15): killing the daemon paged HIGH on the next
+  start; freezing it paged HIGH after 3m42s of stale heartbeat and the
+  watchdog restarted it.
+- Novelty once per source (2026-10-15): a root login from a new address
+  paged HIGH, the next one from it was INFO.
+- Full suite (2026-10-16, --quick): self-test 9 of 9, attacks 7 of 7.
+  False-positive workloads 5 of 6 at first: the web run's cleanup rewrote
+  /root/.bashrc with nobody logged in, which Hermian rightly reported. The
+  cleanup was fixed (#60) and admin-edit and web passed again, run with no
+  session open.
+- Hidden SSH key source (2026-10-16, beta.10): a drop-in pointing sshd at
+  /dev/.cache/rdpii paged on the first start, and a login with the key in
+  it paged with the file and line.
+- Install and updates (2026-10-16, beta.11): the one-line installer from
+  the release installed the .deb and added apt.hermian.me; apt verified the
+  repository's signature and lists Hermian from it. An earlier tarball
+  install's binary was removed so the package's took over (#58).
 
-## Numbers that looked inconsistent
 
-Older drafts disagree; this is the current reading:
+3. Not proven yet
 
-| Seen in older drafts | What it means |
-|---|---|
-| 13/13 | The full `run_suite.sh`: 7 attacks + 6 false-positive workloads. 13/13 per host is the matrix gate; a complete 13-check run hasn't been recorded on a matrix host yet. |
-| 7/7 | The attack half of that, on the burn-in host. |
-| kernel 5.15 vs 6.8 | Two hosts: the burn-in host ran 6.8, the production VPS runs 5.15. |
-| ~5 hours of field time | The burn-in host's first afternoon. Superseded: the production VPS soak since 2026-09-20. |
+- Any distro but Ubuntu 22.04: Debian, the RHEL family with SELinux, the
+  kernel 5.4 fallback path, and arm64 on real hardware.
+- 72 hours with zero unexplained HIGH alerts on several hosts. The runs
+  above were 5-minute workloads.
+- Automatic isolation during a real incident (unit tests only).
+- The disk-backed alert queue during a real channel outage (unit tests
+  only).
+- Release verification on a clean machine with cosign and gh attestation.
 
-## Not proven yet
 
-- Any distro but Ubuntu 22.04: RHEL family with SELinux, the kernel 5.4
-  fallback path, and arm64 are untested.
-- Automatic isolation under a real incident (unit tests only). Telegram
-  buttons have been pressed live on the production VPS, but not during an
-  actual attack.
-- Durable alert queues under a real channel outage (unit tests only so far;
-  the watchdog and unclean-shutdown paths have run live on the VPS).
-- A heartbeat or independent tamper monitor beyond the local watchdog.
-- Release verification reproduced on a clean machine: `sha256sum -c`,
-  `gh attestation verify`, `cosign verify-blob`.
-- An install from a release-served `install.sh`: its remote path has only run
-  with `--dry-run` (in WSL, against the beta.5 assets; `gh` attestation and
-  checksums pass, and the checksum-only branch was exercised). No install from
-  a release asset yet.
+4. Burn-in plan
+
+Each host is a disposable machine of one kind:
+
+    A  idle VPS, sshd, nginx       Ubuntu 22.04        done (see 2)
+    B  busy web server             Debian 12           to do
+    C  developer workstation       Ubuntu 24.04        to do
+    D  SSH users and Ansible       Debian 12           to do
+    E  CI runner                   Ubuntu 22.04        to do
+    F  RHEL family, SELinux on     Rocky 9 or Fedora   to do
+    G  old kernel                  Ubuntu 20.04, 5.4   to do
+    H  arm64                       Debian 12           to do
+
+F, G and H are the most likely to find bugs.
+
+On each host, about 20 minutes plus 72 hours:
+
+    sudo touch /etc/hermian-disposable-host
+    sudo tests/run_suite.sh --skip-fp
+    sudo tests/false_positives/run_false_positive.sh admin-edit 300
+    sudo cp tests/soak/hermian-soak-snapshot /usr/local/bin/
+    sudo tests/soak/start.sh
+    # use the host normally for 72 hours, then:
+    sudo tests/soak/report.sh
+
+A host passes with 0 HIGH not caused by a real event, average CPU under 1%
+and memory under 80 MB. Never run the suites on a machine you care about:
+they modify real auth and persistence files.
+
+
+5. Before v0.1.0
+
+- Hosts A to H have each run 72 hours with 0 unexplained HIGH alerts.
+- Every attack scenario passes on every host.
+- CPU under 1% on average (5% at worst) and memory under 80 MB everywhere.
+- The false-positive log below is complete and every entry is closed.
+- A release has been verified on a clean machine (sha256sum, gh attestation,
+  cosign).
+- apt upgrade has delivered a release to a test host. (Repository live since
+  beta.11.)
+- hermian uninstall leaves nothing behind on every distro.
+- Two hosts the maintainer relies on have run the release for 30 days.
+
+
+6. False positives
+
+Every HIGH or CRITICAL alert that wasn't a real event gets an entry here.
+Find the cause: the rule was wrong, the attribution failed, or it's specific
+to that host. Only the last kind ends with an allowlist entry; the others
+end with a fix and a regression test.
+
+Format: date, host, alert, rule, cause, fix, closed.
+
+None recorded yet. (The web workload alert of 2026-10-16 was a real event
+caused by the test harness, not a false positive; see 2.)
+
+
+7. Things that bit us, now fixed
+
+- The eBPF verifier rejected the exec program: a 400-byte struct on the
+  512-byte stack. Fixed with a per-CPU scratch map.
+- perf mmap failed with EPERM: MemoryDenyWriteExecute and a 64 KB memlock
+  limit in the unit. Both removed.
+- No inotify watches while status said PROTECTED: another process had used
+  up max_user_watches. The package raises the limit; status shows watch
+  health.
+- Setuid files in /tmp were invisible with PrivateTmp. It's off, and a
+  sweep finds them.
+- The web-to-shell chain never fired: sys_enter_execve sees the old name.
+  Hooked sched_process_exec instead.
+- Root logins paged every time. Now HIGH the first time per source.
+- useradd paged on /etc/shadow: the writer exited before inotify fired.
+  Recent user-management tools now count.
+- The .deb refused to install on 22.04: built on a newer glibc. Releases
+  build on Ubuntu 22.04.
+- A tarball install's /usr/local/bin/hermian shadowed the package's binary
+  after an upgrade. The installer removes it.
+- An upgrade's own restart paged "Hermian is stopping". Planned restarts
+  are now INFO.

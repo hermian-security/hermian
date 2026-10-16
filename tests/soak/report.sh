@@ -31,7 +31,7 @@ print("-" * 72)
 if hp:
     print("HIGH/CRITICAL by rule:")
     for k, v in sorted(hp.items(), key=lambda kv: -kv[1]): print("  %4d  %s" % (v, k))
-    print("\nRESULT: FAIL - review each with `hermian alerts -s high`; log verdicts in docs/fp-log.md")
+    print("\nRESULT: FAIL - review each with `hermian alerts -s high`; log verdicts in docs/EVIDENCE.md, section 6")
     sys.exit(1)
 ok = hours >= 72 and pct(cpu, .5) < 1.0 and (max(rss) if rss else 0) < 80
 print("HIGH/CRITICAL: none")

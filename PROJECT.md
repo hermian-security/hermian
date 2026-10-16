@@ -1,291 +1,217 @@
-# Project notes
+Hermian project notes
+=====================
 
-Hermian is a Linux host monitor for a VPS, homelab, or small fleet. The aim is a
-short set of useful alerts without a separate server to manage. It's still beta,
-not a full EDR or a guarantee that a quiet host is clean.
+How Hermian works inside. To install and use it, see README.md. To build,
+test and release, see CONTRIBUTING.md. What has been verified so far is in
+docs/EVIDENCE.md.
 
-For setup, see the [README](README.md). For development and releases, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Hermian watches a single Linux host and sends a short list of useful
+alerts, with no separate server to run. It's in beta. It isn't a full EDR,
+and a quiet host isn't proof that it's clean.
 
-## Architecture
 
-```text
-eBPF / inotify / auth logs / PAM / polling
-                  |
-                  v
-          hermian-core::Engine
-   process tree, baseline, rules, allowlist
-                  |
-                  v
-        findings -> dedup -> alerts
-                  |
-                  v
-     JSON store, logs, notifications
-```
+1. Architecture
 
-| Crate | Job |
-| --- | --- |
-| `hermian-core` | Rules, process tree, baseline, config, and alert rendering; no I/O |
-| `hermian` | Linux collectors, daemon, CLI, storage, and delivery |
-| `hermian-ebpf` | Kernel tracepoints and the vendored eBPF object |
-| `hermian-pam` | Optional passive PAM telemetry module |
+    eBPF, inotify, auth logs, PAM, polling
+                      |
+              hermian-core::Engine
+       process tree, baseline, rules, allowlist
+                      |
+         findings -> deduplication -> alerts
+                      |
+        JSON store, logs, notifications
 
-The agent targets systemd hosts on kernel 5.4+, amd64 and arm64. The core tests
-also run on Windows and macOS; the daemon doesn't. There's no network listener
-or remote event stream. Configured channels send alerts, not raw telemetry.
-Telegram button presses, when enabled, are fetched by outbound long-polling.
+- hermian-core: rules, process tree, baseline, config and alert rendering.
+  No I/O.
+- hermian: the Linux collectors, daemon, CLI, storage and delivery.
+- hermian-ebpf: the kernel hooks and the vendored eBPF object.
+- hermian-pam: an optional, passive PAM module.
 
-## Detection rules
+Hermian runs on systemd hosts with kernel 5.4 or newer, amd64 and arm64.
+The core tests also run on Windows and macOS; the daemon doesn't. Nothing
+listens on the network. Channels send alerts, never raw telemetry, and
+Telegram button presses are fetched by outbound polling.
 
-Rules are deterministic. They use process roles, ancestry, paths, user/session
-context, and recent findings rather than a risk score. The source files below
-are the detailed rule reference, including exemptions and severity choices.
 
-| Group | Looks for |
-| --- | --- |
-| [D1: process chains](hermian-core/src/detect/d1.rs) | Web/db shells (direct or through other programs), downloaders and nc/socat started by services, download-and-exec chains, transient or deleted executables |
-| [D2: auth](hermian-core/src/detect/d2.rs) | Failed-auth bursts (INFO), a [brute-force digest](hermian-core/src/detect/brute.rs) every 2 h when existing accounts were targeted (HIGH), login after a burst (HIGH), root/new-source logins, SSH config and account changes |
-| [D3: persistence](hermian-core/src/detect/d3.rs) | Loader config, cron and at jobs, shell profiles, SSH keys, systemd units (admin, vendor, per-user), PAM, global environment, rc.local, udev rules, and boot-time modules |
-| [D4: privileges](hermian-core/src/detect/d4.rs) | Setuid/capability files, ptrace, LD_PRELOAD, sudoers, and shadow writes |
-| [D5: network](hermian-core/src/detect/d5.rs) | Connections linked to flagged chains, baseline novelty, and new listeners |
+2. Detection rules
 
-These are engine rules, not a promise of complete live coverage. Collectors can
-miss events or lack the context a rule needs.
+Rules are deterministic: they look at process roles, ancestry, paths, who
+is logged in and recent findings, not at a risk score. The source files are
+the detailed reference.
 
-### Context matters
+- D1, process chains (hermian-core/src/detect/d1.rs): shells started by
+  web servers or databases, directly or through other programs; downloaders
+  and nc or socat started by services; download-and-run chains; programs
+  run from /tmp or from deleted files.
+- D2, SSH and accounts (d2.rs, brute.rs): failed-login bursts (INFO); a
+  digest every 2 hours when real accounts were targeted; a login right after
+  a burst; root logins and logins from new sources, naming the key used and
+  where it's stored; sshd key sources in hidden places; SSH config and
+  account changes.
+- D3, persistence (d3.rs): loader config, cron and at jobs, shell profiles,
+  SSH keys, systemd units, PAM, global environment, rc.local, udev rules and
+  boot-time modules.
+- D4, privileges (d4.rs): setuid and capability files, ptrace, LD_PRELOAD,
+  sudoers and shadow writes.
+- D5, network (d5.rs): connections from flagged chains, new destinations
+  and new listeners.
 
-A web server spawning a shell is HIGH. A normal shell under an SSH session
-isn't. File rules also distinguish operator edits from unattended writes.
+Context decides severity. A web server starting a shell is HIGH; a shell in
+an SSH session isn't. Programs that excuse a change (package managers,
+config managers, user tools, debuggers) only count when the file and every
+directory above it are owned by root and writable by nobody else: a binary
+merely named dpkg doesn't count. Content is checked before any excuse: the
+real crontab installing a "curl | sh" job is still reported.
 
-Roles that exempt a process (package and config managers, user tools,
-debuggers, session daemons) need its executable in a system directory that
-root really owns (the file and every directory above it, none writable by
-anyone else); a binary merely named `dpkg`, or one in a deploy user's
-`/opt/app`, doesn't count. Script tools such as
-dnf or Debian's adduser run under an interpreter, so the script's own path
-(from the command line) has to be in such a directory. Build tools that
-excuse LD_PRELOAD (make, cargo, fakeroot...) follow the same rule. A TTY or
-`sudo` doesn't count as an operator under a web server, database or cron.
-Content checks come before tool exemptions: the real `crontab` installing a
-`curl | sh` job, or a package manager writing a unit that runs from `/tmp`,
-is still reported.
+inotify doesn't say who wrote a file. Hermian looks for an open file
+descriptor first, then for a recent admin tool started from a session or a
+package manager. Failing that, it treats a write as an operator's when
+something was started from an interactive session in the last 15 seconds,
+or an editor is open in one. That's a guess, and it can downgrade an
+unrelated write made while someone is typing.
 
-inotify doesn't identify the writer. The daemon tries to find an open file
-descriptor; some rules also look for a recent admin tool, which only counts if
-an operator session or a package/config manager started it (so `visudo -c`
-from a cron job doesn't excuse a direct sudoers write). If the writer is
-unknown, recent operator activity is the fallback: something started from an
-interactive session in the last 15 seconds, or an editor running in one. An
-idle SSH or tmux session doesn't count. That's a heuristic, not proof of who
-changed a file, and it can still downgrade an unrelated write made while an
-operator is typing.
+The baseline learns SSH sources, destinations and connecting programs for
+24 hours, then judges novelty, and keeps learning: something is new the
+first time it's seen, not every time. Destinations are judged by network
+(/24, or /64 for IPv6). A key that has logged in before, from a new address
+in a network the account already uses (/16, or /32 for IPv6), is INFO.
 
-The default baseline learns SSH sources, destination IPs, and connector identities
-for 24 hours, then starts judging novelty. Learning itself doesn't stop when the
-window closes: a source, destination, or program counts as new the first time it
-is ever seen, not every time it appears afterwards. Destinations are host-wide,
-not per-application, and judged by network: an address in a /24 (IPv6: /64)
-already seen isn't new, so an API or CDN rotating addresses doesn't page. Disabling the baseline also disables novelty judgments.
-Root-login source history is tracked separately.
+Allowlist entries need a reason. Fixing a noisy rule is better than a broad
+exception. Examples are in /etc/hermian/config.toml.
 
-Allowlist entries need a `reason`. Prefer fixing a noisy rule over adding a broad
-exception. See the examples in `/etc/hermian/config.toml`.
 
-## Collectors
+3. Collectors
 
-| Signal | Source and limits |
-| --- | --- |
-| Execution | eBPF `sched_process_exec`; syscall-entry hooks collect extra exec context |
-| Parent PID | Kernel BTF offsets, with a `/proc` fallback |
-| Connect / ptrace | eBPF syscall entry: records attempts, not confirmed success. Not seen: 32-bit (compat) syscalls on x86_64, io_uring connects, unconnected UDP `sendto`, TCP Fast Open |
-| File changes | inotify on selected paths; 400 ms debounce, max 2.5 s hold |
-| Process metadata | `/proc` at startup and while handling events |
-| TCP listeners | `/proc/net/tcp*`, polled every 5 s |
-| Setuid/setgid files | Sweep every 20 s, depth-limited to four levels |
-| SSH auth | journald (root `sshd` entries only) when running, else `auth.log` / `secure`; PAM telemetry is optional |
+- Execution: eBPF sched_process_exec, plus syscall hooks for context.
+  Parent PIDs from kernel BTF offsets, with a /proc fallback.
+- Connect and ptrace: eBPF syscall entry, so attempts, not confirmed
+  success. Not seen: 32-bit syscalls on x86_64, io_uring connects,
+  unconnected UDP sends, TCP Fast Open.
+- File changes: inotify on selected paths, 400 ms debounce, 2.5 s at most.
+- Listeners: /proc/net/tcp, every 5 seconds.
+- Setuid files: a sweep every 20 seconds, four levels deep.
+- SSH: journald (sshd's own entries only), else auth.log or secure. The
+  PAM module is optional.
 
-eBPF needs kernel 5.8+ and the required permissions. If it can't load, execution
-falls back to one-second `/proc` polling and audit when available. Hermian leaves
-an existing auditd alone. Short-lived processes can be missed by polling.
+eBPF needs kernel 5.8 or newer. Without it, execution falls back to
+polling /proc every second, and to audit when available (an existing auditd
+is left alone). Short-lived processes can be missed then. The exec hooks
+check 64 environment entries for LD_PRELOAD and LD_AUDIT; more filler than
+that hides them. A 32-bit program on x86_64 is reported LOW, since its
+syscalls bypass the hooks.
 
-The exec hooks check up to 64 environment entries for `LD_PRELOAD` or
-`LD_AUDIT`; more filler variables than that still hide them. A 32-bit
-program starting on x86_64 is logged (LOW) since its syscalls bypass the
-hooks, and CPUs hot-plugged after startup page HIGH until a restart gives
-them a reader.
+Hermian watches the host, not what runs inside containers. It doesn't see
+injection that doesn't start a new program, and a ptrace alert doesn't
+reveal what was done to the target.
 
-Container metadata comes from PID namespaces and cgroups. This is host-side
-monitoring, not full container or Kubernetes coverage.
 
-Normal-looking commands can fall outside these rules. Exec monitoring won't see
-injection that doesn't start a new image, and a ptrace alert doesn't reveal what
-was done to the target's memory. There's no cross-host correlation either.
+4. Alerts and delivery
 
-## Alerts and delivery
+Alerts carry the rule, the evidence, the process chain when there is one,
+the risk and next steps. They're stored as JSON in /var/lib/hermian/alerts/
+and kept for general.alert_retention_days (90 by default). alerts.log
+rotates at 50 MB.
 
-Alerts include the rule, evidence, process chain when available, and suggested
-next steps. JSON records live in `/var/lib/hermian/alerts/`; `show` and `collect`
-read them back. Records and collect bundles older than
-`general.alert_retention_days` (default 90, 0 keeps them) are deleted hourly,
-and `alerts.log` rotates at 50 MB, keeping three old copies.
+- INFO: context, never notified, hidden from "hermian alerts" by default.
+- LOW: worth a look.
+- HIGH: investigate. Notified by default.
+- CRITICAL: urgent. Notified, and can trigger automatic isolation.
 
-- **INFO:** context for later.
-- **LOW:** worth a look, usually not urgent.
-- **HIGH:** investigate; notified by default.
-- **CRITICAL:** urgent; notified and eligible for opt-in auto-isolation.
+Repeats within 5 minutes are folded into one alert with a count. Different
+rules can still report the same incident.
 
-The default dedup window is five minutes. Higher severity gets through immediately;
-repeated HIGH/CRITICAL findings can produce a LOW summary. This isn't one alert
-per incident: separate rules may report the same activity.
+journald and alerts.log always get every alert. Telegram, email, webhooks
+(Slack, Discord, ntfy, JSON) and stdout get those at min_severity and above.
+Pending alerts are queued on disk per channel (500 each) and survive a
+restart, so delivery is at least once: a crash mid-send can send one twice.
 
-Default local outputs are journald and `/var/log/hermian/alerts.log`. Optional
-channels are Telegram, SMTP/sendmail, webhooks, and stdout, gated by `min_severity`.
-Use `hermian notify-test` to check them.
 
-Delivery retries use backoff and track which channels still need an alert.
-Pending alerts are written to per-channel queues on disk (500 each) and
-reloaded after a restart, so delivery is at-least-once: a crash mid-send can
-duplicate an alert, never lose one. `status` shows pending deliveries and
-errors. A prolonged failure is logged locally.
+5. What Hermian changes on a host
 
-## Host changes
+hermian enable creates the systemd units (the daemon and the watchdog
+timer), root-only config, state and log directories, the binary and config
+hashes and the baseline, raises low inotify limits, and starts the daemon.
+The package runs it on every install and upgrade.
 
-`hermian enable` creates the systemd units (the daemon and the watchdog
-timer) and root-only config/state/log dirs,
-records binary/config hashes, initializes the baseline, and starts the daemon.
-It also raises low inotify limits. Re-run it after a source or tarball upgrade;
-the Debian package handles this itself.
+The unit uses ProtectSystem=strict, NoNewPrivileges and a list of
+capabilities. PrivateTmp stays off so Hermian sees the host's /tmp.
 
-The unit uses `ProtectSystem=strict`, `NoNewPrivileges`, and a capability list
-for collection. `PrivateTmp` stays off so monitoring can see the host's `/tmp`.
-See [the unit template](packaging/systemd/hermian.service) for the full settings.
+A config change that alters detections, channels or the allowlist pages
+CRITICAL. An invalid config keeps the last good one and logs LOW. A binary
+or config changed while the daemon was stopped pages on the next start.
+None of this stops someone who already has root.
 
-A validated config change that actually alters detections, channels, or the
-allowlist pages CRITICAL. Reloads compare against the config in effect, not
-the hash file on disk. Invalid TOML keeps the last good config and logs LOW.
-Startup hash checks still flag binary/config changes made while the daemon was
-stopped, and a missing hash record pages HIGH instead of being silently
-re-created. Local hashes aren't protection against someone who already
-controls root. Nothing auto-updates.
+A stop pages HIGH, except a restart by hermian enable (installs and
+upgrades), which is INFO. The unit restarts the daemon after any other exit.
+A timer checks the daemon's heartbeat every minute, pages and restarts it if
+it's stuck, and the next start reports an unclean shutdown. It runs on the
+same host: it isn't an outside monitor. Dropped telemetry pages HIGH.
 
-A clean stop (`systemctl stop`, SIGTERM) pages HIGH before exiting, so package
-upgrades send one too. The unit restarts the daemon after any other exit and
-never gives up. Crashes are covered by the dead-man switch: the daemon writes
-a heartbeat every tick, `hermian-watchdog.timer` checks it every minute, pages
-HIGH and restarts a wedged daemon, and the next start pages HIGH about the
-unclean shutdown. It's a systemd timer on the same host, not an out-of-band
-monitor. Dropped telemetry (full eBPF rings, inotify overflows, audit ENOBUFS)
-pages HIGH and shows in `status`.
+Updates come through the signed APT repository (apt.hermian.me) when the
+installer has added it, or by running the installer again.
 
-PAM integration is opt-in via `hermian enable --with-pam`. The module sends auth
-metadata, doesn't read passwords, and returns `PAM_IGNORE`.
+The PAM module is opt-in (hermian enable --with-pam). It reports login
+results, never reads passwords, and always returns PAM_IGNORE.
 
-## Response
 
-Monitoring logs and notifies by default; it doesn't kill or quarantine processes.
-`hermian isolate` adds nftables rules. `hermian unisolate` removes them.
+6. Response
 
-### Telegram buttons
+By default Hermian only logs and notifies.
 
-With `notifications.telegram.actions = true` and `allowed_user_ids` set,
-alerts that offer responses carry inline buttons:
+Telegram buttons, with notifications.telegram.actions on and
+allowed_user_ids set:
 
-| Alert | Buttons |
-| --- | --- |
-| Brute-force digest (failed logins against accounts that exist and have a login shell, or root; sent every `ssh.brute_digest_hours` only when a source reached `ssh.brute_min_attempts`) | `Block <ip>` for the top sources, `Block all`, `Ignore 2h`, and `Remind me in 7 days` when the digest warns that root can log in with a password |
-| Login after a burst, from a new source, or root from a new place | `Ignore`, `Disconnect session`, `Disconnect and block` |
+- The brute-force digest offers Block for its top sources, Block all and
+  Ignore 2h, plus a 7-day reminder when root can log in with a password.
+- Suspicious logins offer Ignore, Disconnect session and Disconnect and
+  block.
 
-Buttons act immediately; there's no confirmation step. They only work for
-the listed Telegram user ids in the configured chat, expire after
-`action_ttl_mins`, and each works once. Every press is recorded as a local
-alert and answered in the chat. Presses are fetched by outbound
-long-polling (`getUpdates`), so nothing listens on the host, and it works
-during isolation. A webhook set on the same bot stops it; `status` says so.
+Buttons act at once, only for the listed users, expire after action_ttl_mins
+and work once. Every press is logged and answered in the chat. Block puts
+the source in an nftables set of its own for block_duration_hours (IPv6 as
+its /64) and never blocks management CIDRs, allowlisted sources or local
+addresses. Disconnect stops the sshd processes holding that one connection.
+"hermian blocked" lists blocks and "hermian unblock" lifts one. One bot per
+host when buttons are on: see docs/FLEET.md.
 
-- **Block** adds the source to an nftables set with a timeout
-  (`response.block_duration_hours`, default 24) in its own `hermian_block`
-  table, dropping its traffic both ways. IPv6 sources are blocked as their
-  /64. Management CIDRs, allowlisted SSH sources and loopback/link-local
-  addresses are always refused. `hermian blocked` lists blocks and
-  `hermian unblock <ip>` lifts one; blocks survive a daemon restart but not
-  a reboot.
-- **Disconnect** stops the sshd processes holding that connection (matched
-  by source address and port from the log line), so the user's other
-  sessions stay up. With block, the block goes in first so the session
-  can't come straight back. Programs the user started get SIGHUP; ones that
-  ignore it keep running.
-- **Ignore** on the digest stops listing those sources for one digest
-  period. Successful logins from them still alert.
+Isolation (hermian isolate, or automatic on CRITICAL with
+response.auto_isolate) needs response.management_cidrs. It keeps loopback,
+the management CIDRs, DHCP, IPv6 neighbour discovery, DNS, cloud metadata
+and the alert endpoints, and cuts everything else, open connections and
+routed traffic included. Alert endpoints stay reachable, so it isn't a
+complete cutoff. A CRITICAL whose service doesn't look genuine (a program
+merely named nginx) pages but doesn't isolate. "hermian isolate --for 30"
+and auto_isolate_revert_mins lift it with a systemd timer that works even
+if the daemon is gone. Test your CIDRs and recovery access first.
 
-`hermian enable` grants `CAP_NET_ADMIN` and `CAP_KILL` only when actions are
-on; re-run it after turning them on.
+hermian enable grants CAP_NET_ADMIN and CAP_KILL only when buttons or
+isolation are configured: run it again after turning them on.
 
-Isolation requires `response.management_cidrs`. Automatic isolation also needs
-`response.auto_isolate = true` and `CAP_NET_ADMIN`, which `hermian enable`
-grants only when isolation is configured; re-run it after turning isolation on.
-A CRITICAL whose web server or database doesn't look genuine still pages but
-doesn't isolate, so a local user can't trigger it by naming a program
-`nginx`. Genuine means the binary in a root-owned location is named like the
-service, or a trusted interpreter (gunicorn, puma, tomcat) runs it under a
-system account (uid < 1000).
-The rules keep loopback, management CIDRs, DHCP, IPv6 neighbour discovery,
-DNS to the resolvers in resolv.conf, cloud instance metadata
-(169.254.169.254, which some providers need for SSH logins), and TCP to the
-notification endpoints resolved at isolation time. Connections already open
-to anywhere else are cut, so a reverse shell started before the alert
-doesn't survive it; an SSH session from outside the management CIDRs drops
-too. Routed traffic (containers, VMs) is dropped as well. It isn't a
-complete network cutoff: Telegram, webhook and SMTP endpoints stay reachable
-so alerts still go out, and code on the host could use them too.
-Catch-all CIDRs (`0.0.0.0/0`, `::/0`) are rejected since they'd make
-isolation a no-op.
 
-As a dead-man switch, `hermian isolate --for 30` lifts the isolation after 30
-minutes, and `response.auto_isolate_revert_mins` does the same for automatic
-isolation. Both use a transient systemd timer, so they work even if the
-daemon is gone. Check your CIDRs and recovery access on a test host first;
-don't assume remote access is guaranteed.
+7. Building
 
-`hermian uninstall` tries to lift isolation, then removes the unit, config, state,
-logs, PAM hook, and binary. Back up any alerts you want to keep.
+Builds use the vendored eBPF object (hermian-ebpf/prebuilt/hermian-ebpf.o)
+unless told otherwise. To rebuild it, install the pinned nightly with
+rust-src and bpf-linker v0.11.1 (the static release binary: building it
+needs LLVM 21):
 
-## Building eBPF
+    rustup toolchain install nightly-2026-09-17 -c rust-src
+    HERMIAN_EBPF_NIGHTLY=nightly-2026-09-17 HERMIAN_EBPF_FROM_SOURCE=1 \
+      cargo build --release --locked
 
-Normal builds can use `hermian-ebpf/prebuilt/hermian-ebpf.o`. To rebuild it,
-install nightly Rust with `rust-src` and a suitable
-[bpf-linker binary](https://github.com/aya-rs/bpf-linker/releases).
-CI currently uses bpf-linker v0.11.1.
+That pair reproduces the vendored object byte for byte; CI checks it. Bump
+them together and commit the new object in the same pull request.
+HERMIAN_EBPF_PREBUILT picks another object; HERMIAN_EBPF_FROM_SOURCE=0
+uses the vendored one on purpose.
 
-```bash
-rustup toolchain install nightly-2026-09-17 -c rust-src
-HERMIAN_EBPF_NIGHTLY=nightly-2026-09-17 HERMIAN_EBPF_FROM_SOURCE=1 cargo build --release --locked
-```
+Build packages on the oldest glibc you support: a .deb records the build
+host's glibc. Releases build on Ubuntu 22.04 (glibc 2.34 and newer).
 
-CI pins that nightly and bpf-linker v0.11.1; with both, the build reproduces
-the vendored object byte for byte. Bump them together and commit the new
-object in the same PR.
 
-`HERMIAN_EBPF_PREBUILT=/path/to/object` selects an explicit object instead.
-If a BPF toolchain is installed but the source fails to compile, the build
-fails rather than quietly using the vendored object; set
-`HERMIAN_EBPF_FROM_SOURCE=0` to use the vendored object on purpose.
-Linux CI rebuilds from source and compares against the vendored object.
+8. Testing
 
-## Testing and next steps
-
-Portable tests cover the engine. Linux CI builds the daemon/eBPF and runs
-synthetic self-tests. Neither proves live collection works on a given host.
-
-The attack harness requires fresh matching HIGH/CRITICAL evidence. Its 30-second
-wait accommodates pollers; it isn't a five-second latency test. Run attack and
-false-positive workloads only on disposable hosts: they modify real auth and
-persistence files.
-
-Field results so far come from Ubuntu 22.04 hosts; [docs/EVIDENCE.md](docs/EVIDENCE.md)
-records exactly what's verified and what isn't. CPU under 1%, RSS under 80 MB,
-and low false-positive rates are goals, not guarantees. The 20-second privilege
-sweep alone rules out a blanket five-second detection promise.
-
-Next: fix collector and attribution gaps, run the wider
-[burn-in matrix](docs/ROADMAP-BURN-IN.md), and publish a signed APT repository on GitHub Pages so updates arrive through
-`apt upgrade`. RPM and other packaging can wait until that coverage is tested.
+Portable tests cover the engine; Linux CI builds the daemon and eBPF and
+runs the self-test. Neither proves collection works on a real host: the
+attack and false-positive suites do, and they modify real auth and
+persistence files, so run them only on disposable hosts. Results and the
+burn-in plan are in docs/EVIDENCE.md.
