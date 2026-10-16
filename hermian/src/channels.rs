@@ -217,10 +217,18 @@ pub mod telegram {
 
 pub mod email {
     use super::*;
-    use lettre::message::{header::ContentType, Mailbox, MultiPart, SinglePart};
+    use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
     use lettre::transport::smtp::authentication::Credentials;
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SendmailTransport, SmtpTransport, Transport};
+
+    /// The logo for the email header: the mark on its dark tile (so it reads
+    /// on light and dark mail clients alike), 64 px shown at 32. It travels
+    /// inside the message as an inline attachment: no remote image (those
+    /// are blocked by default and would tell a server when an alert was
+    /// read), no data: URI (Gmail drops them). About 0.6 KB.
+    pub(super) const MARK_PNG: &[u8] = include_bytes!("../assets/mark-email.png");
+    const MARK_CID: &str = "hermian-mark";
 
     /// Severity colours from the identity, light palette (mail is mostly
     /// read on light backgrounds; the dark-mode CSS keeps them readable).
@@ -268,8 +276,9 @@ pub mod email {
     }
 
     /// The alert as a branded, mail-client-safe page: tables and inline
-    /// styles only (no images, no external assets), a hidden preheader for
-    /// the inbox preview, and a dark palette for clients that honour
+    /// styles only (the logo is the one image, carried inline; nothing
+    /// remote), a hidden preheader for the inbox preview, and a dark palette
+    /// for clients that honour
     /// `prefers-color-scheme`. Only the severity and the logo's dot carry
     /// colour; the process chain is drawn like a terminal.
     pub fn html(alert: &Alert) -> String {
@@ -309,17 +318,19 @@ pub mod email {
              <tr><td align=\"center\" style=\"padding:32px 12px\">\
              <table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;max-width:600px\">",
         );
-        // Brand row: the mark as glyphs (strokes in ink, the dot in accent),
-        // the wordmark, and the reference on the right.
+        // Brand row: the logo (an inline attachment, see `build`), the
+        // wordmark, and the reference on the right. alt is empty because the
+        // wordmark right after it already says "hermian".
         h.push_str(&format!(
             "<tr><td style=\"padding:0 4px 14px\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
-             <td class=\"hm-tx\" style=\"font:600 17px/1 {sans};color:#17142E;letter-spacing:-.02em\">\
-             <span style=\"font-family:{mono};font-weight:500\">\u{2571}\u{2571}\u{2571}</span>\
-             <span class=\"hm-ac\" style=\"color:#5B4FD0\">\u{25CF}</span>&nbsp; hermian</td>\
+             <td class=\"hm-tx\" style=\"font:600 18px/32px {sans};color:#17142E;letter-spacing:-.02em\">\
+             <img src=\"cid:{cid}\" width=\"32\" height=\"32\" alt=\"\" style=\"display:inline-block;vertical-align:middle;border:0;outline:none\">\
+             &nbsp;<span style=\"vertical-align:middle\">hermian</span></td>\
              <td align=\"right\" class=\"hm-dim\" style=\"font:12px/1 {mono};color:#6B6888\">{r}</td>\
              </tr></table></td></tr>",
             sans = SANS,
             mono = MONO,
+            cid = MARK_CID,
             r = esc(&alert.ref_id)
         ));
         // The card, with a severity stripe on top.
@@ -443,7 +454,7 @@ pub mod email {
         h
     }
 
-    fn build(alert: &Alert, cfg: &EmailCfg) -> Result<Message, String> {
+    pub(super) fn build(alert: &Alert, cfg: &EmailCfg) -> Result<Message, String> {
         let from: Mailbox = format!("HERMIAN <{}>", cfg.from)
             .parse()
             .map_err(|e| format!("bad from address: {}", e))?;
@@ -462,6 +473,9 @@ pub mod email {
             b = b.to(mb);
         }
         let plain = render(alert, Theme::Plain);
+        let png = ContentType::parse("image/png").map_err(|e| format!("build message: {}", e))?;
+        // alternative(plain, related(html, logo)): the standard shape for
+        // HTML mail with an inline image.
         b.multipart(
             MultiPart::alternative()
                 .singlepart(
@@ -469,10 +483,17 @@ pub mod email {
                         .header(ContentType::TEXT_PLAIN)
                         .body(plain),
                 )
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_HTML)
-                        .body(html(alert)),
+                .multipart(
+                    MultiPart::related()
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(ContentType::TEXT_HTML)
+                                .body(html(alert)),
+                        )
+                        .singlepart(
+                            Attachment::new_inline(MARK_CID.to_string())
+                                .body(MARK_PNG.to_vec(), png),
+                        ),
                 ),
         )
         .map_err(|e| format!("build message: {}", e))
@@ -780,15 +801,35 @@ mod tests {
         assert!(h.contains("&lt;modified&gt;"));
         assert!(h.contains("hermian show HER-2025-0101-007"));
         assert!(h.contains("#D9344C"));
-        // Brand row, preheader, dark mode, terminal-style chain-free card.
-        assert!(h.contains("\u{2571}\u{2571}\u{2571}"));
-        assert!(h.contains("&nbsp; hermian</td>"));
+        // Brand row (the logo by Content-ID), preheader, dark mode, sections.
+        assert!(h.contains("<img src=\"cid:hermian-mark\""));
+        assert!(h.contains(">hermian</span></td>"));
         assert!(h.contains("display:none;max-height:0"));
         assert!(h.contains("prefers-color-scheme:dark"));
         assert!(h.contains("WHY IT MATTERS") && h.contains("NEXT STEPS"));
-        assert!(
-            !h.contains("<img") && !h.contains("http"),
-            "no remote assets"
-        );
+        assert!(!h.contains("http"), "no remote assets");
+        assert_eq!(h.matches("<img").count(), 1, "only the inline logo");
+    }
+
+    /// The logo travels inside the message: the HTML and the PNG share a
+    /// multipart/related part, and the PNG carries the Content-ID the HTML
+    /// points at. The plain-text alternative stays.
+    #[test]
+    fn email_carries_the_logo_inline() {
+        let cfg = EmailCfg {
+            from: "hermian@example.com".into(),
+            to: vec!["ops@example.com".into()],
+            ..EmailCfg::default()
+        };
+        let raw = String::from_utf8(email::build(&alert(), &cfg).unwrap().formatted()).unwrap();
+        assert!(raw.contains("multipart/alternative"), "{}", raw);
+        assert!(raw.contains("multipart/related"), "{}", raw);
+        assert!(raw.contains("Content-ID: <hermian-mark>"), "{}", raw);
+        assert!(raw.contains("Content-Disposition: inline"), "{}", raw);
+        assert!(raw.contains("Content-Type: image/png"), "{}", raw);
+        assert!(raw.contains("Content-Type: text/plain"), "{}", raw);
+        // A real PNG, and small.
+        assert_eq!(&email::MARK_PNG[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(email::MARK_PNG.len() < 2048);
     }
 }

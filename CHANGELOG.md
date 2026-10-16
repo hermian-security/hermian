@@ -19,8 +19,9 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   process chain drawn like a terminal with the flagged process in red, facts,
   why it matters, numbered next steps and the command to run. Severity
   colours follow the site (CRITICAL red, HIGH purple), there's an inbox
-  preview line, and a dark palette for clients that support it. No images or
-  remote assets.
+  preview line, and a dark palette for clients that support it. The logo
+  travels inside the message as a small inline image (about 0.6 KB), so
+  nothing is loaded from a server and there's no read tracking.
 
 ## 0.1.0-beta.7 - 2026-10-15
 
