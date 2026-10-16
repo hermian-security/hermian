@@ -19,7 +19,7 @@
 set -eu
 
 REPO=hermian-security/hermian
-DEFAULT_VERSION=v0.1.0-beta.9   # release packaging rewrites this to the tag
+DEFAULT_VERSION=v0.1.0-beta.10   # release packaging rewrites this to the tag
 
 say() { echo "==> $*"; }
 die() { echo "hermian: $*" >&2; exit 1; }
