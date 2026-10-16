@@ -989,7 +989,12 @@ mod tests {
         use crate::events::SshKey;
         let mut baseline = Baseline::new(true, 24, Utc::now());
         baseline.complete = true;
-        let mut eng = Engine::new(Config::default(), Allowlist::default(), baseline, "h".into());
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline,
+            "h".into(),
+        );
         let key = |fp: &str| SshKey {
             kind: "ED25519".into(),
             fingerprint: fp.into(),
@@ -1025,8 +1030,17 @@ mod tests {
         // First login with the key: pages, and names the key.
         let first = login(&mut eng, "41.82.10.5", Some(key("SHA256:aaaa"))).unwrap();
         assert_eq!(first.severity, Severity::High);
-        assert!(first.what.contains("with key 'mohamed@laptop'"), "{}", first.what);
-        let fact = |a: &Alert, l: &str| a.facts.iter().find(|f| f.label == l).map(|f| f.value.clone());
+        assert!(
+            first.what.contains("with key 'mohamed@laptop'"),
+            "{}",
+            first.what
+        );
+        let fact = |a: &Alert, l: &str| {
+            a.facts
+                .iter()
+                .find(|f| f.label == l)
+                .map(|f| f.value.clone())
+        };
         assert_eq!(fact(&first, "Key").as_deref(), Some("ED25519 SHA256:aaaa"));
         assert_eq!(
             fact(&first, "Key file").as_deref(),
