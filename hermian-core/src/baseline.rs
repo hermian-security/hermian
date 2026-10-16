@@ -187,10 +187,6 @@ impl Baseline {
             .contains(&format!("{} {}", user, fingerprint))
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.complete
-    }
-
     /// True once the baseline has finished learning and novelty judgements are
     /// meaningful. A disabled baseline never learned anything, so treating all
     /// traffic as "novel" would be pure noise; it returns `false` here.
@@ -293,7 +289,7 @@ mod tests {
     #[test]
     fn disabled_baseline_is_complete_immediately() {
         let b = Baseline::new(false, 24, now());
-        assert!(b.is_complete());
+        assert!(b.complete);
     }
 
     #[test]
@@ -341,7 +337,7 @@ mod tests {
     fn enabled_baseline_learns_and_completes() {
         let t0 = now();
         let mut b = Baseline::new(true, 24, t0);
-        assert!(!b.is_complete());
+        assert!(!b.complete);
         let ip: IpAddr = "192.0.2.10".parse().unwrap();
         b.observe_ssh_source(ip, t0);
         assert!(b.ssh_source_is_known(ip));
@@ -349,7 +345,7 @@ mod tests {
         b.observe_connector("nginx|33", t0);
         let later = t0 + Duration::hours(25);
         assert!(b.check_completion(later));
-        assert!(b.is_complete());
+        assert!(b.complete);
         let ip2: IpAddr = "192.0.2.11".parse().unwrap();
         assert!(!b.ssh_source_is_known(ip2));
     }

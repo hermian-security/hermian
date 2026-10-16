@@ -10,3 +10,5 @@ tests/soak/* text eol=lf
 # Binary
 *.o binary
 *.png binary
+*.woff2 binary
+*.gpg binary
