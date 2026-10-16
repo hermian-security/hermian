@@ -68,17 +68,21 @@ cat > "$REPO/public/_headers" <<'EOF'
   Cache-Control: public, max-age=31536000, immutable
 EOF
 
-cat > "$REPO/public/index.html" <<'EOF'
-<!doctype html><meta charset="utf-8"><title>Hermian APT repository</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:720px;margin:48px auto;padding:0 20px;color:#17142E}
-pre{background:#0F0E17;color:#ECEBF7;padding:14px 16px;border-radius:10px;overflow-x:auto}a{color:#5B4FD0}</style>
-<h1>Hermian APT repository</h1>
-<p>Signed packages for <a href="https://hermian.me">Hermian</a>. Suites: <code>beta</code> (prereleases and releases) and <code>stable</code>.</p>
-<pre>curl -fsSL https://apt.hermian.me/hermian-archive-keyring.gpg | sudo tee /usr/share/keyrings/hermian-archive-keyring.gpg &gt;/dev/null
-printf 'Types: deb\nURIs: https://apt.hermian.me\nSuites: beta\nComponents: main\nSigned-By: /usr/share/keyrings/hermian-archive-keyring.gpg\n' | sudo tee /etc/apt/sources.list.d/hermian.sources
-sudo apt update &amp;&amp; sudo apt install hermian</pre>
-<p>Or use the one-line installer from the <a href="https://github.com/hermian-security/hermian#install">README</a>: it sets this up for you.</p>
-EOF
+# The landing page, from the template next to this script: the current
+# versions and the key fingerprint filled in, with the brand logos.
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/../.." && pwd)
+current() { # suite -> the version in it, or "none yet"
+    v=$(reprepro --basedir "$REPO" --outdir "$REPO/public" list "$1" hermian 2>/dev/null | awk 'NR==1{print $3}')
+    echo "${v:-none yet}"
+}
+FPR=$(gpg --batch --with-colons --list-keys | awk -F: '$1=="fpr"{print $10; exit}' | sed 's/.\{4\}/& /g; s/ $//')
+sed -e "s|@VERSION@|$TAG|g" \
+    -e "s|@BETA@|$(current beta)|g" \
+    -e "s|@STABLE@|$(current stable)|g" \
+    -e "s|@FINGERPRINT@|$FPR|g" \
+    "$HERE/index.html" > "$REPO/public/index.html"
+cp "$ROOT/docs/brand/lockup-light.svg" "$ROOT/docs/brand/lockup-dark.svg" "$REPO/public/"
+cp "$ROOT/hermian/assets/company-email.png" "$REPO/public/company-lockup.png"
 
 echo "published $TAG to: $SUITES"
