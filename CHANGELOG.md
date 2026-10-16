@@ -8,6 +8,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Added
 
+- `hermian report`: a summary to send the maintainers during the beta.
+  Version, OS, kernel, coverage, how long it's been installed, alert counts
+  by severity and by rule over the last 7 days (`--days`), delivery health
+  and overhead, under the identity banner. Nothing private: no host name,
+  addresses, users, paths or commands (titles that would name one are
+  withheld). `--json` for the same data as JSON.
 - A signed APT repository, `apt.hermian.me`, published by the release
   workflow: `beta` for every prerelease, `stable` from v0.1.0. On
   Debian/Ubuntu the installer adds it (key from the release, checked like the
@@ -15,6 +21,21 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   `hermian uninstall` and `apt purge` remove the entry and the key. Until the
   repository's signing key is configured, releases and installs behave as
   before.
+
+### Changed
+
+- Less noise. "Script executed from a shell" (cron or a service running a
+  script through sh) is gone: no other rule used it, and it was 82% of the
+  test VPS's alert store. `hermian alerts` lists LOW and above by default
+  and says how many INFO alerts from the last day it left out; `--all`
+  includes them, `-s` still picks a level.
+- A restart by `hermian enable` (every install and upgrade) is logged as
+  INFO, "Hermian is restarting", instead of paging "Hermian is stopping".
+  Any other stop still pages HIGH.
+- `hermian alerts 182` and `hermian alerts show 182` work like
+  `hermian show 182`.
+- The hidden key source alert says the path is *included* in the setting
+  (`AuthorizedKeysFile` usually lists several).
 
 ## 0.1.0-beta.10 - 2026-10-16
 

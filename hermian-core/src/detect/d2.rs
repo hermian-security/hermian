@@ -390,9 +390,9 @@ pub fn hidden_key_source_finding(setting: &str, path: &str, why: &str) -> Findin
         &format!("d2|hidden-key-source|{}|{}", setting, path),
     )
     .what(format!(
-        "sshd's effective configuration sets {} to {}, on {}. That {} for SSH, outside \
-         every ~/.ssh where keys are normally reviewed.",
-        setting, path, why, grants
+        "sshd's effective configuration includes {} in {}, on {}. That {} for SSH, \
+         outside every ~/.ssh where keys are normally reviewed.",
+        path, setting, why, grants
     ))
     .fact("Setting", setting)
     .fact("Path", path)

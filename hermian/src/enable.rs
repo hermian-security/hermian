@@ -163,8 +163,14 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         .map(|s| status::pid_alive(s.pid))
         .unwrap_or(false);
     if running {
-        // Upgrade path: pick up the new binary/unit.
+        // Upgrade path: pick up the new binary/unit. The marker tells the
+        // stopping daemon this restart is ours, so it isn't paged as an
+        // unexplained stop.
         run_systemctl(&["enable", "hermian"])?;
+        let _ = crate::config::write_secure(
+            &paths::planned_restart_file(),
+            &chrono::Utc::now().timestamp().to_string(),
+        );
         run_systemctl(&["restart", "hermian"])?;
     } else if run_systemctl(&["enable", "--now", "hermian"]).is_err() {
         run_systemctl(&["start", "hermian"])?;

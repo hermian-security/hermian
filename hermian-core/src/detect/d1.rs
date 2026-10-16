@@ -20,7 +20,6 @@ pub fn evaluate(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
 
     findings.extend(exec_from_transient_dir(ev, ctx));
     findings.extend(exec_from_deleted_inode(ev, ctx));
-    findings.extend(shell_script_exec(ev, ctx, &roles));
 
     findings
 }
@@ -496,38 +495,6 @@ fn exec_from_deleted_inode(ev: &ExecEvent, ctx: &Ctx) -> Option<Finding> {
     )
 }
 
-/// Interpreter launched from a shell *outside any interactive session*. This
-/// is the "cron job runs a python script" / "service runs a helper" shape:
-/// context for correlation, never notified. Interactive shells spawning
-/// interpreters are what terminals are for and are not recorded at all.
-fn shell_script_exec(ev: &ExecEvent, ctx: &Ctx, roles: &[Role]) -> Option<Finding> {
-    let last = roles.len().checked_sub(1)?;
-    if last == 0 {
-        return None;
-    }
-    let is_script_host = matches!(roles[last], Role::Shell | Role::Interpreter);
-    if !is_script_host || roles[last - 1] != Role::Shell {
-        return None;
-    }
-    if ctx.tree.has_interactive_session(ev.pid, ev.tty_nr) {
-        return None;
-    }
-    Some(
-        Finding::new(
-            DetectionId::D1,
-            Severity::Info,
-            "Script executed from a shell",
-            &format!("d1|shell-script|{}|{}", ev.comm, ev.uid),
-        )
-        .what(format!("A shell spawned {} (pid {}).", ev.comm, ev.pid))
-        .chain(ctx.chain_nodes(ev.pid))
-        .why(
-            "Common during administration and development. Logged for context only; it only \
-             becomes meaningful in combination with other detections.",
-        ),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use crate::alert::Alert;
@@ -571,6 +538,20 @@ mod tests {
     fn base(eng: &mut Engine, t: DateTime<Utc>) {
         eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
         eng.process(exec(t, 100, 1, "nginx", "/usr/sbin/nginx"));
+    }
+
+    /// cron running a script through sh (sysstat's debian-sa1 every ten
+    /// minutes) was 82% of the test VPS's alert store. It records nothing.
+    #[test]
+    fn cron_running_a_script_is_not_an_alert() {
+        let mut eng = engine(Config::default());
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 764, 1, "cron", "/usr/sbin/cron"));
+        eng.process(exec(t, 900, 764, "cron", "/usr/sbin/cron"));
+        eng.process(exec(t, 901, 900, "sh", "/usr/bin/dash"));
+        let a = eng.process(exec(t, 902, 901, "debian-sa1", "/usr/bin/dash"));
+        assert!(a.is_empty(), "{:?}", a);
     }
 
     #[test]

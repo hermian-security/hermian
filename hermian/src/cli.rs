@@ -35,6 +35,8 @@ pub enum Cmd {
     NotifyTest(NotifyTestArgs),
     /// Collect a forensic context bundle for an alert
     Collect(CollectArgs),
+    /// Summary to share with the maintainers: versions and counts, nothing private
+    Report(ReportArgs),
     /// Isolate the host from the network (management CIDRs stay reachable)
     Isolate(IsolateArgs),
     /// Remove network isolation
@@ -51,6 +53,16 @@ pub enum Cmd {
     /// Dead-man switch (used by the hermian-watchdog systemd timer)
     #[command(hide = true)]
     Watchdog,
+}
+
+#[derive(clap::Args)]
+pub struct ReportArgs {
+    /// How many days of alerts to count
+    #[arg(long, default_value_t = 7)]
+    pub days: u32,
+    /// Emit JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args)]
@@ -75,12 +87,18 @@ pub struct StatusArgs {
 
 #[derive(clap::Args)]
 pub struct AlertsArgs {
+    /// Show this alert in full instead (`hermian alerts 182`, or `alerts show 182`)
+    #[arg(value_name = "REF", num_args = 0..=2)]
+    pub reference: Vec<String>,
     /// Maximum number of alerts to list
     #[arg(long, short = 'n', default_value_t = 20)]
     pub limit: usize,
-    /// Only alerts at or above this severity (INFO, LOW, HIGH, CRITICAL)
+    /// Only alerts at or above this severity (INFO, LOW, HIGH, CRITICAL); default LOW
     #[arg(long, short = 's')]
     pub severity: Option<String>,
+    /// Include INFO alerts (context, never notified)
+    #[arg(long, short = 'a')]
+    pub all: bool,
     /// Only alerts from this detection (D1..D5, SELF)
     #[arg(long, short = 'd')]
     pub detection: Option<String>,
