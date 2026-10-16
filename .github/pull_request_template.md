@@ -1,3 +1,6 @@
+<!-- Adding yourself to the early testers wall? Just link your beta report
+     here and delete the rest of this template. -->
+
 ## Problem
 
 Describe the bug or need and link the relevant issue, if any.
