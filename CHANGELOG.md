@@ -6,6 +6,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.11 - 2026-10-16
+
+Quieter by default, a report for beta testers, and the first release on the
+signed APT repository `apt.hermian.me`. Hosts on an earlier version: rerun the
+one-line installer once, and `apt upgrade` takes over from there.
+
 ### Added
 
 - `hermian report`: a summary to send the maintainers during the beta.
