@@ -37,7 +37,7 @@ pub fn run(args: &CollectArgs) -> Result<()> {
 
     let mut report = String::new();
     let hr = "\u{2500}".repeat(72);
-    report.push_str(&format!("HERMIAN context bundle  {}\n", ref_id));
+    report.push_str(&format!("Hermian context bundle  {}\n", ref_id));
     report.push_str(&format!(
         "Collected  {}\n",
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")

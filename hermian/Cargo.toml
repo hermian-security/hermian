@@ -37,15 +37,15 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 # release workflow does the same, see CONTRIBUTING.md).
 [package.metadata.deb]
 name = "hermian"
-maintainer = "HERMIAN Security <contact@hermian.me>"
-copyright = "2025, HERMIAN Security"
+maintainer = "Hermian Security <contact@hermian.me>"
+copyright = "2025, Hermian Security"
 license-file = ["../LICENSE", "0"]
 extended-description = """\
-HERMIAN detects high-confidence signs of compromise on a Linux host using \
+Hermian detects high-confidence signs of compromise on a Linux host using \
 deterministic, contextual detection (process chains, SSH abuse, persistence, \
 privilege escalation, anomalous network behavior) and alerts locally or via \
 Telegram, email or webhook. No dashboard, no YAML rules, no alert fatigue: \
-install, enable, forget - HERMIAN only interrupts you when it matters."""
+install, enable, forget - Hermian only interrupts you when it matters."""
 depends = "$auto, systemd"
 recommends = "nftables"
 section = "admin"

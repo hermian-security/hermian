@@ -1,5 +1,5 @@
 #!/bin/sh
-# HERMIAN false-positive workload: run one environment and assert ZERO
+# Hermian false-positive workload: run one environment and assert ZERO
 # HIGH/CRITICAL alerts were raised while it ran.
 #
 # Usage: run_false_positive.sh <environment> <duration-seconds>

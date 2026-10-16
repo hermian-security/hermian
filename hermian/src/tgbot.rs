@@ -3,7 +3,7 @@
 //! Alerts that offer responses get an inline keyboard. Each button carries a
 //! random one-time id that points at an action kept here, in memory, until
 //! it expires. Button presses are fetched by long-polling `getUpdates`
-//! (outbound only, so HERMIAN still listens on no port, and it keeps working
+//! (outbound only, so Hermian still listens on no port, and it keeps working
 //! during isolation since Telegram stays reachable). A press is only acted
 //! on if it comes from the configured chat *and* from one of
 //! `allowed_user_ids`; anything else is refused and logged.
@@ -309,7 +309,7 @@ fn poll_loop(
             }
             Err(e) => {
                 let hint = if e.starts_with("HTTP 409") {
-                    " (a webhook is set on this bot; HERMIAN needs getUpdates: call deleteWebhook)"
+                    " (a webhook is set on this bot; Hermian needs getUpdates: call deleteWebhook)"
                 } else {
                     ""
                 };

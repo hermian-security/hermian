@@ -1,5 +1,5 @@
 #!/bin/sh
-# HERMIAN attack simulation: run ONE scenario and assert the expected alert
+# Hermian attack simulation: run ONE scenario and assert the expected alert
 # appears at HIGH or CRITICAL.
 #
 # Usage: run_attack.sh <scenario> <title-pattern>
@@ -72,7 +72,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Scenarios are unattended by design: run detached from this shell's TTY and
-# session so HERMIAN's session attribution treats them as automated.
+# session so Hermian's session attribution treats them as automated.
 DETACHED_PID=""
 detached() {
     setsid sh -c "$1" </dev/null >/dev/null 2>&1 &

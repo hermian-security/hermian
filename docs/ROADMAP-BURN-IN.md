@@ -1,4 +1,4 @@
-# HERMIAN v0.1.0-beta - Production burn-in roadmap
+# Hermian v0.1.0-beta - Production burn-in roadmap
 
 This is the plan for taking the beta from "one host, one afternoon" to
 "defensible production readiness". It follows PROJECT.md sections 11, 20

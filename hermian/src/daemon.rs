@@ -167,11 +167,11 @@ async fn async_main(
             self_alert(
             &mut engine,
             Severity::Critical,
-            "HERMIAN binary modified",
-            "The running HERMIAN binary does not match the hash recorded at install time.",
+            "Hermian binary modified",
+            "The running Hermian binary does not match the hash recorded at install time.",
             "The security daemon itself may have been replaced or patched. Nothing it reports can be trusted until this is resolved.",
             &[
-                "Reinstall HERMIAN from a signed package or verified tarball.",
+                "Reinstall Hermian from a signed package or verified tarball.",
                 "Compare the binary hash with the release checksum.",
                 "Treat the host as potentially compromised.",
             ],
@@ -186,7 +186,7 @@ async fn async_main(
             self_alert(
                 &mut engine,
                 Severity::Critical,
-                "HERMIAN configuration modified while stopped",
+                "Hermian configuration modified while stopped",
                 "The configuration file changed while the daemon was not running.",
                 "Configuration changes can disable detections, widen allowlists or redirect alerts.",
                 &[
@@ -212,7 +212,7 @@ async fn async_main(
             self_alert(
                 &mut engine,
                 Severity::High,
-                "HERMIAN integrity record missing",
+                "Hermian integrity record missing",
                 &format!(
                     "The stored hash for the {} was missing at startup, so it couldn't be checked. The current value has been recorded.",
                     missing.join(" and ")
@@ -238,13 +238,13 @@ async fn async_main(
             self_alert(
                 &mut engine,
                 Severity::High,
-                "HERMIAN restarted after an unclean shutdown",
+                "Hermian restarted after an unclean shutdown",
                 &format!(
                     "The previous run ({}) did not stop through systemd. {}. Activity between its last heartbeat and this start was not monitored.",
                     prev.trim(),
                     cause
                 ),
-                "A clean stop sends a 'HERMIAN is stopping' notice; a crash or kill cannot. Killing the security daemon is a cheap way to get an unmonitored window, so leftovers are reported rather than silently overwritten.",
+                "A clean stop sends a 'Hermian is stopping' notice; a crash or kill cannot. Killing the security daemon is a cheap way to get an unmonitored window, so leftovers are reported rather than silently overwritten.",
                 &[
                     "Check what happened right before: journalctl -u hermian -n 100.",
                     "If this wasn't the watchdog reacting to a hang, treat it as suspicious.",
@@ -391,9 +391,9 @@ async fn async_main(
             self_alert(
                 &mut engine,
                 Severity::Info,
-                "HERMIAN is active",
-                "This is the one-time confirmation sent when HERMIAN starts for the first time on this host.",
-                "It proves the alert path works end to end. You will not hear from HERMIAN again unless something needs your attention.",
+                "Hermian is active",
+                "This is the one-time confirmation sent when Hermian starts for the first time on this host.",
+                "It proves the alert path works end to end. You will not hear from Hermian again unless something needs your attention.",
                 &["Run 'hermian status' at any time to confirm coverage."],
                 &[],
                 "selftest|install",
@@ -415,7 +415,7 @@ async fn async_main(
     let _ = heartbeat::touch(&paths::heartbeat_file());
     log_daemon(
         Severity::Info,
-        &format!("HERMIAN {} started", hermian_core::VERSION),
+        &format!("Hermian {} started", hermian_core::VERSION),
     );
 
     loop {
@@ -572,7 +572,7 @@ fn report_dropped_events(
             self_alert(
                 engine,
                 Severity::High,
-                "HERMIAN dropped telemetry",
+                "Hermian dropped telemetry",
                 &format!(
                     "{} {} lost in the last interval ({} since start). Activity in that window may not have been seen.",
                     recent, source, total
@@ -740,7 +740,7 @@ fn check_compat_exec(
             Severity::Low,
             "32-bit program started (partly unmonitored)",
             &format!(
-                "{} (pid {}) is a 32-bit program. Its network connections and ptrace calls aren't visible to HERMIAN's eBPF hooks.",
+                "{} (pid {}) is a 32-bit program. Its network connections and ptrace calls aren't visible to Hermian's eBPF hooks.",
                 e.exe, e.pid
             ),
             "32-bit programs make compat syscalls that the syscall tracepoints skip. Legitimate ones are rare on a 64-bit server, and attackers use them to get around syscall monitoring.",
@@ -763,9 +763,9 @@ fn report_unmonitored_cpus(engine: &mut Engine, notifier: &notify::Notifier, cpu
             engine,
             Severity::High,
             "CPUs came online without eBPF monitoring",
-            &format!("CPU(s) {} came online after HERMIAN started and have no event reader.", list),
+            &format!("CPU(s) {} came online after Hermian started and have no event reader.", list),
             "Exec, connect and ptrace events on those CPUs are neither delivered nor counted as lost until the daemon restarts.",
-            &["Restart HERMIAN: systemctl restart hermian"],
+            &["Restart Hermian: systemctl restart hermian"],
             &[("CPUs", list.as_str())],
             &format!("selfprotect|hotplug|{}", list),
         ),
@@ -779,7 +779,7 @@ async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal:
     let alert = self_alert(
         engine,
         Severity::High,
-        "HERMIAN is stopping",
+        "Hermian is stopping",
         &format!("The daemon received {} and is shutting down. Nothing is monitored until it starts again.", signal),
         "Package upgrades and planned maintenance stop the daemon briefly. An unexplained stop means monitoring was switched off, which is often the first thing an intruder does.",
         &[
@@ -974,7 +974,7 @@ fn reload_config(
                 self_alert(
                     engine,
                     Severity::Critical,
-                    "HERMIAN configuration unreadable",
+                    "Hermian configuration unreadable",
                     &format!("The configuration file could not be read: {}.", e),
                     "A missing or unreadable config is either an accident or an attempt to disrupt monitoring. The previous configuration remains active.",
                     &["Check permissions and ownership of /etc/hermian/config.toml.", "Restore it from backup if it was removed."],
@@ -1007,11 +1007,11 @@ fn reload_config(
                     Severity::Info
                 },
                 if !functional {
-                    "HERMIAN configuration reloaded with no functional change"
+                    "Hermian configuration reloaded with no functional change"
                 } else if diff.destinations_changed {
-                    "HERMIAN alert destinations changed and reloaded"
+                    "Hermian alert destinations changed and reloaded"
                 } else {
-                    "HERMIAN configuration changed and reloaded"
+                    "Hermian configuration changed and reloaded"
                 },
                 "The configuration file changed while the daemon was running. It validated and has been applied.",
                 "Changing a security daemon's configuration at runtime is how an attacker blinds a host. If this was you, no action is needed.",
@@ -1039,7 +1039,7 @@ fn reload_config(
                 self_alert(
                     engine,
                     Severity::Low,
-                    "HERMIAN configuration changed but is INVALID",
+                    "Hermian configuration changed but is INVALID",
                     &format!("The configuration file changed but failed validation: {}. The previous configuration remains active.", e),
                     "Usually a typo while editing. The daemon keeps the last good configuration.",
                     &["Fix /etc/hermian/config.toml.", "Reload with 'systemctl reload hermian' (SIGHUP)."],

@@ -241,7 +241,7 @@ pub struct EmailCfg {
     pub transport: String,
     pub from: String,
     pub to: Vec<String>,
-    /// Prefix for the subject line, e.g. "[HERMIAN]".
+    /// Prefix for the subject line, e.g. "[Hermian]".
     pub subject_prefix: String,
     // --- smtp transport ---
     pub smtp_host: String,
@@ -261,7 +261,7 @@ impl Default for EmailCfg {
             transport: "smtp".to_string(),
             from: String::new(),
             to: Vec::new(),
-            subject_prefix: "[HERMIAN]".to_string(),
+            subject_prefix: "[Hermian]".to_string(),
             smtp_host: String::new(),
             smtp_port: 587,
             smtp_security: "starttls".to_string(),
@@ -486,7 +486,7 @@ impl Config {
     }
 }
 
-pub const DEFAULT_CONFIG_TOML: &str = r#"# HERMIAN configuration
+pub const DEFAULT_CONFIG_TOML: &str = r#"# Hermian configuration
 #
 # This file is monitored while the daemon runs. A real change that validates
 # reloads and pages CRITICAL. Invalid TOML stays on the last good config and
@@ -549,7 +549,7 @@ action_ttl_mins = 30           # buttons expire after this
 transport = "smtp"             # smtp | sendmail (use the host's MTA)
 from = ""                      # e.g. "hermian@example.com"
 to = []                        # e.g. ["ops@example.com"]
-subject_prefix = "[HERMIAN]"
+subject_prefix = "[Hermian]"
 smtp_host = ""                 # e.g. "smtp.gmail.com" (use an app password)
 smtp_port = 587
 smtp_security = "starttls"     # starttls (587) | tls (465) | none (25, local relay)

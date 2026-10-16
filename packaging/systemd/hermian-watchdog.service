@@ -1,5 +1,5 @@
 [Unit]
-Description=HERMIAN dead-man switch
+Description=Hermian dead-man switch
 Documentation=https://github.com/hermian-security/hermian
 After=hermian.service
 # One-shot check: an alert and a restart attempt, or silence.

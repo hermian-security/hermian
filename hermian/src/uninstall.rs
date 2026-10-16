@@ -14,7 +14,7 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     let st = Style::detect();
 
     if !args.yes {
-        print!("Remove HERMIAN completely (daemon, unit, config, alerts, logs, binary)? [y/N] ");
+        print!("Remove Hermian completely (daemon, unit, config, alerts, logs, binary)? [y/N] ");
         std::io::stdout().flush()?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
@@ -54,7 +54,7 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         let p = std::path::Path::new(&path);
         if !safe_to_remove(p) {
             eprintln!(
-                "hermian: not removing {} (doesn't look like a HERMIAN path)",
+                "hermian: not removing {} (doesn't look like a Hermian path)",
                 p.display()
             );
             continue;
@@ -84,7 +84,7 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         let _ = fs::remove_file(exe);
     }
 
-    println!("{}", st.ok("HERMIAN removed."));
+    println!("{}", st.ok("Hermian removed."));
     println!(
         "  {}",
         st.dim("No unit, state, logs, PAM hook, or privileged process remains.")

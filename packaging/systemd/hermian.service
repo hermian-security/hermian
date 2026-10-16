@@ -1,5 +1,5 @@
 [Unit]
-Description=HERMIAN defensive security daemon
+Description=Hermian defensive security daemon
 Documentation=https://github.com/hermian-security/hermian
 After=network-online.target local-fs.target
 Wants=network-online.target

@@ -124,7 +124,7 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
             .chain(ctx.chain_nodes(ev.pid))
             .fact("Destination", &dest)
             .why(
-                "HERMIAN learned which programs use the network during the baseline period. A new \
+                "Hermian learned which programs use the network during the baseline period. A new \
                  network-using program is worth a glance, though not on its own evidence of \
                  compromise.",
             )

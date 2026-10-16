@@ -108,7 +108,7 @@ fn respond(cfg: &NotificationsCfg, age: Option<Duration>, verdict: Verdict) -> R
     let (severity, title, what) = match &verdict {
         Verdict::Wedged { age: Some(d) } => (
             Severity::High,
-            "HERMIAN daemon is not responding",
+            "Hermian daemon is not responding",
             format!(
                 "The daemon's heartbeat has not updated for {}. The process is still running but no longer doing its job.",
                 duration_text(*d)
@@ -116,12 +116,12 @@ fn respond(cfg: &NotificationsCfg, age: Option<Duration>, verdict: Verdict) -> R
         ),
         Verdict::Wedged { age: None } => (
             Severity::High,
-            "HERMIAN daemon is not responding",
+            "Hermian daemon is not responding",
             "The unit is running but no heartbeat has ever been written: the daemon isn't reaching its event loop (or can't write to the run directory).".to_string(),
         ),
         _ => (
             Severity::Critical,
-            "HERMIAN daemon is down",
+            "Hermian daemon is down",
             format!(
                 "systemd reports the unit as failed after {} restart(s); the daemon is not running and nothing is monitored.",
                 restarts

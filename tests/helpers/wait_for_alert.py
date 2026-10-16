@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify fresh attack evidence from HERMIAN's JSON alert store, never text logs."""
+"""Verify fresh attack evidence from Hermian's JSON alert store, never text logs."""
 
 import argparse
 from datetime import datetime, timezone

@@ -418,7 +418,7 @@ impl ChannelQueue {
             syslog_msg(
                 Severity::Critical,
                 &format!(
-                    "HERMIAN CRITICAL: {} alert delivery has been failing for more than 15 minutes \
+                    "Hermian CRITICAL: {} alert delivery has been failing for more than 15 minutes \
                      ({} queued, last error: {})",
                     self.name,
                     self.queue.len(),
@@ -729,7 +729,7 @@ pub mod webhook {
                     text.push_str(&format!("\n*Next:* {}", a));
                 }
                 json!({
-                    "text": format!("HERMIAN {}", title),
+                    "text": format!("Hermian {}", title),
                     "attachments": [{
                         "color": slack_colour(alert.severity),
                         "title": title,
@@ -759,7 +759,7 @@ pub mod webhook {
                     }
                 }
                 json!({
-                    "username": "HERMIAN",
+                    "username": "Hermian",
                     "embeds": [{
                         "title": title,
                         "description": description,
@@ -771,7 +771,7 @@ pub mod webhook {
                 })
             }
             "ntfy" => json!({
-                "title": format!("HERMIAN {} on {}", alert.severity.as_str(), alert.host),
+                "title": format!("Hermian {} on {}", alert.severity.as_str(), alert.host),
                 "message": compact,
                 "priority": match alert.severity {
                     Severity::Critical => 5,

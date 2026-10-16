@@ -1,4 +1,4 @@
-# HERMIAN build and packaging
+# Hermian build and packaging
 #
 # The eBPF object is built automatically by hermian/build.rs; nothing here
 # needs to invoke the bpfel-unknown-none target directly.

@@ -1,5 +1,5 @@
 //! `pam_hermian.so` - a passive PAM module that reports authentication
-//! outcomes to the HERMIAN daemon over a local datagram socket.
+//! outcomes to the Hermian daemon over a local datagram socket.
 //!
 //! It never influences the authentication decision (always returns
 //! `PAM_IGNORE`), never reads credentials, and fails silently when the daemon

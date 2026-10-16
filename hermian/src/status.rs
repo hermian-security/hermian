@@ -151,7 +151,7 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
         st.ok("PROTECTED")
     };
     out.push_str(&st.banner(
-        &format!("HERMIAN {}", state.version),
+        &format!("Hermian {}", state.version),
         &format!("{} \u{00B7} up {}", state.host, humanize_secs(uptime)),
     ));
     out.push('\n');
@@ -379,7 +379,7 @@ pub fn cmd_status(json: bool) -> Result<()> {
         println!(
             "{}",
             st.banner(
-                &format!("HERMIAN {}", hermian_core::VERSION),
+                &format!("Hermian {}", hermian_core::VERSION),
                 &st.warn("NEEDS ROOT")
             )
         );
@@ -402,7 +402,7 @@ pub fn cmd_status(json: bool) -> Result<()> {
             if stale && !pid_alive(state.pid) {
                 println!(
                     "{}",
-                    st.banner(&format!("HERMIAN {}", state.version), &st.bad("INACTIVE"))
+                    st.banner(&format!("Hermian {}", state.version), &st.bad("INACTIVE"))
                 );
                 println!("{}", st.rule());
                 println!("  The daemon is not running. Start it with:\n\n    sudo systemctl start hermian\n");
@@ -410,7 +410,7 @@ pub fn cmd_status(json: bool) -> Result<()> {
             } else if stale {
                 println!(
                     "{}",
-                    st.banner(&format!("HERMIAN {}", state.version), &st.warn("STARTING"))
+                    st.banner(&format!("Hermian {}", state.version), &st.warn("STARTING"))
                 );
                 println!("{}", st.rule());
                 println!("  Run 'hermian status' again in a moment.");
@@ -422,7 +422,7 @@ pub fn cmd_status(json: bool) -> Result<()> {
             println!(
                 "{}",
                 st.banner(
-                    &format!("HERMIAN {}", hermian_core::VERSION),
+                    &format!("Hermian {}", hermian_core::VERSION),
                     &st.bad("NOT INSTALLED")
                 )
             );

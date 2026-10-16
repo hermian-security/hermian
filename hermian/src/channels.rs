@@ -43,14 +43,9 @@ pub mod telegram {
             .replace('>', "&gt;")
     }
 
-    /// A four-cell severity meter (filled cells count up with severity).
+    /// The severity meter, shared with the CLI.
     pub(super) fn meter(s: Severity) -> &'static str {
-        match s {
-            Severity::Critical => "\u{25A0}\u{25A0}\u{25A0}\u{25A0}", // â– â– â– â–
-            Severity::High => "\u{25A0}\u{25A0}\u{25A0}\u{25A1}",     // â– â– â– â–¡
-            Severity::Low => "\u{25A0}\u{25A0}\u{25A1}\u{25A1}",      // â– â– â–¡â–¡
-            Severity::Info => "\u{25A0}\u{25A1}\u{25A1}\u{25A1}",     // â– â–¡â–¡â–¡
-        }
+        hermian_core::alert::severity_meter(s)
     }
 
     /// Cut `s` to at most `max` chars, marking the cut. Applied before
@@ -67,7 +62,7 @@ pub mod telegram {
     /// Build the HTML message body:
     ///
     /// ```text
-    /// ■■■■ CRITICAL · web-01                 <- meter, level, host (tap to copy)
+    /// ◉◉◉◉ CRITICAL · web-01                 <- meter, level, host (tap to copy)
     /// Web server chain ran downloaded code   <- headline
     /// ┃ nginx started a shell that ...       <- what happened, as a quote card
     /// hermian · D1 · 03:14 UTC               <- quiet context
@@ -455,7 +450,7 @@ pub mod email {
     }
 
     pub(super) fn build(alert: &Alert, cfg: &EmailCfg) -> Result<Message, String> {
-        let from: Mailbox = format!("HERMIAN <{}>", cfg.from)
+        let from: Mailbox = format!("Hermian <{}>", cfg.from)
             .parse()
             .map_err(|e| format!("bad from address: {}", e))?;
         let mut b = Message::builder()
@@ -653,7 +648,7 @@ mod tests {
         assert!(!b.chars().any(|c| c as u32 >= 0x1F000), "{}", b);
         assert!(
             b.starts_with(
-                "<b>\u{25A0}\u{25A0}\u{25A0}\u{25A0} CRITICAL</b> \u{00B7} <code>web-01</code>"
+                "<b>\u{25C9}\u{25C9}\u{25C9}\u{25C9} CRITICAL</b> \u{00B7} <code>web-01</code>"
             ),
             "{}",
             b
@@ -675,7 +670,7 @@ mod tests {
         a.repeats = 3;
         let b = telegram::body(&a);
         let order = [
-            "<b>\u{25A0}\u{25A0}\u{25A0}\u{25A0} CRITICAL</b> \u{00B7} <code>web-01</code> \u{00B7} seen 3 times\n",
+            "<b>\u{25C9}\u{25C9}\u{25C9}\u{25C9} CRITICAL</b> \u{00B7} <code>web-01</code> \u{00B7} seen 3 times\n",
             "<b>ld.so.preload &lt;modified&gt;</b>",
             "<blockquote>A &amp; B</blockquote>",
             "<i>hermian \u{00B7} D3 \u{00B7} ",
@@ -697,19 +692,19 @@ mod tests {
     fn meters_count_up_with_severity() {
         assert_eq!(
             telegram::meter(Severity::Critical),
-            "\u{25A0}\u{25A0}\u{25A0}\u{25A0}"
+            "\u{25C9}\u{25C9}\u{25C9}\u{25C9}"
         );
         assert_eq!(
             telegram::meter(Severity::High),
-            "\u{25A0}\u{25A0}\u{25A0}\u{25A1}"
+            "\u{25C9}\u{25C9}\u{25C9}\u{25CB}"
         );
         assert_eq!(
             telegram::meter(Severity::Low),
-            "\u{25A0}\u{25A0}\u{25A1}\u{25A1}"
+            "\u{25C9}\u{25C9}\u{25CB}\u{25CB}"
         );
         assert_eq!(
             telegram::meter(Severity::Info),
-            "\u{25A0}\u{25A1}\u{25A1}\u{25A1}"
+            "\u{25C9}\u{25CB}\u{25CB}\u{25CB}"
         );
     }
 
@@ -793,10 +788,10 @@ mod tests {
     fn email_subject_and_html() {
         let a = alert();
         assert_eq!(
-            email::subject(&a, "[HERMIAN]"),
-            "[HERMIAN] CRITICAL D3 | web-01 | ld.so.preload <modified>"
+            email::subject(&a, "[Hermian]"),
+            "[Hermian] CRITICAL D3 | web-01 | ld.so.preload <modified>"
         );
-        assert!(email::subject(&a, "[HERMIAN]").is_ascii());
+        assert!(email::subject(&a, "[Hermian]").is_ascii());
         let h = email::html(&a);
         assert!(h.contains("&lt;modified&gt;"));
         assert!(h.contains("hermian show HER-2025-0101-007"));

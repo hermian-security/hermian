@@ -8,8 +8,8 @@ use crate::ui::Style;
 #[command(
     name = "hermian",
     version,
-    about = "HERMIAN - silent by default, loud when it matters.",
-    long_about = "HERMIAN is a lightweight defensive security daemon for Linux. It detects \
+    about = "Hermian - silent by default, loud when it matters.",
+    long_about = "Hermian is a lightweight defensive security daemon for Linux. It detects \
                   high-confidence signs of compromise with deterministic, contextual rules and \
                   only interrupts you when something genuinely requires attention.",
     after_help = "Environment:\n  NO_COLOR=1 / HERMIAN_COLOR=always|never   control terminal colour\n\nDocs: https://hermian.me  \u{00B7}  https://github.com/hermian-security/hermian\nSecurity contact: contact@hermian.me"
@@ -43,7 +43,7 @@ pub enum Cmd {
     Blocked,
     /// Lift a block before it expires
     Unblock(UnblockArgs),
-    /// Completely remove HERMIAN from this host
+    /// Completely remove Hermian from this host
     Uninstall(UninstallArgs),
     /// Run the daemon (used by the systemd unit)
     #[command(hide = true)]
@@ -173,7 +173,7 @@ pub fn cmd_test(args: &TestArgs) -> Result<()> {
     println!(
         "{}",
         st.banner(
-            "HERMIAN detection self-test",
+            "Hermian detection self-test",
             &format!("{} scenarios", results.len())
         )
     );
@@ -266,7 +266,7 @@ pub fn cmd_notify_test(args: &NotifyTestArgs) -> Result<()> {
         channels.retain(|c| c == only);
     }
     if channels.is_empty() {
-        println!("{}", st.banner("HERMIAN notification test", ""));
+        println!("{}", st.banner("Hermian notification test", ""));
         println!("{}", st.rule());
         println!("  {}", st.warn("No notifying channel is enabled."));
         println!("  Add \"telegram\", \"email\" or \"webhook\" to notifications.channels in");
@@ -277,7 +277,7 @@ pub fn cmd_notify_test(args: &NotifyTestArgs) -> Result<()> {
     println!(
         "{}",
         st.banner(
-            "HERMIAN notification test",
+            "Hermian notification test",
             &format!("{} channel(s)", channels.len())
         )
     );

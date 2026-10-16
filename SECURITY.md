@@ -1,6 +1,6 @@
 # Security
 
-HERMIAN runs as root. If you find a security issue, please report it privately
+Hermian runs as root. If you find a security issue, please report it privately
 before opening a public issue.
 
 ## Report a vulnerability

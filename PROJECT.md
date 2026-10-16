@@ -1,6 +1,6 @@
 # Project notes
 
-HERMIAN is a Linux host monitor for a VPS, homelab, or small fleet. The aim is a
+Hermian is a Linux host monitor for a VPS, homelab, or small fleet. The aim is a
 short set of useful alerts without a separate server to manage. It's still beta,
 not a full EDR or a guarantee that a quiet host is clean.
 
@@ -105,7 +105,7 @@ exception. See the examples in `/etc/hermian/config.toml`.
 | SSH auth | journald (root `sshd` entries only) when running, else `auth.log` / `secure`; PAM telemetry is optional |
 
 eBPF needs kernel 5.8+ and the required permissions. If it can't load, execution
-falls back to one-second `/proc` polling and audit when available. HERMIAN leaves
+falls back to one-second `/proc` polling and audit when available. Hermian leaves
 an existing auditd alone. Short-lived processes can be missed by polling.
 
 The exec hooks check up to 64 environment entries for `LD_PRELOAD` or

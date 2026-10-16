@@ -426,12 +426,14 @@ fn palette(theme: Theme, severity: Severity) -> Palette {
     }
 }
 
-fn severity_glyph(s: Severity) -> &'static str {
+/// A four-step severity meter: lit dots count up with severity, echoing the
+/// logo's dot. Shared by the CLI, Telegram and email.
+pub fn severity_meter(s: Severity) -> &'static str {
     match s {
-        Severity::Critical => "\u{25A0}\u{25A0}\u{25A0}\u{25A0}", // ■■■■
-        Severity::High => "\u{25A0}\u{25A0}\u{25A0}\u{25A1}",     // ■■■□
-        Severity::Low => "\u{25A0}\u{25A0}\u{25A1}\u{25A1}",      // ■■□□
-        Severity::Info => "\u{25A0}\u{25A1}\u{25A1}\u{25A1}",     // ■□□□
+        Severity::Critical => "\u{25C9}\u{25C9}\u{25C9}\u{25C9}", // ◉◉◉◉
+        Severity::High => "\u{25C9}\u{25C9}\u{25C9}\u{25CB}",     // ◉◉◉○
+        Severity::Low => "\u{25C9}\u{25C9}\u{25CB}\u{25CB}",      // ◉◉○○
+        Severity::Info => "\u{25C9}\u{25CB}\u{25CB}\u{25CB}",     // ◉○○○
     }
 }
 
@@ -578,8 +580,8 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
     let heavy = rule('\u{2501}', WIDTH);
     let light = rule('\u{2500}', WIDTH);
     let left = format!(
-        "{} HERMIAN  {}",
-        severity_glyph(alert.severity),
+        "{} Hermian  {}",
+        severity_meter(alert.severity),
         alert.severity.as_str()
     );
     let right = alert.ref_id.clone();
@@ -702,8 +704,8 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
 fn render_compact(alert: &Alert) -> String {
     let mut out = String::with_capacity(512);
     out.push_str(&format!(
-        "{} HERMIAN {} \u{00B7} {} \u{00B7} {}\n",
-        severity_glyph(alert.severity),
+        "{} Hermian {} \u{00B7} {} \u{00B7} {}\n",
+        severity_meter(alert.severity),
         alert.severity.as_str(),
         alert.host,
         alert.ts.format("%Y-%m-%d %H:%M UTC")
@@ -818,7 +820,7 @@ mod tests {
     #[test]
     fn plain_render_has_sections_and_no_ansi() {
         let r = render(&sample_alert(), Theme::Plain);
-        assert!(r.contains("HERMIAN  CRITICAL"));
+        assert!(r.contains("Hermian  CRITICAL"));
         assert!(r.contains("HER-2025-0914-001"));
         assert!(r.contains("WHAT HAPPENED"));
         assert!(r.contains("WHY THIS MATTERS"));
