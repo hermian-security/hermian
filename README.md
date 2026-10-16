@@ -247,10 +247,14 @@ sudo hermian alerts -s high          # only HIGH and CRITICAL
 sudo hermian show 1                  # today's alert 001
 sudo hermian collect HER-2026-0921-001
 sudo hermian test                    # synthetic engine checks, not live coverage
+sudo hermian report                  # a week's summary to share, nothing private
 ```
 
-`status`, `alerts`, `show`, and `test` take `--json` for scripts. `collect`
-gathers local context for an alert and never uploads anything.
+`status`, `alerts`, `show`, `test`, and `report` take `--json` for scripts.
+`collect` gathers local context for an alert and never uploads anything.
+`report` counts alerts by rule and severity with versions and coverage, and
+leaves out host names, addresses, users, paths and commands: if you're
+testing the beta, that's the thing to send.
 
 For the first 24 hours Hermian learns your normal SSH sources and network
 activity. After that, a source or destination counts as new the first time it

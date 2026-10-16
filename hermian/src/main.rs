@@ -20,6 +20,7 @@ mod notify;
 mod pamsock;
 mod paths;
 mod procsrc;
+mod report;
 mod retention;
 mod selfprotect;
 mod sessions;
@@ -40,6 +41,7 @@ fn main() {
         cli::Cmd::Enable(args) => enable::run(&args),
         cli::Cmd::Status(args) => status::cmd_status(args.json),
         cli::Cmd::Alerts(args) => alerts::cmd_alerts(&args),
+        cli::Cmd::Report(args) => report::cmd_report(&args),
         cli::Cmd::Show(args) => alerts::cmd_show(&args),
         cli::Cmd::Test(args) => cli::cmd_test(&args),
         cli::Cmd::NotifyTest(args) => cli::cmd_notify_test(&args),

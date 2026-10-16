@@ -28,6 +28,15 @@ for hidden SSH key files.
 
 ### Added
 
+- `hermian report`: a summary to send the maintainers during the beta.
+  Version, OS, kernel, coverage, how long it's been installed, alert counts
+  by severity and by rule over the last 7 days (`--days`), delivery health
+  and overhead, under the identity banner. Nothing private: no host name,
+  addresses, users, paths or commands (titles that would name one are
+  withheld). `--json` for the same data as JSON.
+
+### Added
+
 - Hidden SSH key sources are caught. Hermian audits sshd's effective
   configuration (`sshd -T`) at start and every ten minutes, and pages once
   when `AuthorizedKeysFile`, `AuthorizedKeysCommand`, the principals

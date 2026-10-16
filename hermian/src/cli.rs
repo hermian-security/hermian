@@ -35,6 +35,8 @@ pub enum Cmd {
     NotifyTest(NotifyTestArgs),
     /// Collect a forensic context bundle for an alert
     Collect(CollectArgs),
+    /// Summary to share with the maintainers: versions and counts, nothing private
+    Report(ReportArgs),
     /// Isolate the host from the network (management CIDRs stay reachable)
     Isolate(IsolateArgs),
     /// Remove network isolation
@@ -51,6 +53,16 @@ pub enum Cmd {
     /// Dead-man switch (used by the hermian-watchdog systemd timer)
     #[command(hide = true)]
     Watchdog,
+}
+
+#[derive(clap::Args)]
+pub struct ReportArgs {
+    /// How many days of alerts to count
+    #[arg(long, default_value_t = 7)]
+    pub days: u32,
+    /// Emit JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args)]
