@@ -47,7 +47,7 @@ cleanup() {
             rm -f /tmp/.x.sh
             ;;
         ssh-key-injection)
-            sed -i '/HERMIANATTACKSIM/d' /root/.ssh/authorized_keys 2>/dev/null || true
+            ! grep -q 'HERMIANATTACKSIM' /root/.ssh/authorized_keys 2>/dev/null || sed -i '/HERMIANATTACKSIM/d' /root/.ssh/authorized_keys || true
             ;;
         cron-persistence)
             rm -f /etc/cron.d/hermian-test-backdoor
@@ -57,7 +57,7 @@ cleanup() {
             systemctl daemon-reload >/dev/null 2>&1 || true
             ;;
         ld-preload)
-            sed -i '/hermian-libevil/d' /etc/ld.so.preload 2>/dev/null || true
+            ! grep -q 'hermian-libevil' /etc/ld.so.preload 2>/dev/null || sed -i '/hermian-libevil/d' /etc/ld.so.preload || true
             if [ "$PRELOAD_EXISTED" -eq 0 ] && [ ! -s /etc/ld.so.preload ]; then
                 rm -f /etc/ld.so.preload
             fi

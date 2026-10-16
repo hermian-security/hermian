@@ -17,9 +17,12 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$DIR/../helpers/disposable_host.sh"
 require_disposable_host
 
+# Cleanups only rewrite a file that still holds the marker: `sed -i` swaps
+# in a new file even when nothing matches, and an unattended swap of
+# /root/.bashrc is exactly what D3 reports (it failed the web run once).
 cleanup() {
     rm -f /etc/cron.d/hermian-fp-test /tmp/hermian-fp-installer.sh
-    sed -i '/HERMIAN_FP/d' /root/.bashrc 2>/dev/null || true
+    ! grep -q 'HERMIAN_FP' /root/.bashrc 2>/dev/null || sed -i '/HERMIAN_FP/d' /root/.bashrc || true
     [ -n "${NGINX_PID:-}" ] && kill "$NGINX_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -48,7 +51,8 @@ case "$ENV" in
         ;;
     web)
         NGINX_PID=""
-        if command -v nginx >/dev/null 2>&1; then
+        # Reuse a web server that's already up (a second nginx can't bind).
+        if command -v nginx >/dev/null 2>&1 && ! curl -s -o /dev/null http://127.0.0.1/; then
             nginx -g 'daemon off;' &
             NGINX_PID=$!
         fi

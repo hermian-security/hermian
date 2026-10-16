@@ -59,8 +59,8 @@ cleanup() {
     rm -f /etc/systemd/system/hermian-test.service
     rm -f /tmp/.hermian-test-suid /tmp/.x.sh
     systemctl daemon-reload >/dev/null 2>&1 || true
-    sed -i '/hermian-libevil/d' /etc/ld.so.preload 2>/dev/null || true
-    sed -i '/HERMIANATTACKSIM/d' /root/.ssh/authorized_keys 2>/dev/null || true
+    ! grep -q 'hermian-libevil' /etc/ld.so.preload 2>/dev/null || sed -i '/hermian-libevil/d' /etc/ld.so.preload || true
+    ! grep -q 'HERMIANATTACKSIM' /root/.ssh/authorized_keys 2>/dev/null || sed -i '/HERMIANATTACKSIM/d' /root/.ssh/authorized_keys || true
 }
 trap cleanup EXIT
 trap 'exit 130' INT
