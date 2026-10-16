@@ -552,7 +552,7 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     .why(
         "Cron jobs survive reboots and re-run attacker code on a schedule. Legitimate cron \
          changes come from operators, package installs or configuration management, all of \
-         which HERMIAN recognises; this one matched none of them.",
+         which Hermian recognises; this one matched none of them.",
     )
     .actions([
         "Inspect the new entry and the command it runs.",

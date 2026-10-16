@@ -2,7 +2,7 @@
 """Execute a payload from an anonymous memfd (fileless exec).
 
 Simulates the 'fileless exec via memfd_create + execveat/fexecve' technique.
-HERMIAN D1 should fire HIGH (execution from memory / deleted inode).
+Hermian D1 should fire HIGH (execution from memory / deleted inode).
 
 The fd must NOT be MFD_CLOEXEC: the kernel needs it open across the exec so
 `/proc/self/fd/N` resolves. A static-ish payload (`/bin/sleep`) is copied in

@@ -77,7 +77,7 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
     }
 
     if alerts.is_empty() {
-        println!("{}", st.banner("HERMIAN alerts", ""));
+        println!("{}", st.banner("Hermian alerts", ""));
         println!("{}", st.rule());
         println!("  {}", st.dim("No alerts recorded."));
         return Ok(());
@@ -86,7 +86,7 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
     println!(
         "{}",
         st.banner(
-            "HERMIAN alerts",
+            "Hermian alerts",
             &format!(
                 "{} shown{}",
                 alerts.len(),

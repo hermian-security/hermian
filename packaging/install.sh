@@ -1,5 +1,5 @@
 #!/bin/sh
-# HERMIAN installer, served from the release it installs and shipped inside
+# Hermian installer, served from the release it installs and shipped inside
 # its tarball. Everything runs from main(), so a truncated download can't
 # half-run.
 #

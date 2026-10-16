@@ -83,6 +83,9 @@ fn render_watchdog_units(exec_path: &str) -> (String, String) {
 pub fn run(args: &EnableArgs) -> Result<()> {
     config::require_root()?;
     let st = Style::detect();
+    if !args.quiet {
+        println!("\n{}\n", st.brand(hermian_core::VERSION));
+    }
     let cfg = config::load_config()?;
 
     for dir in [paths::state_dir(), paths::log_dir(), paths::run_dir()] {
@@ -175,7 +178,7 @@ pub fn run(args: &EnableArgs) -> Result<()> {
 
     wait_for_startup()?;
     if !args.quiet {
-        println!("{}", st.ok("HERMIAN enabled."));
+        println!("{}", st.ok("Hermian enabled."));
         println!();
         status::cmd_status(false)?;
     }
@@ -264,7 +267,7 @@ fn enable_pam_module() -> Result<()> {
     Ok(())
 }
 
-/// Whether `/etc/pam.d/sshd` already loads the HERMIAN module.
+/// Whether `/etc/pam.d/sshd` already loads the Hermian module.
 pub fn pam_hook_configured() -> bool {
     fs::read_to_string("/etc/pam.d/sshd")
         .map(|c| {
@@ -274,7 +277,7 @@ pub fn pam_hook_configured() -> bool {
         .unwrap_or(false)
 }
 
-/// `content` with HERMIAN's PAM lines, or `None` if nothing needs to change.
+/// `content` with Hermian's PAM lines, or `None` if nothing needs to change.
 ///
 /// The module is referenced by absolute path. A bare `pam_hermian.so` is
 /// looked up in libpam's own directory, which is `/lib/<triplet>/security`

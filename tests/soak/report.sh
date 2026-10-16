@@ -17,7 +17,7 @@ rss = [r["status"].get("rss_mb", 0) for r in rows if r.get("status")]
 def pct(v, p):
     if not v: return 0
     v = sorted(v); return v[min(len(v) - 1, int(round(p * (len(v) - 1))))]
-print("HERMIAN soak report")
+print("Hermian soak report")
 print("-" * 72)
 print("since       %s  (%.1f h, %d snapshots)" % (last["since"], hours, len(rows)))
 c = last["counts"]

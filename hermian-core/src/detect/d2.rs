@@ -169,7 +169,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
                     .why(
-                        "HERMIAN records every source it sees log in. A first-time source isn't \
+                        "Hermian records every source it sees log in. A first-time source isn't \
                          proof of anything by itself; it's just where a surprise login would show \
                          up. Confirm it was expected.",
                     )

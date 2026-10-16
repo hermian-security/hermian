@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Impersonate a service process by comm name, optionally spawning a child.
 
-Used by the HERMIAN attack simulation suite to stand in for services
+Used by the Hermian attack simulation suite to stand in for services
 (nginx, mysqld, ...) without installing them. The process renames itself
 via prctl(PR_SET_NAME) so `/proc/<pid>/comm` reads as NAME, then either
 sleeps or runs the given command as its child, exactly like a compromised

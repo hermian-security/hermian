@@ -74,7 +74,7 @@ impl DetectionId {
             DetectionId::D3 => "Persistence modification",
             DetectionId::D4 => "Privilege escalation indicator",
             DetectionId::D5 => "Anomalous network behavior",
-            DetectionId::Self_ => "HERMIAN self-protection",
+            DetectionId::Self_ => "Hermian self-protection",
         }
     }
 

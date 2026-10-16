@@ -1,5 +1,5 @@
 [Unit]
-Description=HERMIAN dead-man switch timer
+Description=Hermian dead-man switch timer
 Documentation=https://github.com/hermian-security/hermian
 
 [Timer]

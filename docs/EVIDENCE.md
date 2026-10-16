@@ -1,6 +1,6 @@
 # Evidence
 
-What HERMIAN has actually been verified to do, where, and when. This is the
+What Hermian has actually been verified to do, where, and when. This is the
 source of truth for numbers in the README, release notes, and PROJECT.md. If a
 number isn't here, treat it as unproven.
 

@@ -1,6 +1,6 @@
 # Contributing
 
-HERMIAN uses short-lived branches and pull requests into a protected main branch.
+Hermian uses short-lived branches and pull requests into a protected main branch.
 There is no permanent develop branch. Main should remain buildable, but merging
 code does not automatically publish a release.
 
@@ -179,7 +179,7 @@ Release procedure:
 Example commands, only after the version has been prepared and approved:
 
 ```sh
-git tag -a v0.1.0-beta.5 -m "HERMIAN 0.1.0-beta.5"
+git tag -a v0.1.0-beta.5 -m "Hermian 0.1.0-beta.5"
 git push origin v0.1.0-beta.5
 gh run list --workflow release.yml
 ```

@@ -1,4 +1,4 @@
-//! Network isolation via an nftables table owned by HERMIAN.
+//! Network isolation via an nftables table owned by Hermian.
 //!
 //! Isolation is never automatic unless `response.auto_isolate = true` *and*
 //! `response.management_cidrs` is non-empty; those CIDRs (and loopback) stay
@@ -353,7 +353,7 @@ fn revert_args(minutes: u32, nft: &str) -> Vec<String> {
         format!("--unit={}", REVERT_UNIT),
         format!("--on-active={}m", minutes),
         "--timer-property=AccuracySec=1s".to_string(),
-        "--description=HERMIAN: lift network isolation".to_string(),
+        "--description=Hermian: lift network isolation".to_string(),
         nft.to_string(),
         "delete".to_string(),
         "table".to_string(),

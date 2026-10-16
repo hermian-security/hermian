@@ -1,5 +1,5 @@
 #!/bin/sh
-# HERMIAN Phase 2 validation suite.
+# Hermian Phase 2 validation suite.
 #
 # 1. Every simulated attack must produce a HIGH/CRITICAL alert.
 # 2. Every false-positive workload must run with ZERO HIGH/CRITICAL alerts
@@ -36,7 +36,7 @@ if ! command -v hermian >/dev/null 2>&1; then
 fi
 
 # The scenarios simulate unattended attacks. Run from a login shell, every
-# command the suite starts looks like operator activity to HERMIAN, which
+# command the suite starts looks like operator activity to Hermian, which
 # rightly downgrades unknown-writer file changes then. Re-run ourselves as a
 # transient systemd unit, outside the session, unless already done.
 if [ -z "${HERMIAN_SUITE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&1; then
@@ -46,7 +46,7 @@ if [ -z "${HERMIAN_SUITE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&
         sh "$DIR/run_suite.sh" "$@"
 fi
 if [ -n "${HERMIAN_SUITE_DETACHED:-}" ]; then
-    # Starting the suite was itself operator activity (HERMIAN looks back 15s).
+    # Starting the suite was itself operator activity (Hermian looks back 15s).
     # Let that pass so the first file-based scenario is judged as unattended.
     echo "(waiting 20s so launching the suite doesn't count as operator activity)"
     sleep 20
@@ -67,7 +67,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 FAILS=0
-echo "=== HERMIAN validation suite ==="
+echo "=== Hermian validation suite ==="
 echo
 
 echo "--- Self-test (synthetic detections) ---"
