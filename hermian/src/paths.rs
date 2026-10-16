@@ -8,6 +8,10 @@ pub const UNIT_PATH: &str = "/etc/systemd/system/hermian.service";
 pub const WATCHDOG_UNIT_PATH: &str = "/etc/systemd/system/hermian-watchdog.service";
 pub const WATCHDOG_TIMER_PATH: &str = "/etc/systemd/system/hermian-watchdog.timer";
 pub const PAM_MODULE_PATH: &str = "/usr/lib/security/pam_hermian.so";
+/// The APT repository entry and key install.sh adds (removed on uninstall
+/// and purge, like everything else Hermian writes).
+pub const APT_SOURCES_PATH: &str = "/etc/apt/sources.list.d/hermian.sources";
+pub const APT_KEYRING_PATH: &str = "/usr/share/keyrings/hermian-archive-keyring.gpg";
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var)

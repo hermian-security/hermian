@@ -27,6 +27,8 @@ case "$1" in
         rm -f /etc/pam.d/sshd.hermian-bak
         rm -rf /etc/hermian /var/lib/hermian /var/log/hermian /run/hermian
         rm -f /etc/sysctl.d/60-hermian.conf
+        # The APT repository install.sh adds (same paths as hermian uninstall).
+        rm -f /etc/apt/sources.list.d/hermian.sources /usr/share/keyrings/hermian-archive-keyring.gpg
         remove_units
     ;;
 esac

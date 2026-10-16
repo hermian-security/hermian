@@ -6,6 +6,22 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Added
+
+- `hermian report`: a summary to send the maintainers during the beta.
+  Version, OS, kernel, coverage, how long it's been installed, alert counts
+  by severity and by rule over the last 7 days (`--days`), delivery health
+  and overhead, under the identity banner. Nothing private: no host name,
+  addresses, users, paths or commands (titles that would name one are
+  withheld). `--json` for the same data as JSON.
+- A signed APT repository, `apt.hermian.me`, published by the release
+  workflow: `beta` for every prerelease, `stable` from v0.1.0. On
+  Debian/Ubuntu the installer adds it (key from the release, checked like the
+  `.deb`), so `apt upgrade` keeps Hermian current; `--no-apt-repo` skips it.
+  `hermian uninstall` and `apt purge` remove the entry and the key. Until the
+  repository's signing key is configured, releases and installs behave as
+  before.
+
 ### Changed
 
 - Less noise. "Script executed from a shell" (cron or a service running a
@@ -25,15 +41,6 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 Redesigned alerts, SSH logins that say which key got in, and a new check
 for hidden SSH key files.
-
-### Added
-
-- `hermian report`: a summary to send the maintainers during the beta.
-  Version, OS, kernel, coverage, how long it's been installed, alert counts
-  by severity and by rule over the last 7 days (`--days`), delivery health
-  and overhead, under the identity banner. Nothing private: no host name,
-  addresses, users, paths or commands (titles that would name one are
-  withheld). `--json` for the same data as JSON.
 
 ### Added
 

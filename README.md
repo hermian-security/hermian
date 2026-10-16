@@ -82,6 +82,11 @@ with the checksum alone.
 `--version vX.Y.Z` picks another release. The same command installs and
 upgrades.
 
+On Debian and Ubuntu, when the release ships the repository key, the
+installer also adds the signed APT repository `apt.hermian.me`, so
+`sudo apt upgrade` keeps Hermian current from then on. The key comes with the
+release and is checked like the `.deb` itself. `--no-apt-repo` skips it.
+
 Rather read it first? Grab `install.sh` from the
 [release](https://github.com/hermian-security/hermian/releases) assets, look it
 over, then run it.
@@ -93,7 +98,21 @@ Pin a release tag (the newest is on the
 [releases page](https://github.com/hermian-security/hermian/releases)); don't
 script against `latest`. These steps work for installing and upgrading.
 
-### Debian / Ubuntu
+### Debian / Ubuntu, from the APT repository
+
+```bash
+curl -fsSL https://apt.hermian.me/hermian-archive-keyring.gpg \
+  | sudo tee /usr/share/keyrings/hermian-archive-keyring.gpg >/dev/null
+printf 'Types: deb\nURIs: https://apt.hermian.me\nSuites: beta\nComponents: main\nSigned-By: /usr/share/keyrings/hermian-archive-keyring.gpg\n' \
+  | sudo tee /etc/apt/sources.list.d/hermian.sources
+sudo apt update && sudo apt install hermian
+```
+
+`beta` gets every prerelease; `stable` starts with v0.1.0. apt checks every
+download against that key. To compare the key with the one a release ships,
+download `hermian-archive-keyring.gpg` from the release and diff the two.
+
+### Debian / Ubuntu, one release by hand
 
 ```bash
 VER=v0.1.0-beta.10
@@ -163,15 +182,16 @@ shows reduced coverage or delivery errors. The full list is in the
 
 ### Upgrade
 
-Nothing updates itself yet (a signed APT repository is planned). Watch the
-releases, read the notes for the new tag (they list any one-time steps), then
-rerun the installer with `--version vX.Y.Z`, or set `VER=vX.Y.Z` in the steps
-above.
+With the APT repository set up (above), upgrades come with
+`sudo apt update && sudo apt upgrade`. Otherwise, rerun the installer with
+`--version vX.Y.Z`, or set `VER=vX.Y.Z` in the steps above. Either way, read
+the notes for the new release first: they list any one-time steps.
 
 ### Uninstall
 
 `sudo hermian uninstall` asks first, then lifts isolation and removes the
-daemon, unit, config, stored alerts, logs, PAM hook, and binary. Back up any
+daemon, unit, config, stored alerts, logs, PAM hook, APT repository entry,
+and binary. Back up any
 alerts you want to keep. If you installed the package, `sudo apt purge hermian`
 does the same.
 

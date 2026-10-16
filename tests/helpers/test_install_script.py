@@ -73,6 +73,12 @@ class InstallModeTests(unittest.TestCase):
         self.assertIn("installing the tarball at", out)
         self.assertNotIn("fetching", out)
 
+    def test_no_apt_repo_is_an_option(self):
+        out = self.run_sh(["-s", "--", "--dry-run", "--no-apt-repo"], self.tmp,
+                          stdin=INSTALL.read_text()).stdout
+        self.assertNotIn("unknown argument", out)
+        self.assertIn("fetching SHA256SUMS", out)
+
     def test_version_is_refused_for_a_local_tarball(self):
         d = self.tarball()
         res = self.run_sh(["install.sh", "--dry-run", "--version", "v0.0.1"], d)
@@ -139,6 +145,34 @@ class DropShadowTests(unittest.TestCase):
         old = self.fake("old", "hermian 0.1.0-beta.5")
         self.drop(old, self.tmp / "missing")
         self.assertTrue(old.exists())
+
+
+@unittest.skipIf(SH is None, "needs a POSIX sh")
+class AptRepoTests(unittest.TestCase):
+    """The .sources entry install.sh writes, run on its own."""
+
+    def funcs(self):
+        text = INSTALL.read_text()
+        start = text.index("APT_KEYRING=")
+        end = text.index("\n}\n", text.index("apt_sources() {")) + 3
+        return text[start:end]
+
+    def sh(self, call):
+        return subprocess.run([SH, "-c", self.funcs() + "\n" + call], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True, timeout=30).stdout
+
+    def test_prereleases_track_beta_and_releases_stable(self):
+        self.assertEqual(self.sh("apt_suite v0.1.0-beta.11").strip(), "beta")
+        self.assertEqual(self.sh("apt_suite v0.1.0-rc.1").strip(), "beta")
+        self.assertEqual(self.sh("apt_suite v0.1.0").strip(), "stable")
+
+    def test_sources_entry_is_signed_by_the_release_key(self):
+        self.assertEqual(self.sh("apt_sources beta"),
+                         "Types: deb\n"
+                         "URIs: https://apt.hermian.me\n"
+                         "Suites: beta\n"
+                         "Components: main\n"
+                         "Signed-By: /usr/share/keyrings/hermian-archive-keyring.gpg\n")
 
 
 if __name__ == "__main__":

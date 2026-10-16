@@ -25,7 +25,24 @@ def unit_paths():
     return found
 
 
+def apt_paths():
+    """The APT repository entry and key, from paths.rs."""
+    src = (ROOT / "hermian" / "src" / "paths.rs").read_text()
+    found = [re.search(r'%s: &str = "([^"]+)"' % name, src).group(1)
+             for name in ("APT_SOURCES_PATH", "APT_KEYRING_PATH")]
+    return found
+
+
 class DebianScriptTests(unittest.TestCase):
+    def test_purge_and_the_installer_agree_on_the_apt_repo_paths(self):
+        purge = case_block((DEBIAN / "postrm").read_text(), "purge)")
+        installer = (ROOT / "packaging" / "install.sh").read_text()
+        for path in apt_paths():
+            self.assertIn(path, purge)
+            self.assertIn(path, installer)
+        self.assertNotIn("hermian.sources", case_block((DEBIAN / "postrm").read_text(), "remove)"),
+                         "a plain remove keeps the repo, so reinstalling works")
+
     def test_prerm_lifts_isolation_on_remove_only(self):
         text = (DEBIAN / "prerm").read_text()
         remove_block = text.split("remove|deconfigure)", 1)[1].split(";;", 1)[0]
