@@ -22,19 +22,25 @@ no account, and no server to run.
 Here's an alert in Telegram:
 
 ```
-◉◉◉◉ CRITICAL · web-01
+◉◉◉◉  CRITICAL · Process chain
 Web server chain ran downloaded code
 
 ┃ nginx started a shell that downloaded a file and is now running it as
 ┃ www-data.
 
-hermian · D1 · 03:14 UTC
+host   web-01
+chain  nginx › sh › curl
+rule   D1 · Suspicious process chain
+time   6 Oct 2026 · 03:14 UTC
+
+┃ Risk · Next steps   (tap to expand)
+
 hermian show HER-2026-1006-415
 ```
 
-The meter counts up with severity (`◉○○○` INFO to `◉◉◉◉` CRITICAL). Chat gets
-the short version; `hermian show` and the email carry the full record: the
-process chain, evidence, why it matters, and what to do next.
+The meter counts up with severity (`◉○○○` INFO to `◉◉◉◉` CRITICAL). The push
+stays short: the risk and next steps sit in a collapsed section. `hermian show`
+and the email carry the full record, process chain and evidence included.
 
 > [!NOTE]
 > **It's beta.** One host has passed the full attack and false-positive run,

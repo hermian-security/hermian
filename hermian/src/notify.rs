@@ -682,15 +682,6 @@ pub mod webhook {
     use super::*;
     use serde_json::{json, Value};
 
-    fn colour(sev: Severity) -> u32 {
-        match sev {
-            Severity::Critical => 0xD62828,
-            Severity::High => 0xF77F00,
-            Severity::Low => 0xFCBF49,
-            Severity::Info => 0x8D99AE,
-        }
-    }
-
     fn slack_colour(sev: Severity) -> &'static str {
         match sev {
             Severity::Critical => "#D62828",
@@ -698,6 +689,101 @@ pub mod webhook {
             Severity::Low => "#FCBF49",
             Severity::Info => "#8D99AE",
         }
+    }
+
+    /// The mark, served from the site. Discord's servers fetch it, not the
+    /// host, so nothing about the host leaks.
+    const AVATAR_URL: &str = "https://hermian.me/icon-192.png";
+
+    /// Severity colours from the identity's dark palette (Discord is dark).
+    fn discord_colour(sev: Severity) -> u32 {
+        match sev {
+            Severity::Critical => 0xFF6B81,
+            Severity::High => 0x9A8CF7,
+            Severity::Low => 0x8D8AA8,
+            Severity::Info => 0x6B6888,
+        }
+    }
+
+    /// Cut to Discord's per-field limits, marking the cut.
+    fn cut(s: &str, max: usize) -> String {
+        if s.chars().count() <= max {
+            return s.to_string();
+        }
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('\u{2026}');
+        out
+    }
+
+    /// Inline code that a backtick in the value can't break out of.
+    fn code(s: &str) -> String {
+        format!("`{}`", s.replace('`', "'"))
+    }
+
+    /// Author line with meter and detection, the title alone, the sentence
+    /// as a quote (the path in it as code), host and a live relative time,
+    /// then risk, steps and the command.
+    fn discord(alert: &Alert) -> Value {
+        let mut what = cut(&alert.what, 1500);
+        if let Some(p) = alert.facts.iter().find(|f| f.label == "Path") {
+            if p.value.len() > 1 && !p.value.contains('`') {
+                what = what.replacen(&p.value, &code(&p.value), 1);
+            }
+        }
+        let ts = alert.ts.timestamp();
+        let mut fields = vec![
+            json!({"name": "Host", "value": code(&cut(&alert.host, 200)), "inline": true}),
+            json!({"name": "Detected", "value": format!("<t:{}:t> \u{00B7} <t:{}:R>", ts, ts), "inline": true}),
+        ];
+        if !alert.chain.is_empty() {
+            fields.push(json!({"name": "Process chain", "value": code(&cut(&chain_line(alert), 900)), "inline": false}));
+        }
+        for f in alert.facts.iter().filter(|f| f.label != "Path").take(6) {
+            fields.push(
+                json!({"name": cut(&f.label, 200), "value": cut(&f.value, 1000), "inline": true}),
+            );
+        }
+        if !alert.why.is_empty() {
+            fields.push(json!({"name": "Risk", "value": cut(&alert.why, 1000), "inline": false}));
+        }
+        if !alert.actions.is_empty() {
+            let steps = alert
+                .actions
+                .iter()
+                .take(5)
+                .enumerate()
+                .map(|(i, a)| format!("{}. {}", i + 1, cut(a, 180)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fields.push(json!({"name": "Next steps", "value": steps, "inline": false}));
+        }
+        fields.push(json!({
+            "name": "\u{200B}",
+            "value": format!("```\nhermian show {}\n```", alert.ref_id.replace('`', "'")),
+            "inline": false
+        }));
+        json!({
+            "username": "Hermian",
+            "avatar_url": AVATAR_URL,
+            // Alert text carries attacker-controlled strings (an SSH user
+            // named "@everyone"); never let it ping anyone.
+            "allowed_mentions": {"parse": []},
+            "embeds": [{
+                "author": {"name": format!(
+                    "{}  {}  \u{00B7}  {} {}",
+                    hermian_core::alert::severity_meter(alert.severity),
+                    alert.severity.as_str(),
+                    alert.detection.short(),
+                    alert.detection.family()
+                )},
+                "title": cut(&alert.title, 250),
+                "description": format!("> {}", what.replace('\n', "\n> ")),
+                "color": discord_colour(alert.severity),
+                "fields": fields,
+                "footer": {"text": format!("Hermian \u{00B7} {}", alert.ref_id), "icon_url": AVATAR_URL},
+                "timestamp": alert.ts.to_rfc3339(),
+            }]
+        })
     }
 
     fn chain_line(alert: &Alert) -> String {
@@ -740,36 +826,7 @@ pub mod webhook {
                     }]
                 })
             }
-            "discord" => {
-                let mut fields = vec![
-                    json!({"name": "Host", "value": alert.host, "inline": true}),
-                    json!({"name": "Detection", "value": format!("{} {}", alert.detection.short(), alert.detection.name()), "inline": true}),
-                ];
-                if !alert.chain.is_empty() {
-                    fields.push(json!({"name": "Process chain", "value": format!("`{}`", chain_line(alert)), "inline": false}));
-                }
-                for f in &alert.facts {
-                    fields.push(json!({"name": f.label, "value": f.value, "inline": true}));
-                }
-                let mut description = alert.what.clone();
-                if !alert.actions.is_empty() {
-                    description.push_str("\n\n**Recommended action**\n");
-                    for (i, a) in alert.actions.iter().enumerate() {
-                        description.push_str(&format!("{}. {}\n", i + 1, a));
-                    }
-                }
-                json!({
-                    "username": "Hermian",
-                    "embeds": [{
-                        "title": title,
-                        "description": description,
-                        "color": colour(alert.severity),
-                        "fields": fields,
-                        "footer": {"text": format!("{}  \u{00B7}  hermian show {}", alert.ref_id, alert.ref_id)},
-                        "timestamp": alert.ts.to_rfc3339(),
-                    }]
-                })
-            }
+            "discord" => discord(alert),
             "ntfy" => json!({
                 "title": format!("Hermian {} on {}", alert.severity.as_str(), alert.host),
                 "message": compact,
@@ -871,6 +928,7 @@ pub mod webhook {
 mod tests {
     use super::*;
     use hermian_core::{DetectionId, Finding};
+    use serde_json::json;
 
     fn alert() -> Alert {
         let f = Finding::new(
@@ -897,9 +955,51 @@ mod tests {
             .unwrap()
             .contains("HIGH"));
         let d = webhook::payload(&a, "discord");
-        assert_eq!(d["embeds"][0]["color"], 0xF77F00);
+        assert_eq!(d["embeds"][0]["color"], 0x9A8CF7);
         let n = webhook::payload(&a, "ntfy");
         assert_eq!(n["priority"], 4);
+    }
+
+    /// Meter and detection in the author line, the title alone, the path
+    /// as code in the quoted sentence, the risk and steps as fields, and
+    /// alert text can never ping anyone.
+    #[test]
+    fn discord_embed_layout() {
+        let f = Finding::new(
+            DetectionId::D3,
+            Severity::High,
+            "Shell profile changed with no session present",
+            "x",
+        )
+        .what("/root/.bashrc was moved into place by @everyone.")
+        .fact("Path", "/root/.bashrc")
+        .why("Shell profiles execute on every login.")
+        .action("Review the tail of the file.");
+        let a = Alert::from_finding(f, "HER-4".into(), "web`01".into(), Utc::now());
+        let d = webhook::payload(&a, "discord");
+        assert_eq!(d["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(d["avatar_url"], "https://hermian.me/icon-192.png");
+        let e = &d["embeds"][0];
+        assert_eq!(
+            e["author"]["name"],
+            "\u{25C9}\u{25C9}\u{25C9}\u{25CB}  HIGH  \u{00B7}  D3 Persistence"
+        );
+        assert_eq!(e["title"], "Shell profile changed with no session present");
+        assert_eq!(
+            e["description"],
+            "> `/root/.bashrc` was moved into place by @everyone."
+        );
+        let fields = e["fields"].as_array().unwrap();
+        let named = |n: &str| fields.iter().find(|f| f["name"] == n).unwrap()["value"].clone();
+        assert_eq!(named("Host"), "`web'01`");
+        assert!(named("Detected").as_str().unwrap().contains(":R>"));
+        assert_eq!(named("Risk"), "Shell profiles execute on every login.");
+        assert_eq!(named("Next steps"), "1. Review the tail of the file.");
+        assert!(
+            !fields.iter().any(|f| f["name"] == "Path"),
+            "path is in the quote"
+        );
+        assert_eq!(e["footer"]["text"], "Hermian \u{00B7} HER-4");
     }
 
     #[test]

@@ -59,27 +59,60 @@ pub mod telegram {
         out
     }
 
+    /// Most facts on the fact sheet; the CLI has the rest.
+    const SHEET_FACTS: usize = 5;
+
     /// Build the HTML message body:
     ///
     /// ```text
-    /// ◉◉◉◉ CRITICAL · web-01                 <- meter, level, host (tap to copy)
-    /// Web server chain ran downloaded code   <- headline
-    /// ┃ nginx started a shell that ...       <- what happened, as a quote card
-    /// hermian · D1 · 03:14 UTC               <- quiet context
-    /// hermian show HER-2026-1006-415         <- tap to copy
+    /// ◉◉◉○  HIGH · Persistence               <- meter, level, detection family
+    /// Shell profile changed with no ...      <- headline, on its own line
+    /// ┃ /root/.bashrc was moved into ...     <- what happened, as a quote card
+    /// host  web-01                           <- <pre> fact sheet, tap to copy
+    /// path  /root/.bashrc
+    /// rule  D3 · Persistence modification
+    /// time  16 Oct 2026 · 12:36 UTC
+    /// ┃ Risk ... Next steps 1. ... 2. ...    <- expandable quote, collapsed
+    /// hermian show HER-2026-1016-163         <- tap to copy
     /// ```
     ///
     /// Telegram allows no colour or fonts, so hierarchy does the work. The
-    /// bot's name and avatar already say who's talking, so the header leads
-    /// with the severity. Evidence, the process chain, why it matters and
-    /// the recommended steps stay in the CLI; the message says what happened,
-    /// nothing more.
+    /// bot's name and avatar already say who's talking, so there's no
+    /// product name. The why and the steps sit in a collapsed quote: the
+    /// push notification and the first screen stay short.
     pub fn body(alert: &Alert) -> String {
+        // Escaping can triple hostile text, so shed detail until it fits
+        // Telegram's 4096-character limit: first the collapsed section, then
+        // the fact sheet's length.
+        let levels = [
+            (SHEET_FACTS, 120, true, 500),
+            (SHEET_FACTS, 120, false, 500),
+            (2, 40, false, 300),
+        ];
+        for (facts, value_max, why, what_max) in levels {
+            let b = body_with(alert, facts, value_max, why, what_max);
+            if b.chars().count() <= TG_LIMIT {
+                return b;
+            }
+        }
+        // Worst case, every field escaped 5x: still well under the limit.
+        body_with(alert, 0, 0, false, 120)
+    }
+
+    const TG_LIMIT: usize = 4096;
+
+    fn body_with(
+        alert: &Alert,
+        facts: usize,
+        value_max: usize,
+        why: bool,
+        what_max: usize,
+    ) -> String {
         let mut out = format!(
-            "<b>{} {}</b> \u{00B7} <code>{}</code>",
+            "<b>{}  {}</b> \u{00B7} {}",
             meter(alert.severity),
             alert.severity.as_str(),
-            esc(&clip(&alert.host, 60))
+            alert.detection.family()
         );
         if alert.repeats > 1 {
             out.push_str(&format!(" \u{00B7} seen {} times", alert.repeats));
@@ -90,16 +123,87 @@ pub mod telegram {
         if !alert.what.is_empty() {
             out.push_str(&format!(
                 "\n\n<blockquote>{}</blockquote>",
-                esc(&clip(&alert.what, 500))
+                esc(&clip(&alert.what, what_max))
             ));
         }
         out.push_str(&format!(
-            "\n\n<i>hermian \u{00B7} {} \u{00B7} {} UTC</i>\n<code>hermian show {}</code>",
-            alert.detection.short(),
-            alert.ts.format("%H:%M"),
+            "\n\n<pre>{}</pre>",
+            esc(&fact_sheet(alert, facts, value_max))
+        ));
+        let why_steps = if why {
+            why_and_steps(alert)
+        } else {
+            String::new()
+        };
+        if !why_steps.is_empty() {
+            out.push_str(&format!(
+                "\n\n<blockquote expandable>{}</blockquote>",
+                why_steps
+            ));
+        }
+        out.push_str(&format!(
+            "\n\n<code>hermian show {}</code>",
             esc(&alert.ref_id)
         ));
         out
+    }
+
+    /// Aligned `key  value` lines: host, the first detector facts, the
+    /// process chain, the rule and the time. Plain text; escaped by the
+    /// caller.
+    fn fact_sheet(alert: &Alert, facts: usize, value_max: usize) -> String {
+        let mut rows: Vec<(String, String)> = vec![("host".into(), clip(&alert.host, 60))];
+        for f in alert.facts.iter().take(facts) {
+            rows.push((clip(&f.label.to_lowercase(), 16), clip(&f.value, value_max)));
+        }
+        if !alert.chain.is_empty() {
+            let chain = alert
+                .chain
+                .iter()
+                .map(|n| n.comm.as_str())
+                .collect::<Vec<_>>()
+                .join(" \u{203A} ");
+            rows.push(("chain".into(), clip(&chain, value_max.max(40))));
+        }
+        rows.push((
+            "rule".into(),
+            format!(
+                "{} \u{00B7} {}",
+                alert.detection.short(),
+                alert.detection.name()
+            ),
+        ));
+        rows.push((
+            "time".into(),
+            alert.ts.format("%-d %b %Y \u{00B7} %H:%M UTC").to_string(),
+        ));
+        let width = rows
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
+        rows.iter()
+            .map(|(k, v)| format!("{:<w$}  {}", k, v, w = width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The risk and the numbered steps, escaped, or empty.
+    fn why_and_steps(alert: &Alert) -> String {
+        let mut s = String::new();
+        if !alert.why.is_empty() {
+            s.push_str(&format!("<b>Risk</b>\n{}", esc(&clip(&alert.why, 600))));
+        }
+        if !alert.actions.is_empty() {
+            if !s.is_empty() {
+                s.push_str("\n\n");
+            }
+            s.push_str("<b>Next steps</b>");
+            for (i, a) in alert.actions.iter().take(5).enumerate() {
+                s.push_str(&format!("\n{}. {}", i + 1, esc(&clip(a, 200))));
+            }
+        }
+        s
     }
 
     pub fn send(alert: &Alert, cfg: &TelegramCfg) -> Result<(), SendError> {
@@ -217,24 +321,16 @@ pub mod email {
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SendmailTransport, SmtpTransport, Transport};
 
-    /// The logo for the email header: the mark on its dark tile (so it reads
-    /// on light and dark mail clients alike), 64 px shown at 32. It travels
-    /// inside the message as an inline attachment: no remote image (those
-    /// are blocked by default and would tell a server when an alert was
-    /// read), no data: URI (Gmail drops them). About 0.6 KB.
-    pub(super) const MARK_PNG: &[u8] = include_bytes!("../assets/mark-email.png");
-    const MARK_CID: &str = "hermian-mark";
-
-    /// Severity colours from the identity, light palette (mail is mostly
-    /// read on light backgrounds; the dark-mode CSS keeps them readable).
-    fn colour(s: Severity) -> &'static str {
-        match s {
-            Severity::Critical => "#D9344C",
-            Severity::High => "#5B4FD0",
-            Severity::Low => "#6B6888",
-            Severity::Info => "#8D8AA8",
-        }
-    }
+    /// The header lockup (light on the ink band, 176x44 shown at 88x22) and
+    /// the company lockup for the footer (one mid-tone colour, so it reads on
+    /// light and dark clients). Both travel inside the message as inline
+    /// attachments: no remote image (blocked by default, and it would tell a
+    /// server when an alert was read), no data: URI (Gmail drops them).
+    /// About 1.1 KB each.
+    pub(super) const LOCKUP_PNG: &[u8] = include_bytes!("../assets/lockup-email-dark.png");
+    pub(super) const COMPANY_PNG: &[u8] = include_bytes!("../assets/company-email.png");
+    const LOCKUP_CID: &str = "hermian-lockup";
+    const COMPANY_CID: &str = "hermian-company";
 
     fn esc(s: &str) -> String {
         s.replace('&', "&amp;")
@@ -242,17 +338,17 @@ pub mod email {
             .replace('>', "&gt;")
     }
 
-    /// ASCII-only so the subject never needs RFC 2047 encoding (which some
-    /// clients render badly in notification previews).
+    /// "[Hermian] HIGH: <title> (<host>)". Severity and title lead because
+    /// inbox lists cut from the right. ASCII-only so the subject never needs
+    /// RFC 2047 encoding (which some clients render badly in previews).
     pub fn subject(alert: &Alert, prefix: &str) -> String {
-        let title: String = alert.title.chars().filter(|c| c.is_ascii()).collect();
+        let ascii = |s: &str| s.chars().filter(|c| c.is_ascii()).collect::<String>();
         format!(
-            "{} {} {} | {} | {}",
+            "{} {}: {} ({})",
             prefix,
             alert.severity.as_str(),
-            alert.detection.short(),
-            alert.host,
-            title
+            ascii(alert.title.trim()),
+            ascii(&alert.host)
         )
         .trim()
         .to_string()
@@ -263,22 +359,57 @@ pub mod email {
     const MONO: &str = "'JetBrains Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
 
     /// A section label in the brand accent.
-    fn eyebrow(label: &str) -> String {
+    fn eyebrow(label: &str, top: u32) -> String {
         format!(
-            "<div class=\"hm-ac\" style=\"margin-top:26px;font:600 11px/1 {};letter-spacing:.1em;color:#5B4FD0\">{}</div>",
-            MONO, label
+            "<div class=\"hm-ac\" style=\"margin-top:{}px;font:600 11px/1 {};letter-spacing:.1em;color:#5B4FD0\">{}</div>",
+            top, MONO, label
+        )
+    }
+
+    /// Pill colours per severity: background, text and lit dots, unlit dots.
+    fn pill(s: Severity) -> (&'static str, &'static str, &'static str) {
+        match s {
+            Severity::Critical => ("#FCE8EB", "#D9344C", "#F0A5B1"),
+            Severity::High => ("#EFEDFB", "#5B4FD0", "#B7B0EC"),
+            Severity::Low => ("#EEEDF3", "#6B6888", "#C5C3D3"),
+            Severity::Info => ("#F1F1F5", "#8D8AA8", "#D3D1DE"),
+        }
+    }
+
+    fn lit_dots(s: Severity) -> usize {
+        match s {
+            Severity::Critical => 4,
+            Severity::High => 3,
+            Severity::Low => 2,
+            Severity::Info => 1,
+        }
+    }
+
+    /// One spec-grid cell: a small label over a monospace value.
+    fn cell(label: &str, value: &str, td_attrs: &str, borders: &str) -> String {
+        format!(
+            "<td class=\"hm-line\" {} style=\"padding:14px 16px;border-color:#E3E1EF;border-style:solid;border-width:0;vertical-align:top{}\">\
+             <div class=\"hm-dim\" style=\"font:600 10.5px/1 {mono};letter-spacing:.1em;color:#8D8AA8\">{}</div>\
+             <div class=\"hm-tx\" style=\"margin-top:6px;font:500 13px/1.4 {mono};color:#17142E;word-break:break-all\">{}</div></td>",
+            td_attrs,
+            borders,
+            esc(&label.to_uppercase()),
+            esc(value),
+            mono = MONO
         )
     }
 
     /// The alert as a branded, mail-client-safe page: tables and inline
-    /// styles only (the logo is the one image, carried inline; nothing
-    /// remote), a hidden preheader for the inbox preview, and a dark palette
-    /// for clients that honour
-    /// `prefers-color-scheme`. Only the severity and the logo's dot carry
-    /// colour; the process chain is drawn like a terminal.
+    /// styles only, the two logos carried inline (nothing remote), a hidden
+    /// preheader for the inbox preview, and a dark palette for clients that
+    /// honour `prefers-color-scheme`. An ink header band with the lockup,
+    /// the severity as a pill with a drawn four-dot meter (Unicode glyphs
+    /// turn into emoji in some clients), a spec grid, the risk, numbered
+    /// steps and both CLI commands in one terminal block.
     pub fn html(alert: &Alert) -> String {
-        let sev = colour(alert.severity);
-        let mut h = String::with_capacity(8192);
+        let sev = alert.severity;
+        let (pill_bg, pill_fg, pill_off) = pill(sev);
+        let mut h = String::with_capacity(12288);
         h.push_str(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -290,9 +421,9 @@ pub mod email {
             "<style>@media (prefers-color-scheme:dark){\
              .hm-bg{background:#0F0E17!important}\
              .hm-card{background:#14131D!important;border-color:#2A2839!important}\
-             .hm-tx{color:#ECEBF7!important}.hm-dim{color:#8D8AA8!important}\
+             .hm-tx{color:#ECEBF7!important}.hm-tx2{color:#C9C7DA!important}.hm-dim{color:#8D8AA8!important}\
              .hm-line{border-color:#2A2839!important}.hm-ac{color:#9A8CF7!important}\
-             .hm-box{background:#1A1926!important;border-color:#2A2839!important;color:#ECEBF7!important}}\
+             .hm-pill{background:#221F38!important}}\
              @media (max-width:620px){.hm-pad{padding-left:20px!important;padding-right:20px!important}}\
              </style></head>",
         );
@@ -310,64 +441,96 @@ pub mod email {
         ));
         h.push_str(
             "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"hm-bg\" style=\"background:#F4F4F8\">\
-             <tr><td align=\"center\" style=\"padding:32px 12px\">\
+             <tr><td align=\"center\" style=\"padding:32px 12px 36px\">\
              <table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;max-width:600px\">",
         );
-        // Brand row: the logo (an inline attachment, see `build`), the
-        // wordmark, and the reference on the right. alt is empty because the
-        // wordmark right after it already says "hermian".
+        // Header band: the lockup (inline PNG, already on the ink colour)
+        // and the reference.
         h.push_str(&format!(
-            "<tr><td style=\"padding:0 4px 14px\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
-             <td class=\"hm-tx\" style=\"font:600 18px/32px {sans};color:#17142E;letter-spacing:-.02em\">\
-             <img src=\"cid:{cid}\" width=\"32\" height=\"32\" alt=\"\" style=\"display:inline-block;vertical-align:middle;border:0;outline:none\">\
-             &nbsp;<span style=\"vertical-align:middle\">hermian</span></td>\
-             <td align=\"right\" class=\"hm-dim\" style=\"font:12px/1 {mono};color:#6B6888\">{r}</td>\
+            "<tr><td class=\"hm-pad\" style=\"background:#17142E;border-radius:16px 16px 0 0;padding:22px 32px\">\
+             <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+             <td><img src=\"cid:{cid}\" width=\"88\" height=\"22\" alt=\"Hermian\" style=\"display:block;border:0;outline:none;color:#ECEBF7;font:600 16px {sans}\"></td>\
+             <td align=\"right\" style=\"font:500 11.5px/1 {mono};letter-spacing:.04em;color:#8D8AA8\">{r}</td>\
              </tr></table></td></tr>",
+            cid = LOCKUP_CID,
             sans = SANS,
             mono = MONO,
-            cid = MARK_CID,
             r = esc(&alert.ref_id)
         ));
-        // The card, with a severity stripe on top.
         h.push_str(
-            "<tr><td class=\"hm-card\" style=\"background:#FFFFFF;border:1px solid #E3E1EF;border-radius:16px;overflow:hidden\">",
+            "<tr><td class=\"hm-card hm-pad\" style=\"background:#FFFFFF;border:1px solid #E3E1EF;border-top:0;border-radius:0 0 16px 16px;padding:32px 32px 34px\">",
         );
+        // Severity pill with a drawn meter, then the detection.
+        let mut dots = String::new();
+        for i in 0..4 {
+            let style = if i < lit_dots(sev) {
+                format!("background:{}", pill_fg)
+            } else {
+                format!("border:1.5px solid {}", pill_off)
+            };
+            dots.push_str(&format!(
+                "<span style=\"display:inline-block;width:7px;height:7px;box-sizing:border-box;border-radius:50%;margin-right:3px;vertical-align:middle;{}\"></span>",
+                style
+            ));
+        }
         h.push_str(&format!(
-            "<div style=\"height:4px;line-height:4px;font-size:0;background:{}\">&nbsp;</div>",
-            sev
+            "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+             <td class=\"hm-pill\" style=\"background:{bg};border-radius:999px;padding:6px 12px 6px 10px;white-space:nowrap\">{dots}\
+             <span style=\"font:600 11.5px/1 {mono};letter-spacing:.1em;color:{fg};vertical-align:middle;padding-left:2px\">{level}</span></td>\
+             <td class=\"hm-dim\" style=\"padding-left:12px;font:500 12px/1.4 {mono};letter-spacing:.06em;color:#6B6888\">{short} \u{00B7} {name}</td>\
+             </tr></table>",
+            bg = pill_bg,
+            fg = pill_fg,
+            dots = dots,
+            mono = MONO,
+            level = sev.as_str(),
+            short = alert.detection.short(),
+            name = esc(&alert.detection.name().to_uppercase())
         ));
-        h.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td class=\"hm-pad\" style=\"padding:28px 32px 30px\">");
         h.push_str(&format!(
-            "<div style=\"font:600 12px/1 {};letter-spacing:.08em;color:{}\">{}&nbsp; {}</div>",
-            MONO,
-            sev,
-            super::telegram::meter(alert.severity),
-            alert.severity.as_str()
-        ));
-        h.push_str(&format!(
-            "<h1 class=\"hm-tx\" style=\"margin:14px 0 0;font:600 22px/1.3 {};letter-spacing:-.015em;color:#17142E\">{}</h1>",
+            "<h1 class=\"hm-tx\" style=\"margin:18px 0 0;font:600 26px/1.25 {};letter-spacing:-.022em;color:#17142E\">{}</h1>",
             SANS,
             esc(&alert.title)
         ));
-        let repeats = if alert.repeats > 1 {
-            format!(" &nbsp;\u{00B7}&nbsp; seen {} times", alert.repeats)
-        } else {
-            String::new()
-        };
-        h.push_str(&format!(
-            "<div class=\"hm-dim\" style=\"margin-top:8px;font-size:13px;line-height:1.5;color:#6B6888\">{} &nbsp;\u{00B7}&nbsp; {} {} &nbsp;\u{00B7}&nbsp; {} UTC{}</div>",
-            esc(&alert.host),
-            alert.detection.short(),
-            esc(alert.detection.name()),
-            alert.ts.format("%Y-%m-%d %H:%M:%S"),
-            repeats
-        ));
+        if alert.repeats > 1 {
+            h.push_str(&format!(
+                "<div class=\"hm-dim\" style=\"margin-top:6px;font-size:13px;color:#6B6888\">Seen {} times</div>",
+                alert.repeats
+            ));
+        }
         if !alert.what.is_empty() {
             h.push_str(&format!(
-                "<p class=\"hm-tx\" style=\"margin:20px 0 0;font-size:15px;line-height:1.6;color:#17142E\">{}</p>",
+                "<p class=\"hm-tx2\" style=\"margin:14px 0 0;font-size:15.5px;line-height:1.65;color:#3A3756\">{}</p>",
                 esc(&alert.what)
             ));
         }
+        // Spec grid: host and time side by side, then one row per fact.
+        h.push_str(
+            "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"hm-line\" \
+             style=\"margin-top:26px;border:1px solid #E3E1EF;border-radius:12px;border-collapse:separate;overflow:hidden\">",
+        );
+        let detected = alert.ts.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        let more = !alert.facts.is_empty();
+        let bottom = if more { ";border-bottom-width:1px" } else { "" };
+        h.push_str(&format!(
+            "<tr>{}{}</tr>",
+            cell(
+                "Host",
+                &alert.host,
+                "width=\"50%\"",
+                &format!(";border-right-width:1px{}", bottom)
+            ),
+            cell("Detected", &detected, "width=\"50%\"", bottom)
+        ));
+        for (i, f) in alert.facts.iter().enumerate() {
+            let last = i + 1 == alert.facts.len();
+            let b = if last { "" } else { ";border-bottom-width:1px" };
+            h.push_str(&format!(
+                "<tr>{}</tr>",
+                cell(&f.label, &f.value, "colspan=\"2\"", b)
+            ));
+        }
+        h.push_str("</table>");
         if !alert.chain.is_empty() {
             h.push_str(&format!(
                 "<div style=\"margin-top:20px;background:#0F0E17;border-radius:12px;padding:16px 18px;font:12.5px/1.75 {};color:#ECEBF7;word-break:break-all\">",
@@ -396,54 +559,55 @@ pub mod email {
             }
             h.push_str("</div>");
         }
-        if !alert.facts.is_empty() {
-            h.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:18px\">");
-            for f in &alert.facts {
-                h.push_str(&format!(
-                    "<tr><td class=\"hm-dim hm-line\" style=\"padding:8px 16px 8px 0;border-top:1px solid #E3E1EF;font-size:12.5px;color:#6B6888;white-space:nowrap;vertical-align:top\">{}</td>\
-                     <td class=\"hm-tx hm-line\" style=\"padding:8px 0;border-top:1px solid #E3E1EF;font:12.5px/1.5 {};color:#17142E;word-break:break-all\">{}</td></tr>",
-                    esc(&f.label),
-                    MONO,
-                    esc(&f.value)
-                ));
-            }
-            h.push_str("</table>");
-        }
         if !alert.why.is_empty() {
-            h.push_str(&eyebrow("WHY IT MATTERS"));
+            h.push_str(&eyebrow("RISK", 30));
             h.push_str(&format!(
-                "<p class=\"hm-tx\" style=\"margin:10px 0 0;font-size:14.5px;line-height:1.6;color:#17142E\">{}</p>",
+                "<p class=\"hm-tx\" style=\"margin:10px 0 0;font-size:14.5px;line-height:1.65;color:#17142E\">{}</p>",
                 esc(&alert.why)
             ));
         }
         if !alert.actions.is_empty() {
-            h.push_str(&eyebrow("NEXT STEPS"));
-            h.push_str("<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:8px\">");
+            h.push_str(&eyebrow("NEXT STEPS", 28));
+            h.push_str(
+                "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:12px\">",
+            );
             for (i, a) in alert.actions.iter().enumerate() {
+                let top = if i == 0 {
+                    "border-top:1px solid #EDECF4;"
+                } else {
+                    ""
+                };
                 h.push_str(&format!(
-                    "<tr><td class=\"hm-ac\" style=\"padding:4px 12px 4px 0;font:600 12.5px/1.6 {};color:#5B4FD0;vertical-align:top\">{}</td>\
-                     <td class=\"hm-tx\" style=\"padding:4px 0;font-size:14.5px;line-height:1.6;color:#17142E\">{}</td></tr>",
-                    MONO,
-                    i + 1,
-                    esc(a)
+                    "<tr><td class=\"hm-ac hm-line\" width=\"32\" style=\"{top}border-bottom:1px solid #EDECF4;padding:11px 0;font:600 12px/1.5 {mono};color:#5B4FD0;vertical-align:top\">{n:02}</td>\
+                     <td class=\"hm-tx hm-line\" style=\"{top}border-bottom:1px solid #EDECF4;padding:11px 0;font-size:14.5px;line-height:1.5;color:#17142E\">{a}</td></tr>",
+                    top = top,
+                    mono = MONO,
+                    n = i + 1,
+                    a = esc(a)
                 ));
             }
             h.push_str("</table>");
         }
+        // Both commands in one terminal block.
         h.push_str(&format!(
-            "<div class=\"hm-box\" style=\"margin-top:26px;border:1px solid #E3E1EF;background:#F7F7FB;border-radius:10px;padding:12px 16px;font:13px/1.5 {mono};color:#17142E\">\
-             <span class=\"hm-dim\" style=\"color:#8D8AA8\">$</span> hermian show {r}</div>\
-             <div class=\"hm-dim\" style=\"margin-top:8px;font-size:12.5px;line-height:1.5;color:#6B6888\">Run it on {host} for the full record. \
-             <span style=\"font-family:{mono}\">hermian collect {r}</span> gathers local context.</div>",
+            "<div style=\"margin-top:30px;background:#0F0E17;border-radius:12px;padding:16px 18px\">\
+             <div style=\"font:600 10.5px/1 {mono};letter-spacing:.1em;color:#8D8AA8\">ON <span style=\"letter-spacing:0\">{host}</span></div>\
+             <div style=\"margin-top:12px;font:13px/1.7 {mono};color:#ECEBF7;word-break:break-all\">\
+             <span style=\"color:#9A8CF7\">$</span> hermian show {r} &nbsp;<span style=\"color:#6B6888\"># full record</span><br>\
+             <span style=\"color:#9A8CF7\">$</span> hermian collect {r} &nbsp;<span style=\"color:#6B6888\"># local context</span></div></div>",
             mono = MONO,
-            r = esc(&alert.ref_id),
-            host = esc(&alert.host)
+            host = esc(&alert.host),
+            r = esc(&alert.ref_id)
         ));
-        h.push_str("</td></tr></table></td></tr>");
+        h.push_str("</td></tr>");
         h.push_str(&format!(
-            "<tr><td align=\"center\" class=\"hm-dim\" style=\"padding:22px 12px 0;font-size:12px;line-height:1.6;color:#8D8AA8\">\
-             Silent by default. Loud when it matters.<br>Sent by Hermian on {}. Who receives these is set in /etc/hermian/config.toml.</td></tr>",
-            esc(&alert.host)
+            "<tr><td align=\"center\" style=\"padding:26px 12px 0\">\
+             <img src=\"cid:{cid}\" width=\"112\" height=\"16\" alt=\"Hermian Security\" style=\"display:block;margin:0 auto;border:0;outline:none;opacity:.75\">\
+             <div class=\"hm-dim\" style=\"margin-top:10px;font-size:12px;line-height:1.6;color:#8D8AA8\">Silent by default. Loud when it matters.<br>\
+             Recipients are set in <span style=\"font-family:{mono}\">/etc/hermian/config.toml</span> on {host}.</div></td></tr>",
+            cid = COMPANY_CID,
+            mono = MONO,
+            host = esc(&alert.host)
         ));
         h.push_str("</table></td></tr></table></body></html>");
         h
@@ -469,8 +633,8 @@ pub mod email {
         }
         let plain = render(alert, Theme::Plain);
         let png = ContentType::parse("image/png").map_err(|e| format!("build message: {}", e))?;
-        // alternative(plain, related(html, logo)): the standard shape for
-        // HTML mail with an inline image.
+        // alternative(plain, related(html, logos)): the standard shape for
+        // HTML mail with inline images.
         b.multipart(
             MultiPart::alternative()
                 .singlepart(
@@ -486,8 +650,12 @@ pub mod email {
                                 .body(html(alert)),
                         )
                         .singlepart(
-                            Attachment::new_inline(MARK_CID.to_string())
-                                .body(MARK_PNG.to_vec(), png),
+                            Attachment::new_inline(LOCKUP_CID.to_string())
+                                .body(LOCKUP_PNG.to_vec(), png.clone()),
+                        )
+                        .singlepart(
+                            Attachment::new_inline(COMPANY_CID.to_string())
+                                .body(COMPANY_PNG.to_vec(), png),
                         ),
                 ),
         )
@@ -616,65 +784,69 @@ mod tests {
         assert!(b.contains("A &amp; B"));
         assert!(!b.contains("<modified>"));
         assert!(b.chars().count() <= 4096);
-        assert!(!b.contains("<pre>"));
-        assert!(!b.contains("Loader injection"));
-        assert!(!b.contains("Remove it."));
     }
 
     #[test]
     fn telegram_body_stays_under_the_limit_with_huge_facts() {
         let mut f = Finding::new(DetectionId::D3, Severity::High, "Cron job added", "x")
-            .what("w".repeat(5000));
+            .what("w".repeat(5000))
+            .why("<&>".repeat(3000));
         for i in 0..30 {
             f = f.fact(format!("Line {}", i), "<&>".repeat(2000));
+            f = f.action("<&>".repeat(500));
         }
-        let a = Alert::from_finding(f, "HER-1".into(), "web-01".into(), chrono::Utc::now());
+        let mut a = Alert::from_finding(f, "HER-1".into(), "<&>".repeat(400), chrono::Utc::now());
+        a.title = "<&>".repeat(400);
         let b = telegram::body(&a);
         assert!(b.chars().count() <= 4096, "{}", b.chars().count());
         assert!(b.ends_with("<code>hermian show HER-1</code>"));
         // Never a dangling entity or tag.
-        assert_eq!(b.matches("<code>").count(), b.matches("</code>").count());
-        assert_eq!(
-            b.matches("<blockquote>").count(),
-            b.matches("</blockquote>").count()
-        );
+        for (open, close) in [
+            ("<code>", "</code>"),
+            ("<pre>", "</pre>"),
+            ("<blockquote", "</blockquote>"),
+            ("<b>", "</b>"),
+        ] {
+            assert_eq!(
+                b.matches(open).count(),
+                b.matches(close).count(),
+                "{}",
+                open
+            );
+        }
         assert!(!b.contains("&am\n") && !b.contains("&l\n"));
     }
 
     #[test]
     fn telegram_body_has_a_meter_and_no_emoji() {
         let b = telegram::body(&alert());
-        // No emoji anywhere: severity is a word and a block meter.
+        // No emoji anywhere: severity is a word and a dot meter.
         assert!(!b.chars().any(|c| c as u32 >= 0x1F000), "{}", b);
         assert!(
             b.starts_with(
-                "<b>\u{25C9}\u{25C9}\u{25C9}\u{25C9} CRITICAL</b> \u{00B7} <code>web-01</code>"
+                "<b>\u{25C9}\u{25C9}\u{25C9}\u{25C9}  CRITICAL</b> \u{00B7} Persistence\n"
             ),
             "{}",
             b
         );
-        assert!(b.contains("<b>ld.so.preload &lt;modified&gt;</b>"));
-        assert!(b.contains("A &amp; B"));
-        // The why, the steps and the facts stay in the CLI.
-        assert!(!b.contains("Loader injection"));
-        assert!(!b.contains("Remove it."));
-        assert!(!b.contains("/tmp/evil.so"));
         assert!(b.ends_with("<code>hermian show HER-2025-0101-007</code>"));
     }
 
-    /// Header, headline, the sentence as a quote card, a quiet context line,
-    /// then the command to copy. Repeats show in the header.
+    /// Header (meter, level, family), headline, the sentence as a quote,
+    /// the fact sheet, the risk and steps collapsed, then the command.
     #[test]
     fn telegram_body_layout() {
         let mut a = alert();
         a.repeats = 3;
         let b = telegram::body(&a);
         let order = [
-            "<b>\u{25C9}\u{25C9}\u{25C9}\u{25C9} CRITICAL</b> \u{00B7} <code>web-01</code> \u{00B7} seen 3 times\n",
+            "<b>\u{25C9}\u{25C9}\u{25C9}\u{25C9}  CRITICAL</b> \u{00B7} Persistence \u{00B7} seen 3 times\n",
             "<b>ld.so.preload &lt;modified&gt;</b>",
             "<blockquote>A &amp; B</blockquote>",
-            "<i>hermian \u{00B7} D3 \u{00B7} ",
-            " UTC</i>\n<code>hermian show HER-2025-0101-007</code>",
+            "<pre>host      web-01\npreloads  /tmp/evil.so\nrule      D3 \u{00B7} Persistence modification\ntime      ",
+            " UTC</pre>",
+            "<blockquote expandable><b>Risk</b>\nLoader injection is a common persistence trick.\n\n<b>Next steps</b>\n1. Remove it.</blockquote>",
+            "<code>hermian show HER-2025-0101-007</code>",
         ];
         let mut at = 0;
         for part in order {
@@ -684,8 +856,40 @@ mod tests {
             at += i + part.len();
         }
         assert_eq!(at, b.len(), "{}", b);
-        // The product name is quiet context now, not a shouted header.
-        assert!(!b.contains("HERMIAN"), "{}", b);
+        // The bot's name says who's talking.
+        assert!(
+            !b.contains("HERMIAN") && !b.contains("hermian \u{00B7}"),
+            "{}",
+            b
+        );
+    }
+
+    /// The process chain shows on the fact sheet; no risk or steps means no
+    /// collapsed section.
+    #[test]
+    fn telegram_fact_sheet_has_the_chain() {
+        use hermian_core::alert::ChainNode;
+        let f = Finding::new(DetectionId::D1, Severity::High, "Web shell", "x").what("w");
+        let mut a = Alert::from_finding(f, "HER-3".into(), "web-01".into(), chrono::Utc::now());
+        a.chain = ["nginx", "sh", "curl"]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ChainNode {
+                pid: i as u32 + 1,
+                uid: 0,
+                user: None,
+                comm: c.to_string(),
+                exe: String::new(),
+                focus: false,
+            })
+            .collect();
+        let b = telegram::body(&a);
+        assert!(
+            b.contains("chain  nginx \u{203A} sh \u{203A} curl\n"),
+            "{}",
+            b
+        );
+        assert!(!b.contains("expandable"), "{}", b);
     }
 
     #[test]
@@ -706,27 +910,6 @@ mod tests {
             telegram::meter(Severity::Info),
             "\u{25C9}\u{25CB}\u{25CB}\u{25CB}"
         );
-    }
-
-    #[test]
-    fn telegram_body_is_a_headline_and_a_sentence() {
-        let f = Finding::new(
-            DetectionId::D2,
-            Severity::Low,
-            "SSH login from a new source",
-            "x",
-        )
-        .what("User 'deploy' authenticated (key) from 1.2.3.4, a source never seen before.")
-        .fact("Source", "1.2.3.4")
-        .why("Some explanation that stays in the CLI.")
-        .action("Do something about it.");
-        let a = Alert::from_finding(f, "HER-2".into(), "web-01".into(), chrono::Utc::now());
-        let b = telegram::body(&a);
-        assert!(b.contains("<b>SSH login from a new source</b>"), "{}", b);
-        assert!(b.contains("authenticated (key) from 1.2.3.4"), "{}", b);
-        assert!(!b.contains("Some explanation"), "{}", b);
-        assert!(!b.contains("Do something"), "{}", b);
-        assert!(b.chars().count() < 400, "{}", b);
     }
 
     /// The chain renders like a terminal, the flagged process in red, and
@@ -761,7 +944,7 @@ mod tests {
             h
         );
         assert!(h.contains("www-data \u{00B7} pid 42"));
-        assert!(h.contains("seen 4 times"));
+        assert!(h.contains("Seen 4 times"));
         assert!(!h.contains("<sh>"));
     }
 
@@ -789,28 +972,37 @@ mod tests {
         let a = alert();
         assert_eq!(
             email::subject(&a, "[Hermian]"),
-            "[Hermian] CRITICAL D3 | web-01 | ld.so.preload <modified>"
+            "[Hermian] CRITICAL: ld.so.preload <modified> (web-01)"
         );
         assert!(email::subject(&a, "[Hermian]").is_ascii());
         let h = email::html(&a);
         assert!(h.contains("&lt;modified&gt;"));
         assert!(h.contains("hermian show HER-2025-0101-007"));
-        assert!(h.contains("#D9344C"));
-        // Brand row (the logo by Content-ID), preheader, dark mode, sections.
-        assert!(h.contains("<img src=\"cid:hermian-mark\""));
-        assert!(h.contains(">hermian</span></td>"));
+        // Critical pill, four lit dots, the detection beside it.
+        assert!(h.contains("background:#FCE8EB"));
+        assert_eq!(
+            h.matches("vertical-align:middle;background:#D9344C")
+                .count(),
+            4
+        );
+        assert!(h.contains("D3 \u{00B7} PERSISTENCE MODIFICATION"));
+        // Header band and footer logos by Content-ID, the spec grid, both commands.
+        assert!(h.contains("<img src=\"cid:hermian-lockup\""));
+        assert!(h.contains("<img src=\"cid:hermian-company\""));
+        assert!(h.contains(">HOST<") && h.contains(">DETECTED<") && h.contains(">PRELOADS<"));
+        assert!(h.contains("# full record") && h.contains("hermian collect HER-2025-0101-007"));
         assert!(h.contains("display:none;max-height:0"));
         assert!(h.contains("prefers-color-scheme:dark"));
-        assert!(h.contains("WHY IT MATTERS") && h.contains("NEXT STEPS"));
+        assert!(h.contains(">RISK<") && h.contains("NEXT STEPS"));
         assert!(!h.contains("http"), "no remote assets");
-        assert_eq!(h.matches("<img").count(), 1, "only the inline logo");
+        assert_eq!(h.matches("<img").count(), 2, "only the inline logos");
     }
 
-    /// The logo travels inside the message: the HTML and the PNG share a
-    /// multipart/related part, and the PNG carries the Content-ID the HTML
+    /// The logos travel inside the message: the HTML and the PNGs share a
+    /// multipart/related part, and each PNG carries the Content-ID the HTML
     /// points at. The plain-text alternative stays.
     #[test]
-    fn email_carries_the_logo_inline() {
+    fn email_carries_the_logos_inline() {
         let cfg = EmailCfg {
             from: "hermian@example.com".into(),
             to: vec!["ops@example.com".into()],
@@ -819,12 +1011,15 @@ mod tests {
         let raw = String::from_utf8(email::build(&alert(), &cfg).unwrap().formatted()).unwrap();
         assert!(raw.contains("multipart/alternative"), "{}", raw);
         assert!(raw.contains("multipart/related"), "{}", raw);
-        assert!(raw.contains("Content-ID: <hermian-mark>"), "{}", raw);
+        assert!(raw.contains("Content-ID: <hermian-lockup>"), "{}", raw);
+        assert!(raw.contains("Content-ID: <hermian-company>"), "{}", raw);
         assert!(raw.contains("Content-Disposition: inline"), "{}", raw);
         assert!(raw.contains("Content-Type: image/png"), "{}", raw);
         assert!(raw.contains("Content-Type: text/plain"), "{}", raw);
-        // A real PNG, and small.
-        assert_eq!(&email::MARK_PNG[..8], b"\x89PNG\r\n\x1a\n");
-        assert!(email::MARK_PNG.len() < 2048);
+        // Real PNGs, and small.
+        for png in [email::LOCKUP_PNG, email::COMPANY_PNG] {
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            assert!(png.len() < 2048);
+        }
     }
 }

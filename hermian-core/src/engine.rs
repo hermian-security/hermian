@@ -2036,8 +2036,8 @@ mod tests {
         assert!(!alerts.is_empty());
         let rendered = crate::alert::render_alert(&alerts[0]);
         assert!(rendered.contains("HER-"));
-        assert!(rendered.contains("WHY THIS MATTERS"));
-        assert!(rendered.contains("RECOMMENDED ACTION"));
+        assert!(rendered.contains("RISK"));
+        assert!(rendered.contains("NEXT STEPS"));
     }
 
     #[test]
