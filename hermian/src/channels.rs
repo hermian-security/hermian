@@ -55,7 +55,7 @@ pub mod telegram {
 
     /// Cut `s` to at most `max` chars, marking the cut. Applied before
     /// escaping so an HTML entity is never split.
-    fn clip(s: &str, max: usize) -> String {
+    pub(super) fn clip(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             return s.to_string();
         }
@@ -64,32 +64,44 @@ pub mod telegram {
         out
     }
 
-    /// Build the HTML message body: the severity meter and host, the
-    /// headline, one or two sentences of what happened, and the
-    /// `hermian show` line. Evidence, the process chain, why it matters and
+    /// Build the HTML message body:
+    ///
+    /// ```text
+    /// ■■■■ CRITICAL · web-01                 <- meter, level, host (tap to copy)
+    /// Web server chain ran downloaded code   <- headline
+    /// ┃ nginx started a shell that ...       <- what happened, as a quote card
+    /// hermian · D1 · 03:14 UTC               <- quiet context
+    /// hermian show HER-2026-1006-415         <- tap to copy
+    /// ```
+    ///
+    /// Telegram allows no colour or fonts, so hierarchy does the work. The
+    /// bot's name and avatar already say who's talking, so the header leads
+    /// with the severity. Evidence, the process chain, why it matters and
     /// the recommended steps stay in the CLI; the message says what happened,
     /// nothing more.
     pub fn body(alert: &Alert) -> String {
         let mut out = format!(
-            "<b>{} HERMIAN - {}</b>\nHost : {}",
+            "<b>{} {}</b> \u{00B7} <code>{}</code>",
             meter(alert.severity),
             alert.severity.as_str(),
             esc(&clip(&alert.host, 60))
         );
         if alert.repeats > 1 {
-            out.push_str(&format!("  (seen {} times)", alert.repeats));
+            out.push_str(&format!(" \u{00B7} seen {} times", alert.repeats));
         }
         if !alert.title.trim().is_empty() {
-            out.push_str(&format!(
-                "\n\n<b>{}</b>",
-                esc(&clip(alert.title.trim(), 160))
-            ));
+            out.push_str(&format!("\n<b>{}</b>", esc(&clip(alert.title.trim(), 160))));
         }
         if !alert.what.is_empty() {
-            out.push_str(&format!("\n{}", esc(&clip(&alert.what, 500))));
+            out.push_str(&format!(
+                "\n\n<blockquote>{}</blockquote>",
+                esc(&clip(&alert.what, 500))
+            ));
         }
         out.push_str(&format!(
-            "\n\n<code>hermian show {}</code>",
+            "\n\n<i>hermian \u{00B7} {} \u{00B7} {} UTC</i>\n<code>hermian show {}</code>",
+            alert.detection.short(),
+            alert.ts.format("%H:%M"),
             esc(&alert.ref_id)
         ));
         out
@@ -210,12 +222,14 @@ pub mod email {
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SendmailTransport, SmtpTransport, Transport};
 
+    /// Severity colours from the identity, light palette (mail is mostly
+    /// read on light backgrounds; the dark-mode CSS keeps them readable).
     fn colour(s: Severity) -> &'static str {
         match s {
-            Severity::Critical => "#D62828",
-            Severity::High => "#F77F00",
-            Severity::Low => "#C9A227",
-            Severity::Info => "#8D99AE",
+            Severity::Critical => "#D9344C",
+            Severity::High => "#5B4FD0",
+            Severity::Low => "#6B6888",
+            Severity::Info => "#8D8AA8",
         }
     }
 
@@ -241,47 +255,132 @@ pub mod email {
         .to_string()
     }
 
-    /// Minimal, mail-client-safe HTML (inline styles, no external assets).
+    const SANS: &str =
+        "-apple-system,BlinkMacSystemFont,'Segoe UI',Manrope,Helvetica,Arial,sans-serif";
+    const MONO: &str = "'JetBrains Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
+
+    /// A section label in the brand accent.
+    fn eyebrow(label: &str) -> String {
+        format!(
+            "<div class=\"hm-ac\" style=\"margin-top:26px;font:600 11px/1 {};letter-spacing:.1em;color:#5B4FD0\">{}</div>",
+            MONO, label
+        )
+    }
+
+    /// The alert as a branded, mail-client-safe page: tables and inline
+    /// styles only (no images, no external assets), a hidden preheader for
+    /// the inbox preview, and a dark palette for clients that honour
+    /// `prefers-color-scheme`. Only the severity and the logo's dot carry
+    /// colour; the process chain is drawn like a terminal.
     pub fn html(alert: &Alert) -> String {
-        let mut h = String::new();
-        h.push_str("<!doctype html><html><body style=\"margin:0;padding:24px;background:#f4f5f7;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1b1f23\">");
-        h.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td align=\"center\">");
-        h.push_str("<table role=\"presentation\" width=\"640\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:640px;background:#fff;border-radius:8px;overflow:hidden;border:1px solid #e1e4e8\">");
+        let sev = colour(alert.severity);
+        let mut h = String::with_capacity(8192);
+        h.push_str(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+             <meta name=\"color-scheme\" content=\"light dark\">\
+             <meta name=\"supported-color-schemes\" content=\"light dark\">",
+        );
+        h.push_str(&format!("<title>{}</title>", esc(&alert.title)));
+        h.push_str(
+            "<style>@media (prefers-color-scheme:dark){\
+             .hm-bg{background:#0F0E17!important}\
+             .hm-card{background:#14131D!important;border-color:#2A2839!important}\
+             .hm-tx{color:#ECEBF7!important}.hm-dim{color:#8D8AA8!important}\
+             .hm-line{border-color:#2A2839!important}.hm-ac{color:#9A8CF7!important}\
+             .hm-box{background:#1A1926!important;border-color:#2A2839!important;color:#ECEBF7!important}}\
+             @media (max-width:620px){.hm-pad{padding-left:20px!important;padding-right:20px!important}}\
+             </style></head>",
+        );
         h.push_str(&format!(
-            "<tr><td style=\"background:{};color:#fff;padding:14px 20px;font-size:13px;font-weight:600;letter-spacing:.08em\">HERMIAN &nbsp;{}<span style=\"float:right;font-weight:400;opacity:.85\">{}</span></td></tr>",
-            colour(alert.severity),
-            alert.severity.as_str(),
-            alert.ref_id
+            "<body class=\"hm-bg\" style=\"margin:0;padding:0;background:#F4F4F8;font-family:{};color:#17142E\">",
+            SANS
+        ));
+        // Inbox preview text, padded so clients don't pull body text after it.
+        let preview =
+            super::telegram::clip(&format!("{} \u{00B7} {}", alert.host, alert.what), 140);
+        h.push_str(&format!(
+            "<div style=\"display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all\">{}{}</div>",
+            esc(&preview),
+            "&#847;&zwnj;&nbsp;".repeat(30)
+        ));
+        h.push_str(
+            "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"hm-bg\" style=\"background:#F4F4F8\">\
+             <tr><td align=\"center\" style=\"padding:32px 12px\">\
+             <table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;max-width:600px\">",
+        );
+        // Brand row: the mark as glyphs (strokes in ink, the dot in accent),
+        // the wordmark, and the reference on the right.
+        h.push_str(&format!(
+            "<tr><td style=\"padding:0 4px 14px\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
+             <td class=\"hm-tx\" style=\"font:600 17px/1 {sans};color:#17142E;letter-spacing:-.02em\">\
+             <span style=\"font-family:{mono};font-weight:500\">\u{2571}\u{2571}\u{2571}</span>\
+             <span class=\"hm-ac\" style=\"color:#5B4FD0\">\u{25CF}</span>&nbsp; hermian</td>\
+             <td align=\"right\" class=\"hm-dim\" style=\"font:12px/1 {mono};color:#6B6888\">{r}</td>\
+             </tr></table></td></tr>",
+            sans = SANS,
+            mono = MONO,
+            r = esc(&alert.ref_id)
+        ));
+        // The card, with a severity stripe on top.
+        h.push_str(
+            "<tr><td class=\"hm-card\" style=\"background:#FFFFFF;border:1px solid #E3E1EF;border-radius:16px;overflow:hidden\">",
+        );
+        h.push_str(&format!(
+            "<div style=\"height:4px;line-height:4px;font-size:0;background:{}\">&nbsp;</div>",
+            sev
+        ));
+        h.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr><td class=\"hm-pad\" style=\"padding:28px 32px 30px\">");
+        h.push_str(&format!(
+            "<div style=\"font:600 12px/1 {};letter-spacing:.08em;color:{}\">{}&nbsp; {}</div>",
+            MONO,
+            sev,
+            super::telegram::meter(alert.severity),
+            alert.severity.as_str()
         ));
         h.push_str(&format!(
-            "<tr><td style=\"padding:20px 20px 6px\"><div style=\"font-size:18px;font-weight:600;line-height:1.3\">{}</div>\
-             <div style=\"margin-top:6px;font-size:13px;color:#6a737d\">{} &nbsp;\u{00B7}&nbsp; {} UTC &nbsp;\u{00B7}&nbsp; {} {}</div></td></tr>",
-            esc(&alert.title),
-            esc(&alert.host),
-            alert.ts.format("%Y-%m-%d %H:%M:%S"),
-            alert.detection.short(),
-            esc(alert.detection.name())
+            "<h1 class=\"hm-tx\" style=\"margin:14px 0 0;font:600 22px/1.3 {};letter-spacing:-.015em;color:#17142E\">{}</h1>",
+            SANS,
+            esc(&alert.title)
         ));
-        let section = |title: &str, body: String| {
-            format!(
-                "<tr><td style=\"padding:14px 20px 0\"><div style=\"font-size:11px;font-weight:700;letter-spacing:.1em;color:#6a737d\">{}</div><div style=\"margin-top:6px;font-size:14px;line-height:1.5\">{}</div></td></tr>",
-                title, body
-            )
+        let repeats = if alert.repeats > 1 {
+            format!(" &nbsp;\u{00B7}&nbsp; seen {} times", alert.repeats)
+        } else {
+            String::new()
         };
-        let mut what = esc(&alert.what);
+        h.push_str(&format!(
+            "<div class=\"hm-dim\" style=\"margin-top:8px;font-size:13px;line-height:1.5;color:#6B6888\">{} &nbsp;\u{00B7}&nbsp; {} {} &nbsp;\u{00B7}&nbsp; {} UTC{}</div>",
+            esc(&alert.host),
+            alert.detection.short(),
+            esc(alert.detection.name()),
+            alert.ts.format("%Y-%m-%d %H:%M:%S"),
+            repeats
+        ));
+        if !alert.what.is_empty() {
+            h.push_str(&format!(
+                "<p class=\"hm-tx\" style=\"margin:20px 0 0;font-size:15px;line-height:1.6;color:#17142E\">{}</p>",
+                esc(&alert.what)
+            ));
+        }
         if !alert.chain.is_empty() {
-            what.push_str("<pre style=\"margin:10px 0 0;padding:10px 12px;background:#f6f8fa;border-radius:6px;font:12px/1.5 SFMono-Regular,Menlo,Consolas,monospace\">");
+            h.push_str(&format!(
+                "<div style=\"margin-top:20px;background:#0F0E17;border-radius:12px;padding:16px 18px;font:12.5px/1.75 {};color:#ECEBF7;word-break:break-all\">",
+                MONO
+            ));
             for (i, n) in alert.chain.iter().enumerate() {
-                let indent = "   ".repeat(i.saturating_sub(1));
+                let indent = "&nbsp;&nbsp;&nbsp;".repeat(i.saturating_sub(1));
                 let conn = if i == 0 { "" } else { "\u{2514}\u{2500} " };
                 let user = n.user.clone().unwrap_or_else(|| format!("uid {}", n.uid));
                 let name = if n.focus {
-                    format!("<b>{}</b>", esc(&n.comm))
+                    format!(
+                        "<span style=\"color:#FF6B81;font-weight:600\">{}</span>",
+                        esc(&n.comm)
+                    )
                 } else {
                     esc(&n.comm)
                 };
-                what.push_str(&format!(
-                    "{}{}{}  <span style=\"color:#6a737d\">{} \u{00B7} pid {}</span>\n",
+                h.push_str(&format!(
+                    "{}<span style=\"color:#4D4A6B\">{}</span>{} <span style=\"color:#8D8AA8\">{} \u{00B7} pid {}</span><br>",
                     indent,
                     conn,
                     name,
@@ -289,34 +388,56 @@ pub mod email {
                     n.pid
                 ));
             }
-            what.push_str("</pre>");
+            h.push_str("</div>");
         }
         if !alert.facts.is_empty() {
-            what.push_str("<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:10px;font-size:13px\">");
+            h.push_str("<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:18px\">");
             for f in &alert.facts {
-                what.push_str(&format!(
-                    "<tr><td style=\"color:#6a737d;padding:2px 14px 2px 0;white-space:nowrap\">{}</td><td style=\"font-family:SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all\">{}</td></tr>",
+                h.push_str(&format!(
+                    "<tr><td class=\"hm-dim hm-line\" style=\"padding:8px 16px 8px 0;border-top:1px solid #E3E1EF;font-size:12.5px;color:#6B6888;white-space:nowrap;vertical-align:top\">{}</td>\
+                     <td class=\"hm-tx hm-line\" style=\"padding:8px 0;border-top:1px solid #E3E1EF;font:12.5px/1.5 {};color:#17142E;word-break:break-all\">{}</td></tr>",
                     esc(&f.label),
+                    MONO,
                     esc(&f.value)
                 ));
             }
-            what.push_str("</table>");
+            h.push_str("</table>");
         }
-        h.push_str(&section("WHAT HAPPENED", what));
         if !alert.why.is_empty() {
-            h.push_str(&section("WHY THIS MATTERS", esc(&alert.why)));
+            h.push_str(&eyebrow("WHY IT MATTERS"));
+            h.push_str(&format!(
+                "<p class=\"hm-tx\" style=\"margin:10px 0 0;font-size:14.5px;line-height:1.6;color:#17142E\">{}</p>",
+                esc(&alert.why)
+            ));
         }
         if !alert.actions.is_empty() {
-            let mut ol = String::from("<ol style=\"margin:0;padding-left:20px\">");
-            for a in &alert.actions {
-                ol.push_str(&format!("<li style=\"margin:2px 0\">{}</li>", esc(a)));
+            h.push_str(&eyebrow("NEXT STEPS"));
+            h.push_str("<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"margin-top:8px\">");
+            for (i, a) in alert.actions.iter().enumerate() {
+                h.push_str(&format!(
+                    "<tr><td class=\"hm-ac\" style=\"padding:4px 12px 4px 0;font:600 12.5px/1.6 {};color:#5B4FD0;vertical-align:top\">{}</td>\
+                     <td class=\"hm-tx\" style=\"padding:4px 0;font-size:14.5px;line-height:1.6;color:#17142E\">{}</td></tr>",
+                    MONO,
+                    i + 1,
+                    esc(a)
+                ));
             }
-            ol.push_str("</ol>");
-            h.push_str(&section("RECOMMENDED ACTION", ol));
+            h.push_str("</table>");
         }
         h.push_str(&format!(
-            "<tr><td style=\"padding:18px 20px 20px;font:12px SFMono-Regular,Menlo,Consolas,monospace;color:#6a737d;border-top:1px solid #e1e4e8;margin-top:14px\">hermian show {r} &nbsp;&nbsp;\u{00B7}&nbsp;&nbsp; hermian collect {r}</td></tr>",
-            r = alert.ref_id
+            "<div class=\"hm-box\" style=\"margin-top:26px;border:1px solid #E3E1EF;background:#F7F7FB;border-radius:10px;padding:12px 16px;font:13px/1.5 {mono};color:#17142E\">\
+             <span class=\"hm-dim\" style=\"color:#8D8AA8\">$</span> hermian show {r}</div>\
+             <div class=\"hm-dim\" style=\"margin-top:8px;font-size:12.5px;line-height:1.5;color:#6B6888\">Run it on {host} for the full record. \
+             <span style=\"font-family:{mono}\">hermian collect {r}</span> gathers local context.</div>",
+            mono = MONO,
+            r = esc(&alert.ref_id),
+            host = esc(&alert.host)
+        ));
+        h.push_str("</td></tr></table></td></tr>");
+        h.push_str(&format!(
+            "<tr><td align=\"center\" class=\"hm-dim\" style=\"padding:22px 12px 0;font-size:12px;line-height:1.6;color:#8D8AA8\">\
+             Silent by default. Loud when it matters.<br>Sent by Hermian on {}. Who receives these is set in /etc/hermian/config.toml.</td></tr>",
+            esc(&alert.host)
         ));
         h.push_str("</table></td></tr></table></body></html>");
         h
@@ -497,6 +618,10 @@ mod tests {
         assert!(b.ends_with("<code>hermian show HER-1</code>"));
         // Never a dangling entity or tag.
         assert_eq!(b.matches("<code>").count(), b.matches("</code>").count());
+        assert_eq!(
+            b.matches("<blockquote>").count(),
+            b.matches("</blockquote>").count()
+        );
         assert!(!b.contains("&am\n") && !b.contains("&l\n"));
     }
 
@@ -506,11 +631,12 @@ mod tests {
         // No emoji anywhere: severity is a word and a block meter.
         assert!(!b.chars().any(|c| c as u32 >= 0x1F000), "{}", b);
         assert!(
-            b.starts_with("<b>\u{25A0}\u{25A0}\u{25A0}\u{25A0} HERMIAN - CRITICAL</b>"),
+            b.starts_with(
+                "<b>\u{25A0}\u{25A0}\u{25A0}\u{25A0} CRITICAL</b> \u{00B7} <code>web-01</code>"
+            ),
             "{}",
             b
         );
-        assert!(b.contains("Host : web-01"));
         assert!(b.contains("<b>ld.so.preload &lt;modified&gt;</b>"));
         assert!(b.contains("A &amp; B"));
         // The why, the steps and the facts stay in the CLI.
@@ -518,6 +644,32 @@ mod tests {
         assert!(!b.contains("Remove it."));
         assert!(!b.contains("/tmp/evil.so"));
         assert!(b.ends_with("<code>hermian show HER-2025-0101-007</code>"));
+    }
+
+    /// Header, headline, the sentence as a quote card, a quiet context line,
+    /// then the command to copy. Repeats show in the header.
+    #[test]
+    fn telegram_body_layout() {
+        let mut a = alert();
+        a.repeats = 3;
+        let b = telegram::body(&a);
+        let order = [
+            "<b>\u{25A0}\u{25A0}\u{25A0}\u{25A0} CRITICAL</b> \u{00B7} <code>web-01</code> \u{00B7} seen 3 times\n",
+            "<b>ld.so.preload &lt;modified&gt;</b>",
+            "<blockquote>A &amp; B</blockquote>",
+            "<i>hermian \u{00B7} D3 \u{00B7} ",
+            " UTC</i>\n<code>hermian show HER-2025-0101-007</code>",
+        ];
+        let mut at = 0;
+        for part in order {
+            let i = b[at..]
+                .find(part)
+                .unwrap_or_else(|| panic!("{:?} not after {} in {}", part, at, b));
+            at += i + part.len();
+        }
+        assert_eq!(at, b.len(), "{}", b);
+        // The product name is quiet context now, not a shouted header.
+        assert!(!b.contains("HERMIAN"), "{}", b);
     }
 
     #[test]
@@ -561,6 +713,42 @@ mod tests {
         assert!(b.chars().count() < 400, "{}", b);
     }
 
+    /// The chain renders like a terminal, the flagged process in red, and
+    /// everything user-controlled is escaped.
+    #[test]
+    fn email_html_chain_and_escaping() {
+        use hermian_core::alert::ChainNode;
+        let mut a = alert();
+        a.chain = vec![
+            ChainNode {
+                pid: 1,
+                uid: 0,
+                user: Some("root".into()),
+                comm: "systemd".into(),
+                exe: String::new(),
+                focus: false,
+            },
+            ChainNode {
+                pid: 42,
+                uid: 33,
+                user: Some("www-data".into()),
+                comm: "<sh>".into(),
+                exe: String::new(),
+                focus: true,
+            },
+        ];
+        a.repeats = 4;
+        let h = email::html(&a);
+        assert!(
+            h.contains("color:#FF6B81;font-weight:600\">&lt;sh&gt;</span>"),
+            "{}",
+            h
+        );
+        assert!(h.contains("www-data \u{00B7} pid 42"));
+        assert!(h.contains("seen 4 times"));
+        assert!(!h.contains("<sh>"));
+    }
+
     #[test]
     fn smtp_credentials_need_tls_unless_local() {
         let mut c = EmailCfg {
@@ -591,6 +779,16 @@ mod tests {
         let h = email::html(&a);
         assert!(h.contains("&lt;modified&gt;"));
         assert!(h.contains("hermian show HER-2025-0101-007"));
-        assert!(h.contains("#D62828"));
+        assert!(h.contains("#D9344C"));
+        // Brand row, preheader, dark mode, terminal-style chain-free card.
+        assert!(h.contains("\u{2571}\u{2571}\u{2571}"));
+        assert!(h.contains("&nbsp; hermian</td>"));
+        assert!(h.contains("display:none;max-height:0"));
+        assert!(h.contains("prefers-color-scheme:dark"));
+        assert!(h.contains("WHY IT MATTERS") && h.contains("NEXT STEPS"));
+        assert!(
+            !h.contains("<img") && !h.contains("http"),
+            "no remote assets"
+        );
     }
 }

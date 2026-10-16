@@ -16,30 +16,17 @@ September 2026. Broader testing across distros and time is in progress. Start
 on a test host. The verified numbers are in [docs/EVIDENCE.md](docs/EVIDENCE.md),
 and the known gaps are in [Limits](#limits).
 
-Here's what an alert looks like (Telegram; the CLI has the full record):
+Here's what an alert looks like in Telegram (the CLI and email carry the full
+record: process chain, evidence, why it matters, next steps):
 
 ```
-■■■■ HERMIAN - CRITICAL
-Host : web-01
+■■■■ CRITICAL · web-01
+Web server chain ran downloaded code
 
-- Web server chain ran downloaded code :
+┃ nginx started a shell that downloaded a file and is now running it as
+┃ www-data.
 
-nginx started a shell that downloaded a file and is now running it as
-www-data.
-
-Chain  nginx → sh → curl → /tmp/.x
-File   /tmp/.x
-
-━━━━━━━━━━━━━━━━
-
-Web servers don't normally spawn shells. The chain then downloaded a
-file from the internet, which is the shape of a web shell dropped on a
-vulnerable app.
-
-Also
-1. Isolate the host unless this is expected.
-
-━━━━━━━━━━━━━━━━
+hermian · D1 · 03:14 UTC
 hermian show HER-2026-1006-415
 ```
 

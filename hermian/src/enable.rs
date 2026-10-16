@@ -83,6 +83,9 @@ fn render_watchdog_units(exec_path: &str) -> (String, String) {
 pub fn run(args: &EnableArgs) -> Result<()> {
     config::require_root()?;
     let st = Style::detect();
+    if !args.quiet {
+        println!("\n{}\n", st.brand(hermian_core::VERSION));
+    }
     let cfg = config::load_config()?;
 
     for dir in [paths::state_dir(), paths::log_dir(), paths::run_dir()] {

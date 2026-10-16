@@ -6,6 +6,22 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- `hermian enable` opens with the new identity: the mark (three strokes and
+  the signal dot, the only coloured part) beside the wordmark and tagline.
+  `--quiet` (used by the package) still prints nothing.
+- Telegram alerts are laid out for scanning: `■■■■ CRITICAL · web-01`, the
+  headline, the sentence as a quote card, a quiet `hermian · D1 · time` line
+  and the `hermian show` command. Same content as before; the evidence still
+  stays in the CLI.
+- Alert emails use the identity: brand row, severity stripe and meter, the
+  process chain drawn like a terminal with the flagged process in red, facts,
+  why it matters, numbered next steps and the command to run. Severity
+  colours follow the site (CRITICAL red, HIGH purple), there's an inbox
+  preview line, and a dark palette for clients that support it. No images or
+  remote assets.
+
 ## 0.1.0-beta.7 - 2026-10-15
 
 The first release with the one-command installer: a dead-man switch, durable
