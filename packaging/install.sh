@@ -75,6 +75,22 @@ install_tree() { # extracted tarball dir
     run /usr/local/bin/hermian enable
 }
 
+# A tarball install leaves /usr/local/bin/hermian, which comes before the
+# package's /usr/bin/hermian in PATH: after moving to the .deb, every
+# `hermian` typed in a shell would still run the old version. Only removes a
+# file that answers --version as hermian.
+drop_shadow() { # old new
+    [ -x "$1" ] && [ -x "$2" ] || return 0
+    [ "$1" -ef "$2" ] && return 0
+    _old=$("$1" --version 2>/dev/null || true)
+    case "$_old" in
+        "hermian "*) ;;
+        *) echo "hermian: leaving $1 alone (not a hermian binary)"; return 0 ;;
+    esac
+    say "removing $1 (${_old#hermian }, from an earlier tarball install); $2 replaces it"
+    run rm -f "$1"
+}
+
 install_local() { # dir holding this script and the binary
     cd "$1" || die "cannot enter $1"
     say "installing the tarball at $(pwd)"
@@ -137,6 +153,7 @@ install_remote() {
             chmod 755 "$TD"   # so apt's sandbox user can read the .deb
             say "installing $_name with apt"
             run apt-get install -y "$TD/$_name"
+            drop_shadow /usr/local/bin/hermian /usr/bin/hermian
             ;;
         *)
             say "extracting $_name"

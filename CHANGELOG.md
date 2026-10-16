@@ -6,6 +6,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Fixed
+
+- Moving from the tarball to the `.deb` with `install.sh` left the old
+  `/usr/local/bin/hermian` in place, ahead of the package's `/usr/bin/hermian`
+  in PATH, so `hermian status` and every other command kept running the old
+  version (the daemon itself was upgraded). The installer now removes it,
+  after checking it really is a hermian binary, and says so.
+
 ## 0.1.0-beta.8 - 2026-10-16
 
 The new identity reaches the product: the CLI banner, Telegram alerts and

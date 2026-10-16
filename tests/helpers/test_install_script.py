@@ -80,5 +80,66 @@ class InstallModeTests(unittest.TestCase):
         self.assertIn("extracted tarball", res.stdout)
 
 
+@unittest.skipIf(SH is None, "needs a POSIX sh")
+class DropShadowTests(unittest.TestCase):
+    """drop_shadow, run on its own against temporary paths.
+
+    A box moved from the tarball to the .deb kept /usr/local/bin/hermian
+    (beta.5) ahead of the package's /usr/bin/hermian (beta.8) in PATH, so
+    the CLI kept running the old version.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        text = INSTALL.read_text()
+        start = text.index("say() {")
+        end = text.index("\n}\n", text.index("drop_shadow() {")) + 3
+        # say/die/run plus drop_shadow; main() never runs.
+        self.funcs = text[start:end]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fake(self, name, version_line):
+        p = self.tmp / name
+        p.write_text("#!/bin/sh\necho '%s'\n" % version_line)
+        p.chmod(0o755)
+        return p
+
+    def drop(self, old, new, dry_run=0):
+        script = "%s\ndry_run=%d\ndrop_shadow '%s' '%s'\n" % (
+            self.funcs, dry_run, old.as_posix(), new.as_posix())
+        return subprocess.run([SH, "-c", script], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True,
+                              timeout=30).stdout
+
+    def test_old_tarball_binary_is_removed(self):
+        old = self.fake("old", "hermian 0.1.0-beta.5")
+        new = self.fake("new", "hermian 0.1.0-beta.8")
+        out = self.drop(old, new)
+        self.assertFalse(old.exists(), out)
+        self.assertTrue(new.exists())
+        self.assertIn("0.1.0-beta.5", out)
+
+    def test_dry_run_only_says_so(self):
+        old = self.fake("old", "hermian 0.1.0-beta.5")
+        new = self.fake("new", "hermian 0.1.0-beta.8")
+        out = self.drop(old, new, dry_run=1)
+        self.assertTrue(old.exists())
+        self.assertIn("(dry-run) rm -f", out)
+
+    def test_something_else_at_that_path_is_kept(self):
+        old = self.fake("old", "some other tool 2.0")
+        new = self.fake("new", "hermian 0.1.0-beta.8")
+        out = self.drop(old, new)
+        self.assertTrue(old.exists())
+        self.assertIn("leaving", out)
+
+    def test_nothing_happens_without_the_package_binary(self):
+        old = self.fake("old", "hermian 0.1.0-beta.5")
+        self.drop(old, self.tmp / "missing")
+        self.assertTrue(old.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
