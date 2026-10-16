@@ -6,113 +6,199 @@
 <title>Hermian APT repository</title>
 <meta name="description" content="Signed Debian and Ubuntu packages for Hermian, the open-source intrusion alarm for Linux servers.">
 <meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fafafd" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f0e17" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="https://hermian.me/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/manrope-latin.woff2" as="font" type="font/woff2" crossorigin>
 <style>
-:root{--bg:#F4F4F8;--card:#FFFFFF;--tx:#17142E;--tx2:#3A3756;--dim:#6B6888;--line:#E3E1EF;--ac:#5B4FD0;--code:#0F0E17;--codetx:#ECEBF7;--codedim:#8D8AA8}
-@media (prefers-color-scheme:dark){:root{--bg:#0F0E17;--card:#14131D;--tx:#ECEBF7;--tx2:#C9C7DA;--dim:#8D8AA8;--line:#2A2839;--ac:#9A8CF7;--code:#0B0A12}}
-*{box-sizing:border-box}
-html{background:var(--bg)}
-body{margin:0;font:400 15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Manrope,Helvetica,Arial,sans-serif;color:var(--tx);background:var(--bg)}
-.w{max-width:760px;margin:0 auto;padding:48px 20px 56px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:16px}
-.top img{height:30px;width:auto;display:block}
-.top a{font:500 13px "JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--dim);text-decoration:none}
-.top a:hover{color:var(--ac)}
-.top img.lk-d{display:none}@media (prefers-color-scheme:dark){.top img.lk-l{display:none}.top img.lk-d{display:block}}
-h1{margin:48px 0 0;font-size:34px;line-height:1.15;letter-spacing:-.025em;font-weight:650}
-.lead{margin:12px 0 0;font-size:17px;color:var(--tx2);max-width:600px}
-.meta{margin:22px 0 0;display:flex;flex-wrap:wrap;gap:8px}
-.meta span{font:500 12px "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:5px 11px;background:var(--card)}
-.meta b{color:var(--tx);font-weight:600}
-.eb{margin:44px 0 12px;font:600 11px "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;letter-spacing:.12em;color:var(--ac)}
-.step{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 18px 16px;margin-top:12px}
-.step h2{margin:0;font-size:15px;font-weight:600;display:flex;gap:10px;align-items:baseline}
-.step h2 i{font:600 12px "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;font-style:normal;color:var(--ac)}
-.step p{margin:6px 0 0;color:var(--dim);font-size:14px}
-.code{position:relative;margin-top:12px;background:var(--code);border-radius:10px}
-pre{margin:0;padding:14px 76px 14px 16px;overflow-x:auto;font:13px/1.65 "JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--codetx)}
-pre .d{color:var(--codedim)}
-button{position:absolute;top:8px;right:8px;font:500 11px "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;color:var(--codedim);background:transparent;border:1px solid #2E2B42;border-radius:6px;padding:4px 9px;cursor:pointer}
-button:hover{color:var(--codetx);border-color:#4D4A6B}
-table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;font-size:14px}
-th,td{text-align:left;padding:11px 16px;border-top:1px solid var(--line)}
-tr:first-child th{border-top:0}th{font:600 11px "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;letter-spacing:.1em;color:var(--dim);background:transparent}
-td code,.fp{font:13px "JetBrains Mono",ui-monospace,Menlo,Consolas,monospace}
-.fp{display:block;margin-top:10px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--card);word-break:break-all;color:var(--tx)}
-.note{margin-top:10px;color:var(--dim);font-size:14px}
-a{color:var(--ac)}
-footer{margin-top:56px;padding-top:22px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between;color:var(--dim);font-size:13px}
-footer img{height:16px;width:auto;opacity:.8}
+/* Brand: docs/BRAND.md. Fonts: Manrope and JetBrains Mono (SIL OFL 1.1, fonts/OFL-*.txt). */
+@font-face{font-family:Manrope;font-style:normal;font-weight:200 800;font-display:swap;src:url(fonts/manrope-latin.woff2) format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:Manrope;font-style:normal;font-weight:200 800;font-display:swap;src:url(fonts/manrope-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+1E00-1E9F,U+1EF2-1EFF,U+20A0-20AB,U+20AD-20C4,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400 500;font-display:swap;src:url(fonts/jetbrainsmono-latin.woff2) format('woff2');unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:400 500;font-display:swap;src:url(fonts/jetbrainsmono-latin-ext.woff2) format('woff2');unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+1E00-1E9F,U+1EF2-1EFF,U+20A0-20AB,U+20AD-20C4,U+2C60-2C7F,U+A720-A7FF}
+
+:root{--bg:#fafafd;--card:#fff;--line:#e3e1ef;--ln2:#b4b0d4;--tx:#17142e;--tx2:#3a3756;--dim:#6b6888;--ac:#5b4fd0;--glow:rgba(91,79,208,.10);--dot:rgba(23,20,46,.06);
+ --term:#0f0e17;--termbar:#16151f;--termline:#2a2839;--termtx:#ecebf7;--termdim:#8d8aa8;--termac:#9a8cf7;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0f0e17;--card:#14131d;--line:#2a2839;--ln2:#4d4a6b;--tx:#ecebf7;--tx2:#c9c7da;--dim:#8d8aa8;--ac:#9a8cf7;--glow:rgba(154,140,247,.15);--dot:rgba(236,235,247,.05);
+ --term:#0b0a12;--termbar:#14131d;color-scheme:dark}}
+
+*{box-sizing:border-box;margin:0}
+html{background:var(--bg);scrollbar-width:thin;scrollbar-color:var(--ln2) var(--bg)}
+body{font-family:Manrope,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;font-size:16px;line-height:1.6;color:var(--tx);background:
+ radial-gradient(900px 520px at 85% -10%,var(--glow),transparent 70%),
+ radial-gradient(700px 420px at -10% 30%,var(--glow),transparent 70%),var(--bg);
+ -webkit-font-smoothing:antialiased;min-height:100vh}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background-image:radial-gradient(var(--dot) 1px,transparent 1.2px);background-size:24px 24px;
+ -webkit-mask-image:linear-gradient(180deg,#000,transparent 70%);mask-image:linear-gradient(180deg,#000,transparent 70%)}
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:color-mix(in srgb,var(--ln2) 75%,transparent);border:3px solid transparent;border-radius:99px;background-clip:padding-box;min-height:48px}
+::-webkit-scrollbar-thumb:hover{background:var(--ac);background-clip:padding-box}
+::-webkit-scrollbar-corner{background:transparent}
+.mono,code,pre{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+a{color:var(--ac);text-decoration:none}a:hover{text-decoration:underline;text-underline-offset:3px}
+
+.w{position:relative;max-width:1120px;margin:0 auto;padding:28px clamp(20px,4vw,40px) 48px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+header .lk{display:block;height:32px}header .lk img{height:32px;width:auto;display:block}
+header .lk .d{display:none}
+@media (prefers-color-scheme:dark){header .lk .l{display:none}header .lk .d{display:block}}
+nav{display:flex;gap:6px;flex-wrap:wrap}
+nav a{font:500 13px Manrope,system-ui,sans-serif;color:var(--dim);padding:7px 13px;border:1px solid var(--line);border-radius:99px;background:color-mix(in srgb,var(--card) 70%,transparent);backdrop-filter:blur(8px)}
+nav a:hover{color:var(--tx);border-color:var(--ln2);text-decoration:none}
+
+.hero{padding:clamp(44px,8vw,88px) 0 clamp(28px,4vw,40px);max-width:760px}
+.eb{font:500 11px 'JetBrains Mono',monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--ac)}
+h1{margin-top:14px;font-size:clamp(38px,5.4vw,60px);line-height:1.05;font-weight:500;letter-spacing:-.035em}
+h1 span{color:var(--dim)}
+.lead{margin-top:18px;font-size:clamp(16px,1.6vw,18px);line-height:1.65;color:var(--tx2);max-width:620px}
+.lead code{font-size:.92em;color:var(--tx)}
+.chips{margin-top:24px;display:flex;flex-wrap:wrap;gap:8px}
+.chips span{font:500 12px 'JetBrains Mono',monospace;color:var(--dim);border:1px solid var(--line);border-radius:99px;padding:6px 12px;background:var(--card)}
+.chips b{font-weight:500;color:var(--tx)}
+.chips .on:before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ac);margin-right:8px;box-shadow:0 0 0 4px var(--glow);vertical-align:1px}
+
+.grid{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:clamp(20px,3vw,36px);align-items:start}
+aside{position:sticky;top:24px;display:flex;flex-direction:column;gap:16px}
+@media (max-width:960px){.grid{grid-template-columns:minmax(0,1fr)}aside{position:static}}
+
+.sec+.sec{margin-top:40px}
+.sec>.eb{margin-bottom:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px 22px 20px}
+.card+.card{margin-top:14px}
+.card h2{font-size:17px;font-weight:600;letter-spacing:-.01em;display:flex;gap:12px;align-items:baseline}
+.card h2 i{font:500 12px 'JetBrains Mono',monospace;font-style:normal;color:var(--ac)}
+.card p{margin-top:6px;color:var(--dim);font-size:14.5px}
+.card p code{font-size:.92em;color:var(--tx)}
+.card.feat{border-color:color-mix(in srgb,var(--ac) 45%,var(--line));box-shadow:0 0 0 4px var(--glow)}
+
+.term{margin-top:14px;background:var(--term);border:1px solid var(--termline);border-radius:12px;overflow:hidden}
+.term .bar{height:36px;display:flex;align-items:center;gap:6px;padding:0 8px 0 14px;background:var(--termbar);border-bottom:1px solid var(--termline)}
+.term .bar i{width:9px;height:9px;border-radius:50%;background:var(--termline)}
+.term .bar span{margin-left:8px;font:500 11.5px 'JetBrains Mono',monospace;color:var(--termdim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.term button{margin-left:auto;flex:none;font:500 11.5px 'JetBrains Mono',monospace;color:var(--termdim);background:transparent;border:1px solid var(--termline);border-radius:7px;padding:4px 10px;cursor:pointer;transition:color .2s,border-color .2s}
+.term button:hover{color:var(--termtx);border-color:var(--termac)}
+.term button.ok{color:var(--termac);border-color:var(--termac)}
+.term pre{padding:14px 16px 16px;overflow-x:auto;font-size:13.5px;line-height:1.7;color:var(--termtx);scrollbar-width:thin;scrollbar-color:#4d4a6b transparent}
+.term pre::-webkit-scrollbar-thumb{background:rgba(77,74,107,.8);border-color:var(--term)}
+.term pre::-webkit-scrollbar-thumb:hover{background:var(--termac)}
+.term .p{color:var(--termac)}.term .d{color:var(--termdim)}
+
+.suite{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;border-top:1px solid var(--line)}
+.suite:first-of-type{border-top:0;padding-top:2px}
+.suite div{display:flex;flex-direction:column;min-width:0}
+.suite div code{font-size:13.5px;font-weight:500;color:var(--tx)}
+.suite div span{font-size:13px;color:var(--dim)}
+.suite .v{flex:none;font-size:12.5px;color:var(--tx);background:color-mix(in srgb,var(--ac) 8%,var(--card));border:1px solid var(--line);border-radius:7px;padding:3px 8px;white-space:nowrap}
+.fp{display:block;margin-top:12px;font:500 13.5px/1.7 'JetBrains Mono',monospace;color:var(--tx);letter-spacing:.02em;word-spacing:.15em;
+ padding:12px 14px;border-radius:10px;background:color-mix(in srgb,var(--ac) 6%,var(--card));border:1px solid var(--line)}
+.side h3{font-size:15px;font-weight:600;margin-bottom:10px}
+.side p{color:var(--dim);font-size:14px;margin-top:8px}
+.side p code{font-size:.92em;color:var(--tx)}
+.side .term{margin-top:12px}.side .term pre{font-size:12.5px}
+
+footer{margin-top:clamp(48px,7vw,80px);padding-top:24px;border-top:1px solid var(--line);display:flex;flex-wrap:wrap;gap:14px 24px;align-items:center;justify-content:space-between;font-size:13.5px;color:var(--dim)}
+footer img{height:18px;width:auto;display:block;opacity:.85}
+footer .fl{display:flex;gap:18px;flex-wrap:wrap}
+footer .fl a{color:var(--dim)}footer .fl a:hover{color:var(--tx)}
+
+@media (max-width:560px){
+ .card{padding:18px 16px 16px;border-radius:14px}
+ .term pre{font-size:12.5px;padding:12px 14px 14px;white-space:pre-wrap;word-break:break-all}
+ nav a{padding:6px 11px}
+}
 </style>
 </head>
 <body>
 <div class="w">
- <div class="top">
-  <a href="https://hermian.me" aria-label="Hermian home"><img class="lk-l" src="lockup-light.svg" alt="Hermian"><img class="lk-d" src="lockup-dark.svg" alt="Hermian"></a>
-  <a href="https://github.com/hermian-security/hermian">github.com/hermian-security/hermian</a>
- </div>
+ <header>
+  <a class="lk" href="https://hermian.me" aria-label="Hermian home"><img class="l" src="lockup-light.svg" alt="Hermian" width="127" height="32"><img class="d" src="lockup-dark.svg" alt="Hermian" width="127" height="32"></a>
+  <nav><a href="https://hermian.me">Website</a><a href="https://github.com/hermian-security/hermian">GitHub</a><a href="https://github.com/hermian-security/hermian/releases">Releases</a></nav>
+ </header>
 
- <h1>APT repository</h1>
- <p class="lead">Signed Debian and Ubuntu packages. Add it once and <code>apt upgrade</code> keeps Hermian current, like any other package.</p>
- <div class="meta"><span>latest <b>@VERSION@</b></span><span>amd64 · arm64</span><span>Debian · Ubuntu</span><span>signed with ed25519</span></div>
+ <section class="hero">
+  <div class="eb">apt.hermian.me</div>
+  <h1>Hermian, kept current<br><span>by apt.</span></h1>
+  <p class="lead">Signed packages for Debian and Ubuntu. Add the repository once and <code>apt upgrade</code> updates Hermian like any other package. Every download is checked against the key below.</p>
+  <div class="chips"><span class="on">latest <b>@VERSION@</b></span><span>amd64 · arm64</span><span>Debian · Ubuntu</span><span>ed25519 signed</span></div>
+ </section>
 
- <div class="eb">THE EASY WAY</div>
- <div class="step">
-  <h2><i>→</i>Use the one-line installer</h2>
-  <p>It installs the package, checks it against the release's <code>SHA256SUMS</code>, and adds this repository for you.</p>
-  <div class="code"><button data-c="one">Copy</button><pre id="one">curl -fsSL https://github.com/hermian-security/hermian/releases/download/@VERSION@/install.sh \
-  | sudo sh</pre></div>
- </div>
+ <div class="grid">
+  <main>
+   <section class="sec">
+    <div class="eb">The easy way</div>
+    <div class="card feat">
+     <h2><i>→</i>One command</h2>
+     <p>Installs the package, checks it against the release's signed <code>SHA256SUMS</code>, and adds this repository for you.</p>
+     <div class="term"><div class="bar"><i></i><i></i><i></i><span>install</span><button data-c="one">Copy</button></div>
+<pre id="one"><span class="p">$</span> curl -fsSL https://github.com/hermian-security/hermian/releases/download/@VERSION@/install.sh | sudo sh</pre></div>
+    </div>
+   </section>
 
- <div class="eb">OR BY HAND</div>
- <div class="step">
-  <h2><i>01</i>Add the signing key</h2>
-  <div class="code"><button data-c="s1">Copy</button><pre id="s1">curl -fsSL https://apt.hermian.me/hermian-archive-keyring.gpg \
-  | sudo tee /usr/share/keyrings/hermian-archive-keyring.gpg &gt;/dev/null</pre></div>
- </div>
- <div class="step">
-  <h2><i>02</i>Add the repository</h2>
-  <p>Use <code>beta</code> for every prerelease, or <code>stable</code> once v0.1.0 is out.</p>
-  <div class="code"><button data-c="s2">Copy</button><pre id="s2">sudo tee /etc/apt/sources.list.d/hermian.sources &gt;/dev/null &lt;&lt;'EOF'
+   <section class="sec">
+    <div class="eb">Or by hand</div>
+    <div class="card">
+     <h2><i>01</i>Add the signing key</h2>
+     <div class="term"><div class="bar"><i></i><i></i><i></i><span>/usr/share/keyrings</span><button data-c="s1">Copy</button></div>
+<pre id="s1"><span class="p">$</span> curl -fsSL https://apt.hermian.me/hermian-archive-keyring.gpg \
+    | sudo tee /usr/share/keyrings/hermian-archive-keyring.gpg &gt;/dev/null</pre></div>
+    </div>
+    <div class="card">
+     <h2><i>02</i>Add the repository</h2>
+     <p><code>beta</code> gets every prerelease; switch to <code>stable</code> once v0.1.0 is out.</p>
+     <div class="term"><div class="bar"><i></i><i></i><i></i><span>/etc/apt/sources.list.d/hermian.sources</span><button data-c="s2">Copy</button></div>
+<pre id="s2"><span class="p">$</span> sudo tee /etc/apt/sources.list.d/hermian.sources &gt;/dev/null &lt;&lt;'EOF'
 Types: deb
 URIs: https://apt.hermian.me
 Suites: beta
 Components: main
 Signed-By: /usr/share/keyrings/hermian-archive-keyring.gpg
 EOF</pre></div>
+    </div>
+    <div class="card">
+     <h2><i>03</i>Install</h2>
+     <div class="term"><div class="bar"><i></i><i></i><i></i><span>apt</span><button data-c="s3">Copy</button></div>
+<pre id="s3"><span class="p">$</span> sudo apt update &amp;&amp; sudo apt install hermian
+<span class="p">$</span> sudo hermian status</pre></div>
+    </div>
+   </section>
+  </main>
+
+  <aside class="side">
+   <div class="card">
+    <h3>Suites</h3>
+    <div class="suite"><div><code>beta</code><span>prereleases and releases</span></div><code class="v">@BETA@</code></div>
+    <div class="suite"><div><code>stable</code><span>releases, from v0.1.0</span></div><code class="v">@STABLE@</code></div>
+   </div>
+   <div class="card">
+    <h3>Verify the key</h3>
+    <p>Its fingerprint, which every release also prints in its build log:</p>
+    <code class="fp">@FINGERPRINT@</code>
+    <div class="term"><div class="bar"><i></i><i></i><i></i><span>gpg</span><button data-c="v1">Copy</button></div>
+<pre id="v1"><span class="p">$</span> gpg --show-keys /usr/share/keyrings/hermian-archive-keyring.gpg</pre></div>
+    <p>Each release ships the same <code>hermian-archive-keyring.gpg</code> in its signed <code>SHA256SUMS</code>.</p>
+   </div>
+   <div class="card">
+    <h3>Remove</h3>
+    <div class="term"><div class="bar"><i></i><i></i><i></i><span>uninstall</span><button data-c="r1">Copy</button></div>
+<pre id="r1"><span class="p">$</span> sudo hermian uninstall</pre></div>
+    <p>Or <code>sudo apt purge hermian</code>. Both remove the repository entry and the key too.</p>
+   </div>
+  </aside>
  </div>
- <div class="step">
-  <h2><i>03</i>Install</h2>
-  <div class="code"><button data-c="s3">Copy</button><pre id="s3">sudo apt update &amp;&amp; sudo apt install hermian
-sudo hermian status</pre></div>
- </div>
-
- <div class="eb">SUITES</div>
- <table>
-  <tr><th>SUITE</th><th>GETS</th><th>NOW</th></tr>
-  <tr><td><code>beta</code></td><td>Every prerelease and release</td><td><code>@BETA@</code></td></tr>
-  <tr><td><code>stable</code></td><td>Releases only, from v0.1.0</td><td><code>@STABLE@</code></td></tr>
- </table>
-
- <div class="eb">VERIFY THE KEY</div>
- <p class="note" style="margin-top:0">apt checks every download against this key. Its fingerprint, which every release prints in its build log:</p>
- <code class="fp">@FINGERPRINT@</code>
- <div class="code"><button data-c="v1">Copy</button><pre id="v1">gpg --show-keys /usr/share/keyrings/hermian-archive-keyring.gpg</pre></div>
- <p class="note">Each release also ships <code>hermian-archive-keyring.gpg</code>, listed in its signed <code>SHA256SUMS</code>: compare the two if you like.</p>
-
- <div class="eb">REMOVE</div>
- <div class="code"><button data-c="r1">Copy</button><pre id="r1">sudo hermian uninstall        <span class="d"># or: sudo apt purge hermian</span></pre></div>
- <p class="note">Both remove the repository entry and the key too.</p>
 
  <footer>
-  <img src="company-lockup.png" alt="Hermian Security">
+  <img src="company-lockup.png" alt="Hermian Security" width="112" height="16">
+  <div class="fl"><a href="https://hermian.me">hermian.me</a><a href="https://github.com/hermian-security/hermian/blob/main/SECURITY.md">Security</a><a href="https://github.com/hermian-security/hermian/blob/main/LICENSE">Apache-2.0</a></div>
   <span>Silent by default. Loud when it matters.</span>
  </footer>
 </div>
 <script>
+// Copy without the "$ " prompts.
 document.querySelectorAll('button[data-c]').forEach(function(b){b.addEventListener('click',function(){
- var t=document.getElementById(b.dataset.c).innerText.replace(/\s+#.*$/gm,'');
- (navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1500)},function(){});
+ var t=document.getElementById(b.dataset.c).innerText.replace(/^\$ /gm,'');
+ if(!navigator.clipboard)return;
+ navigator.clipboard.writeText(t).then(function(){b.textContent='Copied';b.classList.add('ok');setTimeout(function(){b.textContent='Copy';b.classList.remove('ok')},1500)});
 })});
 </script>
 </body>
