@@ -335,6 +335,7 @@ your report:
 
 ## More
 
+- [Several servers](docs/FLEET.md): one Telegram group for all of them, rollout and updates.
 - [Evidence](docs/EVIDENCE.md): what's been verified, where, and when.
 - [Project notes](PROJECT.md): architecture, detection rules, and limits.
 - [Burn-in matrix](docs/ROADMAP-BURN-IN.md): the road to production-ready.

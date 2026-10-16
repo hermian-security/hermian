@@ -308,8 +308,13 @@ fn poll_loop(
                 }
             }
             Err(e) => {
+                // 409: something else is reading this bot's updates. Either
+                // another host with actions on shares the bot (each press
+                // reaches only one of them), or a webhook is set.
                 let hint = if e.starts_with("HTTP 409") {
-                    " (a webhook is set on this bot; Hermian needs getUpdates: call deleteWebhook)"
+                    " (another host with Telegram actions on may be using this bot: give each \
+                     host with buttons its own bot, see docs/FLEET.md; or a webhook is set: \
+                     call deleteWebhook)"
                 } else {
                     ""
                 };
