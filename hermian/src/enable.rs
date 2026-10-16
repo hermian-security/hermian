@@ -103,9 +103,10 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         Ok(Some(n)) if !args.quiet => println!(
             "{}",
             st.dim(&format!(
-                "Added {} new setting line(s) to {}, commented out (backup: config.toml.bak).",
-                n,
-                paths::config_path().display()
+                "Updated {}: {} line(s) of new settings, commented out; settings no longer used \
+                 are commented out too (backup: config.toml.bak).",
+                paths::config_path().display(),
+                n
             ))
         ),
         Ok(_) => {}
@@ -196,11 +197,16 @@ pub fn run(args: &EnableArgs) -> Result<()> {
 fn document_new_settings() -> Result<Option<usize>> {
     let path = paths::config_path();
     let current = fs::read_to_string(&path)?;
-    let Some(merged) = crate::confmerge::merge(
-        &current,
+    // Retired settings first (commented out, see confmerge::RETIRED), then
+    // the new ones; one backup of the original either way.
+    let retired = crate::confmerge::retire(&current);
+    let base = retired.as_deref().unwrap_or(&current);
+    let merged = crate::confmerge::merge(
+        base,
         hermian_core::DEFAULT_CONFIG_TOML,
         hermian_core::VERSION,
-    ) else {
+    );
+    let Some(merged) = merged.or(retired) else {
         return Ok(None);
     };
     let added = merged

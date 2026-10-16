@@ -140,6 +140,46 @@ fn section_body(lines: &[String], path: &str) -> Option<(usize, usize)> {
     Some((h + 1, end))
 }
 
+/// Settings Hermian no longer reads, as (section, key). Old configs still
+/// load (the parser accepts them and ignores them); `retire` comments them
+/// out so nobody tunes a setting that does nothing. They stop being
+/// accepted at v0.1.0.
+pub const RETIRED: &[(&str, &str)] = &[
+    ("general", "log_level"),
+    ("ssh", "off_hours_start"),
+    ("ssh", "off_hours_end"),
+];
+
+/// The user's file with every retired setting commented out, or `None` if
+/// it has none (or it couldn't be done safely). Nothing else changes: the
+/// result must parse to the original minus exactly those keys.
+pub fn retire(user: &str) -> Option<String> {
+    let mut expected: toml::Value = toml::from_str(user).ok()?;
+    let mut lines: Vec<String> = user.lines().map(str::to_string).collect();
+    let mut changed = false;
+    for (section, key) in RETIRED {
+        let Some((start, end)) = section_body(&lines, section) else {
+            continue;
+        };
+        for l in &mut lines[start..end] {
+            if active_key(l).as_deref() == Some(*key) {
+                *l = format!("# {}   # no longer used; safe to delete", l.trim_end());
+                changed = true;
+            }
+        }
+        if let Some(t) = expected.get_mut(*section).and_then(|v| v.as_table_mut()) {
+            t.remove(*key);
+        }
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    let after: toml::Value = toml::from_str(&out).ok()?;
+    (after == expected).then_some(out)
+}
+
 /// The user's file with everything the template has and it lacks added as
 /// comments, or `None` if nothing is missing (or it couldn't be done safely).
 pub fn merge(user: &str, template: &str, version: &str) -> Option<String> {
@@ -285,5 +325,59 @@ mod tests {
     #[test]
     fn broken_files_are_not_touched() {
         assert!(merge("[general\nhostname = ", DEFAULT_CONFIG_TOML, "v").is_none());
+    }
+
+    /// The shape configs had before #49: the retired keys set, in their
+    /// sections, among settings that still matter.
+    const WITH_RETIRED: &str = "[general]\nhostname = \"web-01\"\nlog_level = \"info\"\n\n\
+                                [ssh]\npermit_root = false\n\
+                                off_hours_start = 22    # UTC; set start == end to disable off-hours weighting\n\
+                                off_hours_end = 6\n\
+                                failed_burst_count = 7\n";
+
+    #[test]
+    fn retired_settings_are_commented_out_and_nothing_else_moves() {
+        let out = retire(WITH_RETIRED).expect("retired keys present");
+        for key in ["log_level", "off_hours_start", "off_hours_end"] {
+            let line = out
+                .lines()
+                .find(|l| l.contains(key))
+                .unwrap_or_else(|| panic!("{} gone entirely", key));
+            assert!(
+                line.starts_with("# ") && line.ends_with("safe to delete"),
+                "{}",
+                line
+            );
+        }
+        let cfg = Config::parse(&out).unwrap();
+        assert_eq!(cfg.general.hostname, "web-01");
+        assert_eq!(cfg.ssh.failed_burst_count, 7);
+        // Twice is a no-op, and a config without them isn't touched.
+        assert!(retire(&out).is_none());
+        assert!(retire(DEFAULT_CONFIG_TOML).is_none());
+        assert!(retire("[general\nbroken").is_none());
+    }
+
+    /// Only the key in its own section: a same-named key elsewhere stays.
+    #[test]
+    fn retire_only_touches_the_right_section() {
+        let t = "[ssh]\noff_hours_start = 22\n\n[notifications.webhook]\nurl = \"\"\n";
+        let out = retire(t).unwrap();
+        assert!(out.contains("# off_hours_start = 22"));
+        assert!(out.contains("url = \"\""));
+    }
+
+    /// What `hermian enable` does: retire, then add what's new. The result
+    /// still loads and keeps the user's values.
+    #[test]
+    fn retire_then_merge_still_loads() {
+        let retired = retire(WITH_RETIRED).unwrap();
+        let merged = merge(&retired, DEFAULT_CONFIG_TOML, "v-test").unwrap_or(retired);
+        let cfg = Config::parse(&merged).unwrap();
+        assert_eq!(cfg.general.hostname, "web-01");
+        assert_eq!(cfg.ssh.failed_burst_count, 7);
+        assert!(!merged
+            .lines()
+            .any(|l| l.trim_start().starts_with("log_level")));
     }
 }

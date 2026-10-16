@@ -74,6 +74,8 @@ pub enum ConfigError {
 #[serde(default, deny_unknown_fields)]
 pub struct General {
     pub hostname: String,
+    /// Retired: accepted so configs from early betas still load, but nothing
+    /// reads it. `hermian enable` comments it out; dropped at v0.1.0.
     pub log_level: String,
     /// Stored alert records and collect bundles older than this are deleted
     /// (0 keeps them forever). `alerts.log` is rotated by size regardless.
@@ -119,8 +121,9 @@ pub struct SshCfg {
     pub permit_root: bool,
     pub failed_burst_count: u32,
     pub failed_burst_window_secs: u64,
-    /// Retained for compatibility: off-hours weighting was removed, so these
-    /// still accept old configs but no longer affect anything.
+    /// Retired: off-hours weighting was removed. Accepted so old configs
+    /// still load, but nothing reads them. `hermian enable` comments them
+    /// out; dropped at v0.1.0.
     pub off_hours_start: u32,
     pub off_hours_end: u32,
     /// Failed logins against *existing* accounts are summed up in a digest

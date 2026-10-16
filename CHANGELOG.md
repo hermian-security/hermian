@@ -6,6 +6,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Deprecated
+
+- `general.log_level`, `ssh.off_hours_start` and `ssh.off_hours_end` do
+  nothing (off-hours scoring was removed earlier; `log_level` was never
+  used). Configs that set them still load. `hermian enable`, which runs on
+  every upgrade, now comments them out, with a note, keeping a backup. They
+  stop being accepted at v0.1.0.
+
 ## 0.1.0-beta.11 - 2026-10-16
 
 Quieter by default, a report for beta testers, and the first release on the
