@@ -242,7 +242,8 @@ blocks with `sudo hermian blocked` and `sudo hermian unblock <ip>`.
 
 ```bash
 sudo hermian status                  # coverage and delivery health
-sudo hermian alerts -s high          # recent HIGH and CRITICAL alerts
+sudo hermian alerts                  # recent alerts, LOW and up (--all adds INFO)
+sudo hermian alerts -s high          # only HIGH and CRITICAL
 sudo hermian show 1                  # today's alert 001
 sudo hermian collect HER-2026-0921-001
 sudo hermian test                    # synthetic engine checks, not live coverage
