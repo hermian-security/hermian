@@ -6,6 +6,28 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- Alerts are redesigned in Telegram, email and Discord:
+  - **Telegram:** `◉◉◉○  HIGH · Persistence` header (the host moves to the
+    fact sheet), the title on its own line, the sentence as a quote, a
+    tap-to-copy fact sheet (host, facts, process chain, rule, time), then
+    the risk and next steps in a collapsed quote so the push stays short.
+    Detail is shed automatically to stay under Telegram's 4096 characters.
+  - **Email:** an ink header band with the lockup, the severity as a pill
+    with a drawn four-dot meter, a spec grid (host, detected, facts), numbered
+    steps, both commands in one terminal block, and the Hermian Security
+    lockup in the footer. The subject is now
+    `[Hermian] HIGH: <title> (<host>)`, so the useful part survives inbox
+    truncation. Both logos are inline images (about 1.1 KB each); nothing is
+    loaded from a server.
+  - **Discord:** brand colours, the mark as avatar, meter and detection in
+    the author line, host and a live relative time, risk and steps as fields.
+    Alert text can no longer ping anyone (`allowed_mentions` is empty), even
+    if it carries `@everyone` from an attacker-chosen username.
+- "Why this matters" is now **Risk** and "Recommended action" is **Next
+  steps**, in the CLI and every channel.
+
 ## 0.1.0-beta.9 - 2026-10-16
 
 An installer fix for hosts moving from the tarball to the `.deb`.
