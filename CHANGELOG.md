@@ -6,6 +6,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Deprecated
+
+- `general.log_level`, `ssh.off_hours_start` and `ssh.off_hours_end` do
+  nothing (off-hours scoring was removed earlier; `log_level` was never
+  used). Configs that set them still load. `hermian enable`, which runs on
+  every upgrade, now comments them out, with a note, keeping a backup. They
+  stop being accepted at v0.1.0.
+
 ### Fixed
 
 - When the Telegram button poller gets HTTP 409, `hermian status` now
