@@ -25,7 +25,7 @@ pub use config::{Config, DEFAULT_CONFIG_TOML};
 pub use engine::{Counters, Engine, EngineFlaggedChain as FlaggedChain};
 pub use events::{
     AuthEvent, AuthMethod, AuthResult, ConnectEvent, DetectionId, Event, ExecEvent, FileEvent,
-    FileKind, ListenerEvent, ProcInfo, PtraceEvent, Severity, WriterInfo,
+    FileKind, ListenerEvent, ProcInfo, PtraceEvent, Severity, SshKey, WriterInfo,
 };
 pub use proctree::{role_of, ProcessTree, Role};
 pub use response::ResponseAction;

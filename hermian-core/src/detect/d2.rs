@@ -71,7 +71,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         "User '{}' authenticated{} from {} after {} failed attempts within {} \
                          seconds{}.",
                         ev.user,
-                        ev.method.note(),
+                        how(ev),
                         rhost,
                         recent,
                         ctx.cfg.ssh.failed_burst_window_secs,
@@ -84,6 +84,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
                     .fact("Failed attempts", recent.to_string())
+                    .facts_from(key_facts(ev))
                     .why(
                         "A login right after failed attempts from the same source usually means \
                          one of those attempts worked. The failures alone were just noise.",
@@ -95,15 +96,24 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     ]),
                 );
             }
+            // A key that has logged in before, from a new address on a network
+            // the account already uses: a dynamic IP, not a new incident.
+            // Passwords and unknown keys don't get this; they're what an
+            // attacker who isn't the operator would be using.
+            let key_known = ev
+                .key
+                .as_ref()
+                .is_some_and(|k| ctx.baseline.key_is_known(&ev.user, &k.fingerprint));
             if ev.user == "root" && !ctx.cfg.ssh.permit_root && !after_burst {
                 // A root login is a policy concern, not per se an anomaly. It is
                 // HIGH the first time a source is seen; the same operator logging
                 // in again from the same place is context, not a new incident.
                 let seen_before = ctx.baseline.root_source_is_known(rhost);
-                let severity = if !seen_before {
-                    Severity::High
-                } else {
+                let nearby = !seen_before && key_known && ctx.baseline.root_net_is_known(rhost);
+                let severity = if seen_before || nearby {
                     Severity::Info
+                } else {
+                    Severity::High
                 };
                 root_login = Some(
                     Finding::new(
@@ -111,6 +121,8 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         severity,
                         if seen_before {
                             "Root login over SSH"
+                        } else if nearby {
+                            "Root login with a known key from a nearby address"
                         } else {
                             "Root login over SSH from a new source"
                         },
@@ -118,15 +130,18 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     )
                     .what(format!(
                         "root authenticated over SSH{} from {}{}.",
-                        ev.method.note(),
+                        how(ev),
                         rhost,
                         if seen_before {
                             ", a source that has logged in as root before"
+                        } else if nearby {
+                            ", a new address on a network root already logs in from"
                         } else {
                             " for the first time"
                         }
                     ))
                     .fact("Source", rhost.to_string())
+                    .facts_from(key_facts(ev))
                     .why(
                         "Direct root logins remove accountability and are the preferred target of \
                          credential attacks. If this host relies on them, set ssh.permit_root = true \
@@ -142,6 +157,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
             if !after_burst
                 && ctx.baseline.can_judge_novelty()
                 && !ctx.baseline.ssh_source_is_known(rhost)
+                && !(key_known && ctx.baseline.ssh_net_is_known(rhost))
             {
                 let elevated = ev.user == "root";
                 let severity = if elevated {
@@ -163,11 +179,12 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     .what(format!(
                         "User '{}' authenticated{} from {}, a source never seen before.",
                         ev.user,
-                        ev.method.note(),
+                        how(ev),
                         rhost
                     ))
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
+                    .facts_from(key_facts(ev))
                     .why(
                         "Hermian records every source it sees log in. A first-time source isn't \
                          proof of anything by itself; it's just where a surprise login would show \
@@ -208,6 +225,39 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
             .collect();
     }
     findings
+}
+
+/// How the login authenticated, for alert text: " with key 'alice@laptop'",
+/// " with key ED25519 SHA256:abc…xyz", " (password)", or nothing.
+fn how(ev: &AuthEvent) -> String {
+    match &ev.key {
+        Some(k) => match &k.comment {
+            Some(c) => format!(" with key '{}'", c),
+            None => format!(" with key {}", k.short()),
+        },
+        None => ev.method.note().to_string(),
+    }
+}
+
+/// Method, key and where the key sits in authorized_keys.
+fn key_facts(ev: &AuthEvent) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    match &ev.key {
+        Some(k) => {
+            out.push(("Method", "public key".to_string()));
+            out.push(("Key", format!("{} {}", k.kind, k.fingerprint)));
+            if let Some(loc) = k.location() {
+                out.push(("Key file", loc));
+            }
+        }
+        None => {
+            let m = ev.method.note().trim().trim_matches(['(', ')']).to_string();
+            if !m.is_empty() {
+                out.push(("Method", m));
+            }
+        }
+    }
+    out
 }
 
 const SSH_CONFIG_PATHS: &[&str] = &[

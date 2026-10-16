@@ -38,6 +38,11 @@ pub struct Baseline {
     /// connector novelty isn't judged.
     #[serde(default)]
     pub connectors_relearn_until: Option<DateTime<Utc>>,
+    /// Keys that have logged in, as "<user> SHA256:<fingerprint>",
+    /// lifetime-wide. A login with one of these from a new address on a
+    /// network the account already logs in from is routine (dynamic IPs).
+    #[serde(default)]
+    pub known_keys: HashSet<String>,
 }
 
 /// Current `known_connectors` key scheme: the connecting process's own exe.
@@ -47,6 +52,20 @@ pub const CONNECTOR_SCHEME: u8 = 1;
 /// learning window) could otherwise grow these, and baseline.json, without
 /// limit. Past the cap, unseen values are simply novel.
 pub const MAX_LEARNED: usize = 50_000;
+
+/// The network a login source is judged by when the key is already known:
+/// its /16 (IPv4, including v4-mapped IPv6) or /32 (IPv6). Home and mobile
+/// connections change address inside their provider's block; a different
+/// provider or country is a different network.
+pub fn source_net(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & 0xffff_0000).into()),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => source_net(IpAddr::V4(v4)),
+            None => IpAddr::V6((u128::from(v6) & (u128::MAX << 96)).into()),
+        },
+    }
+}
 
 /// The network a destination is judged by: its /24 (IPv4, including
 /// v4-mapped IPv6) or /64 (IPv6). APIs and CDNs rotate addresses inside a
@@ -75,6 +94,7 @@ impl Default for Baseline {
             root_sources: HashSet::new(),
             connector_scheme: 0,
             connectors_relearn_until: None,
+            known_keys: HashSet::new(),
         }
     }
 }
@@ -93,6 +113,7 @@ impl Baseline {
             root_sources: HashSet::new(),
             connector_scheme: CONNECTOR_SCHEME,
             connectors_relearn_until: None,
+            known_keys: HashSet::new(),
         }
     }
 
@@ -127,6 +148,29 @@ impl Baseline {
 
     pub fn root_source_is_known(&self, ip: IpAddr) -> bool {
         self.root_sources.contains(&ip)
+    }
+
+    /// Whether root has logged in from `ip`'s network (see [`source_net`]).
+    pub fn root_net_is_known(&self, ip: IpAddr) -> bool {
+        let net = source_net(ip);
+        self.root_sources.iter().any(|s| source_net(*s) == net)
+    }
+
+    /// Whether anyone has logged in from `ip`'s network.
+    pub fn ssh_net_is_known(&self, ip: IpAddr) -> bool {
+        let net = source_net(ip);
+        self.known_ssh_sources.iter().any(|s| source_net(*s) == net)
+    }
+
+    pub fn observe_key(&mut self, user: &str, fingerprint: &str) {
+        if self.known_keys.len() < MAX_LEARNED {
+            self.known_keys.insert(format!("{} {}", user, fingerprint));
+        }
+    }
+
+    pub fn key_is_known(&self, user: &str, fingerprint: &str) -> bool {
+        self.known_keys
+            .contains(&format!("{} {}", user, fingerprint))
     }
 
     pub fn is_complete(&self) -> bool {

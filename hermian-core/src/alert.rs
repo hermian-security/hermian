@@ -121,6 +121,11 @@ impl Finding {
         self
     }
 
+    /// Several facts at once, in order (empty values skipped, as in `fact`).
+    pub fn facts_from(self, facts: Vec<(&'static str, String)>) -> Self {
+        facts.into_iter().fold(self, |f, (l, v)| f.fact(l, v))
+    }
+
     pub fn fact(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
         let value = value.into();
         if !value.is_empty() {

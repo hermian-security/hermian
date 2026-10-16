@@ -320,6 +320,9 @@ impl Engine {
                             self.baseline.observe_root_source(ip);
                         }
                     }
+                    if let Some(k) = &e.key {
+                        self.baseline.observe_key(&e.user, &k.fingerprint);
+                    }
                 }
             }
             Event::Listener(e) => {
@@ -820,6 +823,7 @@ mod tests {
                 tty: "ssh".into(),
                 method: AuthMethod::Unknown,
                 port: None,
+                key: None,
             }));
             infos += alerts
                 .iter()
@@ -849,6 +853,7 @@ mod tests {
                 tty: "ssh".into(),
                 method: AuthMethod::Unknown,
                 port: None,
+                key: None,
             }));
             assert!(!has(&a, DetectionId::D2, Severity::High), "{:?}", a);
         }
@@ -861,6 +866,7 @@ mod tests {
             tty: "ssh".into(),
             method: AuthMethod::Unknown,
             port: None,
+            key: None,
         }));
         assert!(
             has(&alerts, DetectionId::D2, Severity::High),
@@ -888,6 +894,7 @@ mod tests {
             tty: "ssh".into(),
             method: AuthMethod::Unknown,
             port: None,
+            key: None,
         }));
         assert!(
             !alerts.iter().any(|a| a.title.contains("burst")),
@@ -913,6 +920,7 @@ mod tests {
                 tty: "ssh".into(),
                 method: AuthMethod::Unknown,
                 port: None,
+                key: None,
             }))
         };
         let mut eng = engine_without_baseline();
@@ -928,6 +936,7 @@ mod tests {
             tty: "ssh".into(),
             method: AuthMethod::Unknown,
             port: None,
+            key: None,
         }));
         assert!(!has(&again, DetectionId::D2, Severity::High), "{:?}", again);
         let mut cfg = Config::default();
@@ -959,6 +968,7 @@ mod tests {
             tty: "ssh".into(),
             method: AuthMethod::PublicKey,
             port: None,
+            key: None,
         }));
         let d2: Vec<_> = alerts
             .iter()
@@ -968,6 +978,74 @@ mod tests {
         assert_eq!(d2[0].severity, Severity::High);
         assert!(d2[0].title.contains("new source"), "{:?}", d2[0].title);
         assert!(d2[0].what.contains("(key)"), "{:?}", d2[0].what);
+    }
+
+    /// Dynamic IPs: once a key has logged in as root, the same key from a new
+    /// address in the same /16 is context, not a page. A different network,
+    /// a password, or a key never seen before still pages, and the alert
+    /// says which key and where it sits.
+    #[test]
+    fn known_key_from_a_nearby_address_is_quiet() {
+        use crate::events::SshKey;
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(Config::default(), Allowlist::default(), baseline, "h".into());
+        let key = |fp: &str| SshKey {
+            kind: "ED25519".into(),
+            fingerprint: fp.into(),
+            file: Some("/root/.ssh/authorized_keys".into()),
+            line: Some(3),
+            comment: Some("mohamed@laptop".into()),
+        };
+        let mut t = Utc::now();
+        let mut login = |eng: &mut Engine, ip: &str, key: Option<SshKey>| {
+            // Past the dedup window each time, so severities show directly.
+            t += Duration::seconds(3600);
+            let method = if key.is_some() {
+                AuthMethod::PublicKey
+            } else {
+                AuthMethod::Password
+            };
+            let alerts = eng.process(Event::Auth(AuthEvent {
+                ts: t,
+                result: AuthResult::Success,
+                user: "root".into(),
+                rhost: Some(ip.parse().unwrap()),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+                method,
+                port: None,
+                key,
+            }));
+            alerts
+                .into_iter()
+                .filter(|a| a.detection == DetectionId::D2)
+                .max_by_key(|a| a.severity)
+        };
+        // First login with the key: pages, and names the key.
+        let first = login(&mut eng, "41.82.10.5", Some(key("SHA256:aaaa"))).unwrap();
+        assert_eq!(first.severity, Severity::High);
+        assert!(first.what.contains("with key 'mohamed@laptop'"), "{}", first.what);
+        let fact = |a: &Alert, l: &str| a.facts.iter().find(|f| f.label == l).map(|f| f.value.clone());
+        assert_eq!(fact(&first, "Key").as_deref(), Some("ED25519 SHA256:aaaa"));
+        assert_eq!(
+            fact(&first, "Key file").as_deref(),
+            Some("/root/.ssh/authorized_keys:3")
+        );
+        // Same key, new address in the same /16: INFO.
+        let nearby = login(&mut eng, "41.82.200.9", Some(key("SHA256:aaaa"))).unwrap();
+        assert_eq!(nearby.severity, Severity::Info, "{:?}", nearby);
+        assert!(nearby.title.contains("nearby"), "{}", nearby.title);
+        // Same key from another network: pages.
+        let far = login(&mut eng, "102.16.1.1", Some(key("SHA256:aaaa"))).unwrap();
+        assert_eq!(far.severity, Severity::High);
+        // A password from the known /16: pages.
+        let pw = login(&mut eng, "41.82.77.7", None).unwrap();
+        assert_eq!(pw.severity, Severity::High);
+        assert_eq!(fact(&pw, "Method").as_deref(), Some("password"));
+        // A key never seen before from the known /16: pages.
+        let new_key = login(&mut eng, "41.82.88.8", Some(key("SHA256:bbbb"))).unwrap();
+        assert_eq!(new_key.severity, Severity::High);
     }
 
     /// A source first seen after the learning window is novel once, then
@@ -990,6 +1068,7 @@ mod tests {
                 tty: "ssh".into(),
                 method: AuthMethod::PublicKey,
                 port: None,
+                key: None,
             }))
         };
         let alerts = login(&mut eng, Utc::now());
@@ -1024,6 +1103,7 @@ mod tests {
                 tty: "ssh".into(),
                 method: AuthMethod::Unknown,
                 port: None,
+                key: None,
             }),
         );
         assert!(has(&alerts, DetectionId::D2, Severity::Low), "{:?}", alerts);
@@ -1960,6 +2040,7 @@ mod tests {
             tty: "ssh".into(),
             method: AuthMethod::Unknown,
             port: None,
+            key: None,
         }));
         assert_eq!(eng.tree.len(), 1);
         assert_eq!(eng.bursts.len(), 1);
