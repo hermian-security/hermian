@@ -28,6 +28,17 @@ class AptPageTests(unittest.TestCase):
         for src in re.findall(r'cp "\$ROOT/([^"]+)"', publish):
             self.assertTrue((ROOT / src).is_file(), src)
 
+    def test_fonts_are_shipped_with_their_license(self):
+        page = (APT / "index.html").read_text()
+        fonts = set(re.findall(r"url\((fonts/[^)]+)\)", page)) | set(re.findall(r'href="(fonts/[^"]+)"', page))
+        self.assertTrue(fonts)
+        for f in fonts:
+            self.assertTrue((APT / f).is_file(), f)
+        self.assertIn('cp "$HERE"/fonts/*.woff2 "$HERE"/fonts/OFL-*.txt', (APT / "publish.sh").read_text())
+        for family in ("JetBrainsMono", "Manrope"):
+            text = (APT / "fonts" / ("OFL-%s.txt" % family)).read_text()
+            self.assertIn("SIL Open Font License", text)
+
     def test_missing_paths_are_real_404s(self):
         # Cloudflare Pages serves index.html with a 200 for any missing path
         # unless there's a 404.html; apt would then parse HTML.

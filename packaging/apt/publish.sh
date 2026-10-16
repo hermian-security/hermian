@@ -88,5 +88,9 @@ cp "$ROOT/hermian/assets/company-email.png" "$REPO/public/company-lockup.png"
 # index.html and a 200, so apt would get a web page where it expects a
 # signed file (a suite that doesn't exist yet, a typo in sources).
 cp "$HERE/404.html" "$REPO/public/404.html"
+# The brand fonts, served from here (no third-party requests), with their
+# SIL Open Font License texts.
+mkdir -p "$REPO/public/fonts"
+cp "$HERE"/fonts/*.woff2 "$HERE"/fonts/OFL-*.txt "$REPO/public/fonts/"
 
 echo "published $TAG to: $SUITES"
