@@ -333,3 +333,22 @@ jobs:
           git add -A
           git commit -q -m "hermian $TAG"
           git push -q origin HEAD
+
+  # Rebuilds hermian.me once the release is out, so its install pins and
+  # version badges follow without a hand edit. The site's build asks GitHub
+  # for the latest release. Does nothing until SITE_DEPLOY_HOOK (a Cloudflare
+  # Pages deploy hook URL) exists.
+  site:
+    name: Rebuild hermian.me
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger the site build
+        env:
+          SITE_DEPLOY_HOOK: ${{ secrets.SITE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$SITE_DEPLOY_HOOK" ]; then
+            echo "::notice::SITE_DEPLOY_HOOK not set; hermian.me isn't rebuilt automatically"
+            exit 0
+          fi
+          curl -fsS -X POST "$SITE_DEPLOY_HOOK" -o /dev/null && echo "site build triggered"
