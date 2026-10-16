@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use hermian_core::{AuthEvent, AuthMethod, AuthResult, Event};
+use hermian_core::{AuthEvent, AuthMethod, AuthResult, Event, SshKey};
 use tokio::sync::mpsc;
 
 const AUTH_LOG_CANDIDATES: &[&str] = &["/var/log/auth.log", "/var/log/secure"];
@@ -140,7 +140,7 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                     if sender_is_not_sshd(pid) {
                         continue;
                     }
-                    if tx.blocking_send(Event::Auth(ev)).is_err() {
+                    if tx.blocking_send(Event::Auth(locate_key(ev))).is_err() {
                         return;
                     }
                 }
@@ -201,7 +201,7 @@ fn journal_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                 Ok(0) => break, // journalctl exited
                 Ok(_) => {
                     if let Some(ev) = parse_line(&line) {
-                        if tx.blocking_send(Event::Auth(ev)).is_err() {
+                        if tx.blocking_send(Event::Auth(locate_key(ev))).is_err() {
                             let _ = child.kill();
                             return;
                         }
@@ -238,6 +238,16 @@ fn split_sshd_line(line: &str) -> Option<(Option<DateTime<Utc>>, u32, &str)> {
     Some((ts, pid, msg.trim_start()))
 }
 
+/// Add where the accepted key sits in the user's authorized_keys. Runs on
+/// the reader's blocking thread; a few small file reads per key login.
+fn locate_key(mut ev: AuthEvent) -> AuthEvent {
+    let user = ev.user.clone();
+    if let Some(k) = ev.key.as_mut() {
+        crate::sshkeys::resolve(&user, k);
+    }
+    ev
+}
+
 /// Parse a syslog / journal `short-iso` sshd line into an [`AuthEvent`].
 pub fn parse_line(line: &str) -> Option<AuthEvent> {
     parse_line_with_pid(line).map(|(ev, _)| ev)
@@ -262,6 +272,11 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             rhost: extract_rhost(msg),
             service: "sshd".into(),
             tty: "ssh".into(),
+            key: if method == AuthMethod::PublicKey {
+                extract_key(msg)
+            } else {
+                None
+            },
             method,
             port: extract_port(msg),
         });
@@ -288,9 +303,37 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
             tty: "ssh".into(),
             method: AuthMethod::Unknown,
             port: extract_port(msg),
+            key: None,
         });
     }
     None
+}
+
+/// The key from "... ssh2: ED25519 SHA256:<b64>[ ID ... CA ...]". Taken
+/// after the last " ssh2: ": the client-controlled username comes before
+/// it, so a crafted name can't plant a fingerprint.
+fn extract_key(msg: &str) -> Option<SshKey> {
+    let rest = &msg[msg.rfind(" ssh2: ")? + 7..];
+    let mut words = rest.split_whitespace();
+    let kind = words.next()?;
+    let fingerprint = words.next()?;
+    let ok_kind = !kind.is_empty()
+        && kind.len() <= 32
+        && kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let ok_fp = fingerprint.strip_prefix("SHA256:").is_some_and(|b| {
+        !b.is_empty()
+            && b.len() <= 64
+            && b.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+    });
+    if !ok_kind || !ok_fp {
+        return None;
+    }
+    Some(SshKey {
+        kind: kind.to_string(),
+        fingerprint: fingerprint.to_string(),
+        ..SshKey::default()
+    })
 }
 
 fn parse_timestamp(line: &str) -> Option<DateTime<Utc>> {
@@ -475,6 +518,51 @@ mod tests {
         assert!(sender_is_not_sshd(std::process::id()));
         // A pid that can't exist can't be checked.
         assert!(!sender_is_not_sshd(u32::MAX));
+    }
+
+    /// The accepted key comes from sshd's own words after the last
+    /// " ssh2: ", so a crafted username can't plant one.
+    #[test]
+    fn accepted_key_is_parsed() {
+        let a = parse_line(
+            "Jan 15 10:20:30 web sshd[1]: Accepted publickey for root from 203.0.113.9 port 1 ssh2: \
+             ED25519 SHA256:a/Uhk0KZ4L//wnF27P2IxjbktRYERimR+7gc99GB+8M",
+        )
+        .unwrap();
+        let k = a.key.unwrap();
+        assert_eq!(k.kind, "ED25519");
+        assert_eq!(
+            k.fingerprint,
+            "SHA256:a/Uhk0KZ4L//wnF27P2IxjbktRYERimR+7gc99GB+8M"
+        );
+        assert_eq!(k.short(), "ED25519 SHA256:a/Uhk0KZ\u{2026}9GB+8M");
+
+        let c = parse_line(
+            "Jan 15 10:20:30 web sshd[1]: Accepted publickey for bob from 10.0.0.1 port 2 ssh2: \
+             ED25519-CERT SHA256:abcdefgh ID bob@ca (serial 7) CA ED25519 SHA256:zzzz",
+        )
+        .unwrap();
+        assert_eq!(c.key.unwrap().kind, "ED25519-CERT");
+
+        // A fake key earlier in the line (where a crafted name would sit).
+        let f = parse_line(
+            "Jan 15 10:20:30 web sshd[1]: Accepted publickey for x ssh2: RSA SHA256:fake from \
+             10.0.0.1 port 2 ssh2: ED25519 SHA256:real",
+        )
+        .unwrap();
+        assert_eq!(f.key.unwrap().fingerprint, "SHA256:real");
+
+        let p = parse_line(
+            "Jan 15 10:20:30 web sshd[1]: Accepted password for bob from 10.0.0.6 port 2 ssh2",
+        )
+        .unwrap();
+        assert!(p.key.is_none());
+        let junk = parse_line(
+            "Jan 15 10:20:30 web sshd[1]: Accepted publickey for bob from 10.0.0.6 port 2 ssh2: \
+             ED25519 <script>",
+        )
+        .unwrap();
+        assert!(junk.key.is_none());
     }
 
     #[test]

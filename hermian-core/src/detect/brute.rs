@@ -234,6 +234,7 @@ mod tests {
                 tty: "ssh".into(),
                 method: AuthMethod::Unknown,
                 port: Some(50_000),
+                key: None,
             })
         }
 

@@ -27,6 +27,15 @@ Earlier release information remains in the repository's GitHub Releases and Git 
     if it carries `@everyone` from an attacker-chosen username.
 - "Why this matters" is now **Risk** and "Recommended action" is **Next
   steps**, in the CLI and every channel.
+- SSH login alerts say how the login authenticated: the key's type and
+  fingerprint, and the authorized_keys file and line it sits on (with its
+  comment, often `user@machine`), or "password". The daemon fingerprints
+  the keys in the files sshd actually reads (`AuthorizedKeysFile` from
+  `sshd -T`) itself; nothing is spawned per login.
+- Fewer root-login pages for dynamic IPs: a key that has logged in before,
+  from a new address on a network (/16, or /32 for IPv6) the account already
+  logs in from, is now INFO. Password logins, keys never seen before and
+  genuinely new networks still page.
 
 ## 0.1.0-beta.9 - 2026-10-16
 

@@ -23,6 +23,7 @@ mod procsrc;
 mod retention;
 mod selfprotect;
 mod sessions;
+mod sshkeys;
 mod status;
 mod tgbot;
 mod ui;

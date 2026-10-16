@@ -139,6 +139,7 @@ pub fn parse_pam_payload(payload: &str) -> Option<AuthEvent> {
         tty,
         method: AuthMethod::Unknown,
         port: None,
+        key: None,
     })
 }
 

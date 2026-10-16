@@ -288,6 +288,50 @@ pub struct AuthEvent {
     /// `rhost` it identifies the session, so a response can disconnect that
     /// login and not every session of the same user.
     pub port: Option<u16>,
+    /// For a public-key login: the key sshd accepted.
+    pub key: Option<SshKey>,
+}
+
+/// The key a public-key login used. `kind` and `fingerprint` come from
+/// sshd's own log line (`ssh2: ED25519 SHA256:...`); `file`, `line` and
+/// `comment` are filled in by the daemon when it finds that key in the
+/// user's authorized_keys.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshKey {
+    /// "ED25519", "RSA", "ECDSA", "ED25519-CERT", ...
+    pub kind: String,
+    /// "SHA256:<base64>", as `ssh-keygen -l` prints it.
+    pub fingerprint: String,
+    pub file: Option<String>,
+    /// 1-based line in `file`.
+    pub line: Option<usize>,
+    /// The comment after the key (often user@machine), when there is one.
+    pub comment: Option<String>,
+}
+
+impl SshKey {
+    /// "ED25519 SHA256:abc…xyz": short enough for a chat line.
+    pub fn short(&self) -> String {
+        let fp = &self.fingerprint;
+        let body = fp.strip_prefix("SHA256:").unwrap_or(fp);
+        let shown = if body.chars().count() > 16 {
+            let head: String = body.chars().take(8).collect();
+            let tail: String = body.chars().skip(body.chars().count() - 6).collect();
+            format!("SHA256:{}\u{2026}{}", head, tail)
+        } else {
+            fp.clone()
+        };
+        format!("{} {}", self.kind, shown)
+    }
+
+    /// Where the key sits, "/root/.ssh/authorized_keys:3", when known.
+    pub fn location(&self) -> Option<String> {
+        let file = self.file.as_ref()?;
+        Some(match self.line {
+            Some(n) => format!("{}:{}", file, n),
+            None => file.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
