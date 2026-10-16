@@ -378,6 +378,25 @@ impl Engine {
         )
     }
 
+    /// Audit sshd's effective configuration (`sshd -T` output): every key
+    /// source that points somewhere hidden is reported once, then
+    /// remembered, so a restart or the next audit doesn't page again.
+    pub fn check_sshd_config(&mut self, sshd_t: &str, now: DateTime<Utc>) -> Vec<Alert> {
+        if !self.cfg.detections.d2_auth {
+            return Vec::new();
+        }
+        let mut findings = Vec::new();
+        for (setting, path, why) in detect::d2::hidden_key_sources(sshd_t) {
+            if self.allowlist.path_allowed(&path) {
+                continue;
+            }
+            if self.baseline.observe_sshd_key_source(setting, &path) {
+                findings.push(detect::d2::hidden_key_source_finding(setting, &path, why));
+            }
+        }
+        self.raise(findings, now, now)
+    }
+
     /// Periodic housekeeping; returns dedup summaries to deliver.
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Alert> {
         self.counters.roll_day(&day_key(now));
@@ -1060,6 +1079,68 @@ mod tests {
         // A key never seen before from the known /16: pages.
         let new_key = login(&mut eng, "41.82.88.8", Some(key("SHA256:bbbb"))).unwrap();
         assert_eq!(new_key.severity, Severity::High);
+    }
+
+    /// A hidden key source in sshd's config pages once; the next audit (and
+    /// a restart, via the saved baseline) stays quiet. A login with a key
+    /// from that file pages even from a known address with a known key.
+    #[test]
+    fn hidden_ssh_key_file_is_caught() {
+        use crate::events::SshKey;
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            baseline,
+            "h".into(),
+        );
+        let t = "authorizedkeysfile .ssh/authorized_keys /dev/.cache/rdpii\n";
+        let first = eng.check_sshd_config(t, Utc::now());
+        assert_eq!(first.len(), 1, "{:?}", first);
+        assert_eq!(first[0].severity, Severity::High);
+        assert!(first[0].what.contains("/dev/.cache/rdpii"));
+        let later = Utc::now() + Duration::hours(2);
+        assert!(eng.check_sshd_config(t, later).is_empty());
+        let mut restored = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            eng.baseline.clone(),
+            "h".into(),
+        );
+        assert!(restored.check_sshd_config(t, later).is_empty());
+
+        let key = SshKey {
+            kind: "ED25519".into(),
+            fingerprint: "SHA256:R+6n3".into(),
+            file: Some("/dev/.cache/rdpii".into()),
+            line: Some(1),
+            comment: Some("noway".into()),
+        };
+        // Known key, known address: still a page, because of the file.
+        let ip: IpAddr = "196.207.222.228".parse().unwrap();
+        restored.baseline.observe_key("root", &key.fingerprint);
+        restored.baseline.observe_root_source(ip);
+        restored.baseline.observe_ssh_source(ip, Utc::now());
+        let a = restored.process(Event::Auth(AuthEvent {
+            ts: Utc::now(),
+            result: AuthResult::Success,
+            user: "root".into(),
+            rhost: Some(ip),
+            service: "sshd".into(),
+            tty: "ssh".into(),
+            method: AuthMethod::PublicKey,
+            port: None,
+            key: Some(key.clone()),
+        }));
+        let d2: Vec<_> = a
+            .iter()
+            .filter(|a| a.detection == DetectionId::D2)
+            .collect();
+        assert_eq!(d2.len(), 1, "{:?}", a);
+        assert_eq!(d2[0].severity, Severity::High, "{:?}", d2[0]);
+        assert!(d2[0].title.contains("hidden key file"), "{}", d2[0].title);
+        assert!(d2[0].what.contains("/dev/.cache/rdpii"), "{}", d2[0].what);
     }
 
     /// A source first seen after the learning window is novel once, then

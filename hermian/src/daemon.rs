@@ -15,8 +15,8 @@ use tokio::sync::mpsc;
 
 use crate::{
     auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
-    isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, status, tgbot,
-    watchers,
+    isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, sshkeys, status,
+    tgbot, watchers,
 };
 
 /// Persisted across restarts so reference ids never repeat within a day.
@@ -366,6 +366,7 @@ async fn async_main(
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigusr2 = signal(SignalKind::user_defined2())?;
 
+    let mut next_sshd_audit = std::time::Instant::now();
     let mut ticker = tokio::time::interval(heartbeat::INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -496,6 +497,17 @@ async fn async_main(
                 }
                 if let Some(on) = sessions::cached_root_password_login() {
                     engine.set_root_password_login(on);
+                }
+                // Hidden key sources in sshd's effective config: audited at
+                // start and every ten minutes, each reported once.
+                if std::time::Instant::now() >= next_sshd_audit {
+                    next_sshd_audit = std::time::Instant::now() + Duration::from_secs(600);
+                    tokio::task::spawn_blocking(sshkeys::refresh);
+                }
+                if let Some(sshd_t) = sshkeys::take_fresh() {
+                    for a in engine.check_sshd_config(&sshd_t, now) {
+                        notifier.send(a);
+                    }
                 }
                 let _ = config::save_baseline(&engine.baseline);
                 save_engine_state(&engine);

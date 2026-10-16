@@ -43,6 +43,9 @@ pub struct Baseline {
     /// network the account already logs in from is routine (dynamic IPs).
     #[serde(default)]
     pub known_keys: HashSet<String>,
+    /// Hidden sshd key sources already reported, as "<Setting> <path>".
+    #[serde(default)]
+    pub reported_sshd_key_sources: HashSet<String>,
 }
 
 /// Current `known_connectors` key scheme: the connecting process's own exe.
@@ -95,6 +98,7 @@ impl Default for Baseline {
             connector_scheme: 0,
             connectors_relearn_until: None,
             known_keys: HashSet::new(),
+            reported_sshd_key_sources: HashSet::new(),
         }
     }
 }
@@ -114,6 +118,7 @@ impl Baseline {
             connector_scheme: CONNECTOR_SCHEME,
             connectors_relearn_until: None,
             known_keys: HashSet::new(),
+            reported_sshd_key_sources: HashSet::new(),
         }
     }
 
@@ -166,6 +171,15 @@ impl Baseline {
         if self.known_keys.len() < MAX_LEARNED {
             self.known_keys.insert(format!("{} {}", user, fingerprint));
         }
+    }
+
+    /// Record a hidden sshd key source; true the first time it's seen.
+    pub fn observe_sshd_key_source(&mut self, setting: &str, path: &str) -> bool {
+        if self.reported_sshd_key_sources.len() >= MAX_LEARNED {
+            return false;
+        }
+        self.reported_sshd_key_sources
+            .insert(format!("{} {}", setting, path))
     }
 
     pub fn key_is_known(&self, user: &str, fingerprint: &str) -> bool {
