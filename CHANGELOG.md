@@ -6,6 +6,17 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Added
+
+- Hidden SSH key sources are caught. Hermian audits sshd's effective
+  configuration (`sshd -T`) at start and every ten minutes, and pages once
+  when `AuthorizedKeysFile`, `AuthorizedKeysCommand`, the principals
+  settings or `TrustedUserCAKeys` point into `/dev`, `/tmp`, `/run` or a
+  hidden directory, including a setting that was there before Hermian was
+  installed. A login with a key from such a file pages too, whatever the
+  source address. (Found by planting a key in `/dev/.cache/rdpii` on the
+  test VPS: nothing noticed it before.)
+
 ### Changed
 
 - SSH login alerts say how the login authenticated: the key's type and

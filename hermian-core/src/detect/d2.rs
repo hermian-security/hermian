@@ -201,11 +201,54 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
             // matches both rules above; keeping both sent two notifications
             // for one event. The sharper finding wins (ties go to the root
             // policy alert, which carries the novelty in its title anyway).
-            match (root_login, new_source) {
-                (Some(r), Some(n)) => findings.push(if n.severity > r.severity { n } else { r }),
-                (Some(r), None) => findings.push(r),
-                (None, Some(n)) => findings.push(n),
-                (None, None) => {}
+            // A key from a hidden key file pages whatever the source: the
+            // file is the backdoor, and a familiar IP doesn't make it less so.
+            let hidden = ev.key.as_ref().and_then(|k| {
+                let file = k.file.as_deref()?;
+                hidden_key_path(file).map(|why| (k, file, why))
+            });
+            if let Some((k, file, why)) = hidden {
+                findings.push(
+                    Finding::new(
+                        DetectionId::D2,
+                        Severity::High,
+                        "SSH login with a key from a hidden key file",
+                        &format!("d2|hidden-key-login|{}|{}", ev.user, k.fingerprint),
+                    )
+                    .what(format!(
+                        "User '{}' authenticated{} from {}. The key is in {}, on {}, not in \
+                         the account's ~/.ssh.",
+                        ev.user,
+                        how(ev),
+                        rhost,
+                        file,
+                        why
+                    ))
+                    .fact("Source", rhost.to_string())
+                    .fact("User", &ev.user)
+                    .facts_from(key_facts(ev))
+                    .why(
+                        "sshd was configured to accept keys from an extra file that sits \
+                         outside every home directory. That's a common way to keep access \
+                         that nobody sees in authorized_keys.",
+                    )
+                    .actions([
+                        "Confirm this login and this key were expected.".to_string(),
+                        format!("Review the keys in {}: ssh-keygen -lf {}", file, file),
+                        "If not yours, remove the AuthorizedKeysFile entry and the file, \
+                         restart sshd and rotate keys."
+                            .to_string(),
+                    ]),
+                );
+            } else {
+                match (root_login, new_source) {
+                    (Some(r), Some(n)) => {
+                        findings.push(if n.severity > r.severity { n } else { r })
+                    }
+                    (Some(r), None) => findings.push(r),
+                    (None, Some(n)) => findings.push(n),
+                    (None, None) => {}
+                }
             }
         }
     }
@@ -258,6 +301,114 @@ fn key_facts(ev: &AuthEvent) -> Vec<(&'static str, String)> {
         }
     }
     out
+}
+
+/// sshd settings that decide which keys open the door. Each value is one or
+/// more paths (`AuthorizedKeysFile`) or a command and its arguments.
+const KEY_SOURCE_SETTINGS: &[(&str, &str)] = &[
+    ("authorizedkeysfile", "AuthorizedKeysFile"),
+    ("authorizedkeyscommand", "AuthorizedKeysCommand"),
+    ("authorizedprincipalsfile", "AuthorizedPrincipalsFile"),
+    ("authorizedprincipalscommand", "AuthorizedPrincipalsCommand"),
+    ("trustedusercakeys", "TrustedUserCAKeys"),
+];
+
+/// Why a path sshd reads keys (or runs a key command) from looks hidden, or
+/// `None` if it's an ordinary place. Relative paths and `%h/...` are inside
+/// the user's home, where only `.ssh` is expected. Volatile or pseudo
+/// filesystems and dot-directories are where a backdoor key file hides:
+/// nobody reviews them, and `ls ~/.ssh` shows nothing.
+pub fn hidden_key_path(path: &str) -> Option<&'static str> {
+    if path.is_empty() || path == "none" {
+        return None;
+    }
+    let (rel, home) = if let Some(r) = path.strip_prefix("%h/") {
+        (r, true)
+    } else if !path.starts_with('/') {
+        (path, true)
+    } else {
+        (path, false)
+    };
+    if !home {
+        const VOLATILE: &[&str] = &["/dev/", "/tmp/", "/var/tmp/", "/run/", "/proc/", "/sys/"];
+        if VOLATILE.iter().any(|v| rel.starts_with(v)) {
+            return Some("a temporary or pseudo filesystem");
+        }
+    }
+    let hidden = rel
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .any(|c| c.starts_with('.') && c != ".ssh" && c != "." && c != "..");
+    if hidden {
+        return Some("a hidden directory or file");
+    }
+    None
+}
+
+/// Key sources in sshd's effective configuration (`sshd -T` output) that
+/// point somewhere hidden, as (setting, value, reason).
+pub fn hidden_key_sources(sshd_t: &str) -> Vec<(&'static str, String, &'static str)> {
+    let mut out = Vec::new();
+    for line in sshd_t.lines() {
+        let Some((key, value)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let Some((_, name)) = KEY_SOURCE_SETTINGS
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        else {
+            continue;
+        };
+        let is_command = name.ends_with("Command");
+        // A command is judged by its program; files by every path listed.
+        let words: Vec<&str> = value.split_whitespace().collect();
+        let paths = if is_command {
+            words.into_iter().take(1).collect::<Vec<_>>()
+        } else {
+            words
+        };
+        for p in paths {
+            if let Some(why) = hidden_key_path(p) {
+                out.push((*name, p.to_string(), why));
+            }
+        }
+    }
+    out
+}
+
+/// One finding per hidden key source (the engine reports each only once).
+pub fn hidden_key_source_finding(setting: &str, path: &str, why: &str) -> Finding {
+    let grants = if setting.contains("Principals") || setting == "TrustedUserCAKeys" {
+        "decides which certificates and principals may log in"
+    } else {
+        "lists keys that may log in"
+    };
+    Finding::new(
+        DetectionId::D2,
+        Severity::High,
+        "sshd reads login keys from a hidden location",
+        &format!("d2|hidden-key-source|{}|{}", setting, path),
+    )
+    .what(format!(
+        "sshd's effective configuration sets {} to {}, on {}. That {} for SSH, outside \
+         every ~/.ssh where keys are normally reviewed.",
+        setting, path, why, grants
+    ))
+    .fact("Setting", setting)
+    .fact("Path", path)
+    .why(
+        "Pointing sshd at an extra key file is a quiet backdoor: the key works for every \
+         account it covers, survives password changes, and doesn't show up in \
+         ~/.ssh/authorized_keys. Files under /dev, /run or /tmp, or in dot-directories, are \
+         where nobody looks.",
+    )
+    .actions([
+        "Find what sets it: grep -ri authorizedkeys /etc/ssh/sshd_config /etc/ssh/sshd_config.d/"
+            .to_string(),
+        format!("List the keys it grants: ssh-keygen -lf {}", path),
+        "If you didn't add it, remove the setting and the file, restart sshd and rotate keys."
+            .to_string(),
+    ])
 }
 
 const SSH_CONFIG_PATHS: &[&str] = &[
@@ -605,6 +756,65 @@ fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The test VPS: a drop-in added /dev/.cache/rdpii as an extra key file
+    /// and nothing noticed. Ordinary key locations stay quiet.
+    #[test]
+    fn hidden_key_paths() {
+        for p in [
+            "/dev/.cache/rdpii",
+            "/dev/shm/k",
+            "/tmp/keys",
+            "/run/user/0/k",
+            "/var/tmp/x",
+            "/etc/.ssh_keys/%u",
+            "/usr/lib/.cache/k",
+            ".config/.k",
+            "%h/.local/share/keys",
+        ] {
+            assert!(hidden_key_path(p).is_some(), "{}", p);
+        }
+        for p in [
+            ".ssh/authorized_keys",
+            ".ssh/authorized_keys2",
+            "%h/.ssh/authorized_keys",
+            "/etc/ssh/authorized_keys/%u",
+            "/etc/ssh/keys/%u",
+            "/var/lib/sshkeys/%u",
+            "none",
+            "",
+        ] {
+            assert!(hidden_key_path(p).is_none(), "{}", p);
+        }
+    }
+
+    #[test]
+    fn hidden_key_sources_in_sshd_t() {
+        let t = "port 22\n\
+                 authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2 /dev/.cache/rdpii\n\
+                 authorizedkeyscommand /tmp/.k/fetch %u\n\
+                 authorizedprincipalsfile none\n\
+                 trustedusercakeys /etc/ssh/ca.pub\n";
+        let found = hidden_key_sources(t);
+        assert_eq!(
+            found
+                .iter()
+                .map(|(s, p, _)| format!("{} {}", s, p))
+                .collect::<Vec<_>>(),
+            vec![
+                "AuthorizedKeysFile /dev/.cache/rdpii",
+                "AuthorizedKeysCommand /tmp/.k/fetch"
+            ]
+        );
+        // A command's arguments aren't paths.
+        assert!(hidden_key_sources("authorizedkeyscommand /usr/bin/fetch /tmp/x\n").is_empty());
+        let f = hidden_key_source_finding("AuthorizedKeysFile", "/dev/.cache/rdpii", "x");
+        assert_eq!(f.severity, Severity::High);
+        assert!(f
+            .actions
+            .iter()
+            .any(|a| a.contains("ssh-keygen -lf /dev/.cache/rdpii")));
+    }
 
     #[test]
     fn account_diff_detects_new_user() {

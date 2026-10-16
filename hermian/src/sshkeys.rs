@@ -177,21 +177,57 @@ fn expand_key_files(setting: &str, user: &str, home: &Path) -> Vec<PathBuf> {
 
 const DEFAULT_KEY_FILES: &str = ".ssh/authorized_keys .ssh/authorized_keys2";
 
-/// `authorizedkeysfile` from `sshd -T`, cached for ten minutes.
-fn authorized_keys_setting() -> String {
-    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
-    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, v)) = c.as_ref() {
-        if at.elapsed() < Duration::from_secs(600) {
-            return v.clone();
-        }
+/// sshd's effective configuration, and when it was read.
+static SSHD_T: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+/// The last `refresh` result, not yet handed to the engine's audit.
+static FRESH: Mutex<Option<String>> = Mutex::new(None);
+
+/// Ask sshd for its effective configuration (`sshd -T`) and cache it; the
+/// next [`take_fresh`] hands it to the engine's audit. Blocking: run it on
+/// a blocking thread.
+pub fn refresh() {
+    if let Some(t) = run_sshd_t() {
+        *SSHD_T.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), t.clone()));
+        *FRESH.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
     }
-    let v = sshd_authorized_keys_file().unwrap_or_else(|| DEFAULT_KEY_FILES.to_string());
-    *c = Some((Instant::now(), v.clone()));
-    v
 }
 
-fn sshd_authorized_keys_file() -> Option<String> {
+/// The configuration from the last [`refresh`], once.
+pub fn take_fresh() -> Option<String> {
+    FRESH.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The cached configuration, refreshed when older than ten minutes.
+fn sshd_t() -> Option<String> {
+    {
+        let c = SSHD_T.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, t)) = c.as_ref() {
+            if at.elapsed() < Duration::from_secs(600) {
+                return Some(t.clone());
+            }
+        }
+    }
+    refresh();
+    SSHD_T
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, t)| t.clone())
+}
+
+/// `authorizedkeysfile` from `sshd -T`, or sshd's default.
+fn authorized_keys_setting() -> String {
+    sshd_t()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                l.strip_prefix("authorizedkeysfile ")
+                    .map(|v| v.trim().to_string())
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_KEY_FILES.to_string())
+}
+
+fn run_sshd_t() -> Option<String> {
     let sshd = ["/usr/sbin/sshd", "/sbin/sshd", "/usr/bin/sshd"]
         .into_iter()
         .find(|p| Path::new(p).is_file())?;
@@ -199,10 +235,7 @@ fn sshd_authorized_keys_file() -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
-        l.strip_prefix("authorizedkeysfile ")
-            .map(|v| v.trim().to_string())
-    })
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Read a regular file without ever blocking: the user owns this path, and
