@@ -35,6 +35,12 @@ pub fn state_file() -> PathBuf {
     state_dir().join("state.json")
 }
 
+/// Written by `hermian enable` just before it restarts the daemon, so the
+/// stop that follows is reported as planned (see `daemon::announce_stop`).
+pub fn planned_restart_file() -> PathBuf {
+    state_dir().join("planned-restart")
+}
+
 pub fn baseline_file() -> PathBuf {
     state_dir().join("baseline.json")
 }

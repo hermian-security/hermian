@@ -4,7 +4,7 @@ use std::fs;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use hermian_core::{render, Alert, DetectionId};
+use hermian_core::{render, Alert, DetectionId, Severity};
 
 use crate::cli::{severity_filter, AlertsArgs, ShowArgs};
 use crate::paths;
@@ -53,16 +53,55 @@ fn parse_detection(s: &str) -> Option<DetectionId> {
     }
 }
 
+/// The minimum severity listed: what `-s` says, everything with `--all`,
+/// otherwise LOW. INFO is context that's never notified; listing it by
+/// default buried the alerts that matter.
+fn listed_min(severity: Option<&str>, all: bool) -> Result<Option<Severity>> {
+    if severity.is_some() {
+        return severity_filter(severity);
+    }
+    Ok(if all { None } else { Some(Severity::Low) })
+}
+
+/// `hermian alerts 182` and `hermian alerts show 182` mean `hermian show 182`.
+fn show_target(words: &[String]) -> Option<&str> {
+    match words {
+        [] => None,
+        [one] if one != "show" => Some(one),
+        [show, r] if show == "show" => Some(r),
+        _ => None,
+    }
+}
+
 pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
+    if !args.reference.is_empty() {
+        let Some(r) = show_target(&args.reference) else {
+            anyhow::bail!("usage: hermian alerts [show] <ref>, or hermian show <ref>");
+        };
+        return cmd_show(&ShowArgs {
+            ref_id: r.to_string(),
+            json: args.json,
+        });
+    }
     let st = Style::detect();
-    let min = severity_filter(args.severity.as_deref())?;
+    let min = listed_min(args.severity.as_deref(), args.all)?;
     let det = match &args.detection {
         Some(d) => {
             Some(parse_detection(d).ok_or_else(|| anyhow::anyhow!("unknown detection '{}'", d))?)
         }
         None => None,
     };
-    let alerts: Vec<Alert> = load_all()?
+    let all = load_all()?;
+    // What the default filter hides from the last day, so it's never a
+    // silent omission.
+    let day_ago = Utc::now() - chrono::Duration::hours(24);
+    let hidden = all
+        .iter()
+        .filter(|a| a.ts >= day_ago)
+        .filter(|a| min.map(|m| a.severity < m).unwrap_or(false))
+        .filter(|a| det.map(|d| a.detection == d).unwrap_or(true))
+        .count();
+    let alerts: Vec<Alert> = all
         .into_iter()
         .filter(|a| min.map(|m| a.severity >= m).unwrap_or(true))
         .filter(|a| det.map(|d| a.detection == d).unwrap_or(true))
@@ -80,6 +119,12 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
         println!("{}", st.banner("Hermian alerts", ""));
         println!("{}", st.rule());
         println!("  {}", st.dim("No alerts recorded."));
+        if hidden > 0 {
+            println!(
+                "  {}",
+                st.dim(&hidden_note(hidden, args.severity.is_some()))
+            );
+        }
         return Ok(());
     }
 
@@ -125,7 +170,25 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
             ago(alerts[0].ts)
         ))
     );
+    if hidden > 0 {
+        println!(
+            "  {}",
+            st.dim(&hidden_note(hidden, args.severity.is_some()))
+        );
+    }
     Ok(())
+}
+
+fn hidden_note(n: usize, filtered: bool) -> String {
+    let what = if filtered {
+        "below that severity"
+    } else {
+        "INFO"
+    };
+    format!(
+        "+ {} {} in the last 24 h not shown  \u{00B7}  --all to include them",
+        n, what
+    )
 }
 
 /// Accept a full ref or a bare sequence number for today. Anything else is
@@ -181,6 +244,32 @@ pub fn cmd_show(args: &ShowArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// INFO is listed only when asked for; `-s` still wins.
+    #[test]
+    fn info_is_hidden_unless_asked() {
+        assert_eq!(listed_min(None, false).unwrap(), Some(Severity::Low));
+        assert_eq!(listed_min(None, true).unwrap(), None);
+        assert_eq!(
+            listed_min(Some("info"), false).unwrap(),
+            Some(Severity::Info)
+        );
+        assert_eq!(
+            listed_min(Some("high"), true).unwrap(),
+            Some(Severity::High)
+        );
+        assert!(hidden_note(3, false).contains("+ 3 INFO"));
+    }
+
+    #[test]
+    fn alerts_with_a_ref_means_show() {
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(show_target(&w(&[])), None);
+        assert_eq!(show_target(&w(&["182"])), Some("182"));
+        assert_eq!(show_target(&w(&["show", "182"])), Some("182"));
+        assert_eq!(show_target(&w(&["show"])), None);
+        assert_eq!(show_target(&w(&["182", "183"])), None);
+    }
 
     #[test]
     fn permission_errors_say_to_use_sudo() {

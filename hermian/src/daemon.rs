@@ -787,7 +787,44 @@ fn report_unmonitored_cpus(engine: &mut Engine, notifier: &notify::Notifier, cpu
 /// Tell the alert channels the daemon is stopping, and give delivery a few
 /// seconds. A clean `systemctl stop` used to be silent remotely; that's the
 /// simplest way to blind a host. (A SIGKILL still can't be reported.)
+/// Whether the marker `hermian enable` leaves before restarting the daemon
+/// is fresh: written within the last two minutes (a little clock skew
+/// allowed). An old or garbled marker doesn't count.
+fn planned_restart(marker: &str, now: chrono::DateTime<Utc>) -> bool {
+    marker
+        .trim()
+        .parse::<i64>()
+        .map(|t| (-5..=120).contains(&(now.timestamp() - t)))
+        .unwrap_or(false)
+}
+
 async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal: &str) {
+    // A restart by `hermian enable` (installs and upgrades) is routine:
+    // logged, not paged. The marker is used once.
+    let marker = paths::planned_restart_file();
+    let planned = fs::read_to_string(&marker)
+        .map(|m| planned_restart(&m, Utc::now()))
+        .unwrap_or(false);
+    let _ = fs::remove_file(&marker);
+    if planned {
+        let alert = self_alert(
+            engine,
+            Severity::Info,
+            "Hermian is restarting (install or upgrade)",
+            &format!(
+                "hermian enable restarted the daemon ({}). Monitoring resumes in a few seconds.",
+                signal
+            ),
+            "Logged for the record. A stop without this is still paged.",
+            &[],
+            &[("Signal", signal)],
+            &format!("selfprotect|restart|{}", Utc::now().timestamp()),
+        );
+        if let Some(a) = alert {
+            notifier.send(a);
+        }
+        return;
+    }
     let alert = self_alert(
         engine,
         Severity::High,
@@ -1283,6 +1320,27 @@ fn line(enabled: bool, source: &str) -> String {
 mod tests {
     use super::*;
     use hermian_core::{Allowlist, Baseline};
+
+    /// The upgrade restart (#198 on the test VPS) paged HIGH. Only a fresh
+    /// marker from `hermian enable` makes a stop routine.
+    #[test]
+    fn only_a_fresh_marker_is_a_planned_restart() {
+        let now = Utc::now();
+        let ts = |secs_ago: i64| (now.timestamp() - secs_ago).to_string();
+        assert!(planned_restart(&ts(3), now));
+        assert!(planned_restart(
+            &format!(
+                "{}
+",
+                ts(119)
+            ),
+            now
+        ));
+        assert!(!planned_restart(&ts(600), now), "stale");
+        assert!(!planned_restart(&ts(-60), now), "from the future");
+        assert!(!planned_restart("yes", now));
+        assert!(!planned_restart("", now));
+    }
 
     #[test]
     fn auth_label_names_every_source() {

@@ -6,6 +6,21 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- Less noise. "Script executed from a shell" (cron or a service running a
+  script through sh) is gone: no other rule used it, and it was 82% of the
+  test VPS's alert store. `hermian alerts` lists LOW and above by default
+  and says how many INFO alerts from the last day it left out; `--all`
+  includes them, `-s` still picks a level.
+- A restart by `hermian enable` (every install and upgrade) is logged as
+  INFO, "Hermian is restarting", instead of paging "Hermian is stopping".
+  Any other stop still pages HIGH.
+- `hermian alerts 182` and `hermian alerts show 182` work like
+  `hermian show 182`.
+- The hidden key source alert says the path is *included* in the setting
+  (`AuthorizedKeysFile` usually lists several).
+
 ## 0.1.0-beta.10 - 2026-10-16
 
 Redesigned alerts, SSH logins that say which key got in, and a new check
