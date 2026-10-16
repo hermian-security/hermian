@@ -19,7 +19,7 @@ Use one task per branch:
 | chore/ | Repository maintenance |
 | release/ | Version and release preparation |
 
-Examples: fix/validation-harness, feat/file-write-attribution, release/0.1.0-beta.2.
+Examples: fix/validation-harness, feat/file-write-attribution, release/X.Y.Z.
 Keep names lowercase with hyphens. Start from the latest origin/main and never
 mix someone else's local changes into a task.
 
@@ -137,7 +137,7 @@ merged work is a new PR with a revert commit, not a force push or reset of main.
 The workspace package version in Cargo.toml is the version source of truth; all
 four crates inherit it. Cargo.lock must reflect the same workspace versions.
 Release tags must be v followed by that exact version, including any prerelease
-suffix. For example, version 0.1.0-beta.2 requires tag v0.1.0-beta.2.
+suffix. For example, version 0.2.0-rc.1 requires tag v0.2.0-rc.1.
 
 Follow Semantic Versioning:
 
@@ -179,8 +179,8 @@ Release procedure:
 Example commands, only after the version has been prepared and approved:
 
 ```sh
-git tag -a v0.1.0-beta.5 -m "Hermian 0.1.0-beta.5"
-git push origin v0.1.0-beta.5
+git tag -a vX.Y.Z -m "Hermian X.Y.Z"
+git push origin vX.Y.Z
 gh run list --workflow release.yml
 ```
 

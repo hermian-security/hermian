@@ -641,12 +641,6 @@ impl ProcessTree {
         });
     }
 
-    pub fn chain_includes_role(&self, pid: u32, role: Role) -> bool {
-        self.chain_of(pid)
-            .iter()
-            .any(|p| role_of(&p.comm, &p.exe) == role)
-    }
-
     /// True when `pid` (or any ancestor) has a controlling TTY or descends from a
     /// session daemon (sshd, login, sudo, tmux...).
     ///
@@ -677,35 +671,6 @@ impl ProcessTree {
         ancestors
             .iter()
             .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm, &p.exe))
-    }
-
-    /// True if any known process on the host is part of an interactive session.
-    /// Used as the fallback when a file writer cannot be identified.
-    pub fn any_interactive_session(&self) -> bool {
-        // Only live processes: a session that ended an hour ago doesn't make
-        // an unattended write look operator-driven.
-        let live = || self.procs.values().filter(|p| !self.is_exited(p.pid));
-        // A TTY-attached process that is not a getty waiting for login.
-        if live()
-            .any(|p| p.tty_nr != 0 && !p.comm.starts_with("agetty") && !p.comm.starts_with("getty"))
-        {
-            return true;
-        }
-        // A session daemon (sshd, su, sudo, tmux...) that has spawned something:
-        // the bare sshd listener has no children of its own.
-        live().any(|child| {
-            child.ppid != 0
-                && !self.is_exited(child.ppid)
-                && self
-                    .procs
-                    .get(&child.ppid)
-                    .map(|parent| {
-                        is_session_daemon(&parent.comm, &parent.exe)
-                            && parent.comm != "systemd-logind"
-                            && !is_session_daemon(&child.comm, &child.exe)
-                    })
-                    .unwrap_or(false)
-        })
     }
 
     /// Whether an operator looks active *right now*: a program started from
@@ -941,7 +906,6 @@ mod tests {
         t.upsert(fake);
         t.upsert(info(402, 401, "bash"));
         assert!(!t.has_interactive_session(402, 0));
-        assert!(!t.any_interactive_session());
     }
 
     #[test]
@@ -955,7 +919,6 @@ mod tests {
         let comms: Vec<&str> = chain.iter().map(|p| p.comm.as_str()).collect();
         assert_eq!(comms, vec!["systemd", "sshd", "sshd", "bash"]);
         assert!(t.has_interactive_session(300, 0));
-        assert!(t.any_interactive_session());
     }
 
     #[test]
@@ -965,7 +928,6 @@ mod tests {
         t.upsert(info(400, 1, "cron"));
         t.upsert(info(401, 400, "bash"));
         assert!(!t.has_interactive_session(401, 0));
-        assert!(!t.any_interactive_session());
     }
 
     #[test]
@@ -1029,11 +991,9 @@ mod tests {
         t.upsert(info(100, 1, "sshd"));
         t.upsert(info(200, 100, "sshd"));
         t.upsert(info(300, 200, "bash"));
-        assert!(t.any_interactive_session());
         // The session's processes exit; only systemd and the listener remain.
         let alive: std::collections::HashSet<u32> = [1, 100].into_iter().collect();
         t.reap(&alive, now);
-        assert!(!t.any_interactive_session());
         // Still in the tree during the grace period...
         assert!(t.get(300).is_some());
         // ...and gone after it.

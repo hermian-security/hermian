@@ -14,6 +14,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   every upgrade, now comments them out, with a note, keeping a backup. They
   stop being accepted at v0.1.0.
 
+### Fixed
+
+- When the Telegram button poller gets HTTP 409, `hermian status` now
+  names the usual cause on a fleet: another host with `actions = true`
+  sharing the same bot (each press reaches only one of them). It used to
+  blame a webhook only. `docs/FLEET.md` explains the setup: one bot for
+  every host's alerts, a bot of its own only where you want buttons.
+
 ## 0.1.0-beta.11 - 2026-10-16
 
 Quieter by default, a report for beta testers, and the first release on the

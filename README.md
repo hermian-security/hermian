@@ -41,9 +41,9 @@ stays short: the risk and next steps sit in a collapsed section. `hermian show`
 and the email carry the full record, process chain and evidence included.
 
 > [!NOTE]
-> **It's beta.** One host has passed the full attack and false-positive run,
-> and a production VPS has run it since September 2026. Wider testing across
-> distros is still going. Try it on a test host first. What's been verified is
+> **It's beta.** Two Ubuntu 22.04 hosts have passed the full attack suite, one
+> of them running Hermian since September 2026. Other distros and longer runs
+> are still to come. Try it on a test host first. What's been verified is
 > in [docs/EVIDENCE.md](docs/EVIDENCE.md), and what it can't do is under
 > [Limits](#limits). Running it for a week? [Become an early tester](#early-testers).
 
@@ -178,7 +178,7 @@ Hermian runs as root. Setup creates its config, state, logs, and systemd unit,
 and raises inotify limits if they're too low. Out of the box it logs and
 notifies; automatic isolation is off until you turn it on. `hermian status`
 shows reduced coverage or delivery errors. The full list is in the
-[project notes](PROJECT.md#host-changes).
+[project notes](PROJECT.md), section 5.
 
 ### Upgrade
 
@@ -207,7 +207,7 @@ sudo make install
 ```
 
 A prebuilt eBPF object is included. Rebuilding it takes a few extra tools; see
-[the build notes](PROJECT.md#building-ebpf).
+[the build notes](PROJECT.md), section 7.
 
 ## Get notified
 
@@ -281,8 +281,9 @@ activity. After that, a source or destination counts as new the first time it
 shows up, not every time it comes back (destinations are grouped by /24, or
 /64 for IPv6). Put exceptions in the config's allowlist, each with a `reason`.
 
-Network isolation needs your management CIDRs configured first. Read
-[response settings and limits](PROJECT.md#response) before you turn it on.
+Network isolation needs your management CIDRs configured first. Read the
+response settings and limits in [PROJECT.md](PROJECT.md), section 6, before you
+turn it on.
 
 ## Limits
 
@@ -304,7 +305,7 @@ Network isolation needs your management CIDRs configured first. Read
   someone who already has root.
 
 How it works under the hood is in [PROJECT.md](PROJECT.md), and what's left
-before production is in [the burn-in matrix](docs/ROADMAP-BURN-IN.md).
+before production is in [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 ## How it's built
 
@@ -335,10 +336,10 @@ your report:
 
 ## More
 
-- [Evidence](docs/EVIDENCE.md): what's been verified, where, and when.
+- [Several servers](docs/FLEET.md): one Telegram group for all of them, rollout and updates.
+- [Evidence](docs/EVIDENCE.md): what's verified, the burn-in plan, and the
+  false-positive log.
 - [Project notes](PROJECT.md): architecture, detection rules, and limits.
-- [Burn-in matrix](docs/ROADMAP-BURN-IN.md): the road to production-ready.
-- [False-positive log](docs/fp-log.md): every HIGH+ that wasn't real.
 - [Contributing](CONTRIBUTING.md): builds, tests, PRs, and releases.
 - [Changelog](CHANGELOG.md): what changed and when.
 - [Security](SECURITY.md): please report vulnerabilities privately.
