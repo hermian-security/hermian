@@ -6,6 +6,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.8 - 2026-10-16
+
+The new identity reaches the product: the CLI banner, Telegram alerts and
+alert emails now match the site, with a dot severity meter and the real logo
+in emails.
+
 ### Changed
 
 - `hermian enable` opens with the new identity: the mark (three strokes and
