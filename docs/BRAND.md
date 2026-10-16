@@ -3,22 +3,14 @@
 Short rules for naming and the logo, so the docs, the CLI, alerts, and the site
 stay consistent.
 
-## Company and products
+## Company and product
 
 **Hermian Security** is the company. It owns the GitHub org
 (`hermian-security`), the domain (hermian.me), the copyright, and the security
 contact.
 
-**Hermian** is the first product: the Linux daemon in this repo.
-
-Future tools get **Hermian + one plain word** for what they do, for example
-"Hermian Scan". No unrelated codenames. Each one gets its own binary
-(`hermian-scan`), or a subcommand if it's close enough to the daemon.
-
-The daemon keeps the bare name. Its binary, `/etc/hermian`, the package, and
-existing installs all depend on `hermian`, so that never changes. Once a second
-tool exists, the site can describe it as "Hermian for hosts" without renaming
-anything.
+**Hermian** is the product: the Linux daemon in this repo. Its command,
+package, and paths are all `hermian`.
 
 ## Writing the name
 
@@ -38,8 +30,7 @@ Tagline: **Silent by default. Loud when it matters.**
 ## Logo
 
 The mark is three 45° strokes and a dot. Only the dot carries colour; it's the
-signal, and it's shared by every product. Don't give products their own
-colours.
+signal, the one thing that speaks up, like the alerts.
 
 | File | Use |
 | --- | --- |
