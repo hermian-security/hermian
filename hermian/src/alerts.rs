@@ -16,7 +16,7 @@ fn needs_root(e: &std::io::Error) -> Option<anyhow::Error> {
         .then(|| anyhow::anyhow!("alerts are root-only; re-run with sudo"))
 }
 
-fn load_all() -> Result<Vec<Alert>> {
+pub fn load_all() -> Result<Vec<Alert>> {
     let dir = paths::alerts_dir();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
