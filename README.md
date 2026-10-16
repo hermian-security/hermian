@@ -45,7 +45,7 @@ and the email carry the full record, process chain and evidence included.
 > and a production VPS has run it since September 2026. Wider testing across
 > distros is still going. Try it on a test host first. What's been verified is
 > in [docs/EVIDENCE.md](docs/EVIDENCE.md), and what it can't do is under
-> [Limits](#limits).
+> [Limits](#limits). Running it for a week? [Become an early tester](#early-testers).
 
 ## Is it for you?
 
@@ -313,6 +313,25 @@ say so than hide it. AI-assisted work can branch, test, commit, push, and open
 a PR; merges and releases are done by hand, never by AI. For now there's one
 maintainer, who owns everything that lands. Independent review comes as the
 project grows. The working rules are in [AGENTS.md](AGENTS.md).
+
+## Early testers
+
+The people running the beta on their own servers and telling us what they
+see. Thank you.
+
+<!-- testers:start (one line per tester; see "Join them" below) -->
+<!-- testers:end -->
+
+**Join them.** Run Hermian for a week, then open a
+[beta report](https://github.com/hermian-security/hermian/issues/new?template=beta-report.yml) with the output of `sudo hermian report` (counts and
+versions only, nothing private). After that, [edit this file](https://github.com/hermian-security/hermian/edit/main/README.md): GitHub
+forks it for you. Add one line between the two `testers` markers, with your
+GitHub username in all three places, and open the pull request with a link to
+your report:
+
+```html
+<a href="https://github.com/YOU" title="YOU"><img src="https://github.com/YOU.png?size=96" width="48" height="48" alt="YOU"></a>
+```
 
 ## More
 

@@ -1,0 +1,57 @@
+name: Beta report
+description: You ran Hermian for a while. Tell us how it went (takes 2 minutes).
+title: "Beta report: "
+labels: ["beta-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Hermian. This report is how we find out what's noisy, what's missing and what breaks.
+        Run `sudo hermian report` on your server and paste its output below: it holds versions and counts only, no host names, addresses, users, paths or commands.
+  - type: textarea
+    id: report
+    attributes:
+      label: Output of `sudo hermian report`
+      description: Pasted as is. `--days 14` or `--days 30` if you've run it longer.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: duration
+    attributes:
+      label: How long has it been running?
+      options:
+        - Less than a week
+        - 1 to 2 weeks
+        - 2 to 4 weeks
+        - More than a month
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: What kind of machine?
+      options:
+        - VPS / cloud server
+        - Homelab / home server
+        - Bare-metal server
+        - Desktop or laptop
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: false-positives
+    attributes:
+      label: Alerts that weren't real
+      description: Any HIGH or CRITICAL that was normal activity on your side? `hermian show <ref> --json` helps; remove anything private first.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: What was confusing, missing or annoying. What you liked, too.
+  - type: checkboxes
+    id: wall
+    attributes:
+      label: Early testers wall
+      options:
+        - label: I'd like my GitHub avatar on the README's early testers wall (I'll open the small PR described there).
