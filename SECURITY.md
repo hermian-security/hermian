@@ -1,7 +1,8 @@
 # Security
 
 Hermian runs as root. If you find a security issue, please report it privately
-before opening a public issue.
+before opening a public issue. Reports go to Hermian Security, the team behind
+Hermian.
 
 ## Report a vulnerability
 

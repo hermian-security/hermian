@@ -294,8 +294,18 @@ project grows. The working rules are in [AGENTS.md](AGENTS.md).
 - [Contributing](CONTRIBUTING.md): builds, tests, PRs, and releases.
 - [Changelog](CHANGELOG.md): what changed and when.
 - [Security](SECURITY.md): please report vulnerabilities privately.
+- [Brand](docs/BRAND.md): naming, logo, and colours.
 
 Found a bug or a false positive? Open an issue with `hermian show <ref> --json`,
 after removing secrets and private details.
 
-Licensed under [Apache-2.0](LICENSE).
+---
+
+<a href="https://hermian.me">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/company-lockup-dark.svg">
+    <img src="docs/brand/company-lockup-light.svg" alt="Hermian Security" height="24">
+  </picture>
+</a>
+
+Hermian is made by Hermian Security and licensed under [Apache-2.0](LICENSE).
