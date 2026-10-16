@@ -653,12 +653,12 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
     }
 
     if !alert.why.is_empty() {
-        push_section(&mut out, &p, "Why this matters");
+        push_section(&mut out, &p, "Risk");
         push_paragraph(&mut out, &alert.why);
     }
 
     if !alert.actions.is_empty() {
-        push_section(&mut out, &p, "Recommended action");
+        push_section(&mut out, &p, "Next steps");
         for (i, step) in alert.actions.iter().enumerate() {
             let num = format!("{:>2}. ", i + 1);
             let lines = wrap(step, WIDTH - GUTTER - num.len());
@@ -823,8 +823,8 @@ mod tests {
         assert!(r.contains("Hermian  CRITICAL"));
         assert!(r.contains("HER-2025-0914-001"));
         assert!(r.contains("WHAT HAPPENED"));
-        assert!(r.contains("WHY THIS MATTERS"));
-        assert!(r.contains("RECOMMENDED ACTION"));
+        assert!(r.contains("RISK"));
+        assert!(r.contains("NEXT STEPS"));
         assert!(r.contains("nginx"));
         assert!(r.contains("\u{2514}\u{2500} sh"));
         assert!(r.contains("hermian collect HER-2025-0914-001"));

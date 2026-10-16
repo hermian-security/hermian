@@ -78,6 +78,18 @@ impl DetectionId {
         }
     }
 
+    /// One or two words for message headers ("◉◉◉○ HIGH · Persistence").
+    pub fn family(&self) -> &'static str {
+        match self {
+            DetectionId::D1 => "Process chain",
+            DetectionId::D2 => "SSH",
+            DetectionId::D3 => "Persistence",
+            DetectionId::D4 => "Privilege escalation",
+            DetectionId::D5 => "Network",
+            DetectionId::Self_ => "Self-protection",
+        }
+    }
+
     pub fn short(&self) -> &'static str {
         match self {
             DetectionId::D1 => "D1",
