@@ -208,6 +208,21 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
+      # The APT repository's public key ships with the release, inside
+      # SHA256SUMS and signed like everything else, so the installer can add
+      # apt.hermian.me without trusting a download it can't check. Skipped
+      # until the APT_GPG_KEY secret exists (see docs in dist/).
+      - name: APT repository key
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+        run: |
+          if [ -z "$APT_GPG_KEY" ]; then
+            echo "::notice::APT_GPG_KEY not set: no APT repository key in this release"
+            exit 0
+          fi
+          printf '%s\n' "$APT_GPG_KEY" | gpg --batch --import
+          gpg --batch --export > dist/hermian-archive-keyring.gpg
+          gpg --batch --list-keys --with-colons | awk -F: '$1=="fpr"{print "key fingerprint: " $10; exit}'
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Checksums and Sigstore signatures
         working-directory: dist
@@ -260,3 +275,61 @@ jobs:
           generate_release_notes: true
           files: dist/*
           body_path: notes.md
+
+  # Adds the .deb files to the signed APT repository (hermian-security/apt,
+  # served as https://apt.hermian.me by Cloudflare Pages). Does nothing
+  # until both APT_GPG_KEY and APT_DEPLOY_KEY exist.
+  apt:
+    name: Publish to apt.hermian.me
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configured?
+        id: cfg
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+          APT_DEPLOY_KEY: ${{ secrets.APT_DEPLOY_KEY }}
+        run: |
+          if [ -n "$APT_GPG_KEY" ] && [ -n "$APT_DEPLOY_KEY" ]; then
+            echo "on=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::APT repository not configured (APT_GPG_KEY and APT_DEPLOY_KEY); skipping"
+          fi
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.cfg.outputs.on == 'true'
+        with:
+          persist-credentials: false
+          path: src
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: steps.cfg.outputs.on == 'true'
+        with:
+          repository: hermian-security/apt
+          ssh-key: ${{ secrets.APT_DEPLOY_KEY }}
+          path: apt
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: steps.cfg.outputs.on == 'true'
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Add the packages and sign the repository
+        if: steps.cfg.outputs.on == 'true'
+        env:
+          APT_GPG_KEY: ${{ secrets.APT_GPG_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq reprepro
+          printf '%s\n' "$APT_GPG_KEY" | gpg --batch --import
+          sh src/packaging/apt/publish.sh dist apt "$TAG"
+      - name: Push
+        if: steps.cfg.outputs.on == 'true'
+        working-directory: apt
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name "hermian-release"
+          git config user.email "contact@hermian.me"
+          git add -A
+          git commit -q -m "hermian $TAG"
+          git push -q origin HEAD

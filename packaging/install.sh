@@ -7,6 +7,9 @@
 #   - the binary: /usr/local/bin/hermian, or /usr/bin via the .deb
 #   - the optional PAM module; it stays unwired until `hermian enable --with-pam`
 #   - `hermian enable`: config, state, logs, systemd unit, inotify limits
+#   - on Debian/Ubuntu, when the release ships the repository key: the APT
+#     repository apt.hermian.me, so `apt upgrade` keeps Hermian current
+#     (/etc/apt/sources.list.d/hermian.sources; --no-apt-repo to skip)
 # It never edits sshd_config, pam.d or nftables; isolation is opt-in.
 #
 # Remote (piped, or no hermian binary next to this script): downloads the pinned release,
@@ -15,7 +18,7 @@
 # Local (run from an extracted tarball): installs the files next to the script.
 #
 #   curl -fsSL https://github.com/hermian-security/hermian/releases/download/vX.Y.Z/install.sh | sudo sh
-#   sudo sh install.sh [--version vX.Y.Z] [--dry-run]
+#   sudo sh install.sh [--version vX.Y.Z] [--dry-run] [--no-apt-repo]
 set -eu
 
 REPO=hermian-security/hermian
@@ -34,10 +37,11 @@ run() {
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--version vX.Y.Z] [--dry-run]
+Usage: install.sh [--version vX.Y.Z] [--dry-run] [--no-apt-repo]
 
   --version VER   install that release tag (default: the tag this script is from)
   --dry-run       download and verify, print what would change, change nothing
+  --no-apt-repo   don't add apt.hermian.me (updates stay manual)
   -h, --help      this text
 EOF
 }
@@ -91,6 +95,37 @@ drop_shadow() { # old new
     run rm -f "$1"
 }
 
+APT_KEYRING=/usr/share/keyrings/hermian-archive-keyring.gpg
+APT_SOURCES=/etc/apt/sources.list.d/hermian.sources
+
+# The suite a tag belongs to: prereleases (a "-" in the tag) are beta.
+apt_suite() { # tag
+    case "$1" in
+        *-*) echo beta ;;
+        *) echo stable ;;
+    esac
+}
+
+apt_sources() { # suite
+    printf 'Types: deb\nURIs: https://apt.hermian.me\nSuites: %s\nComponents: main\nSigned-By: %s\n' \
+        "$1" "$APT_KEYRING"
+}
+
+# Point apt at apt.hermian.me with the key that came with this release (its
+# checksum was verified with the .deb). From then on `apt upgrade` updates
+# Hermian like any other package.
+add_apt_repo() { # dir-with-keyring tag
+    _suite=$(apt_suite "$2")
+    say "adding the APT repository apt.hermian.me ($_suite): apt upgrade keeps Hermian current"
+    run install -D -m 0644 "$1/hermian-archive-keyring.gpg" "$APT_KEYRING"
+    if [ "$dry_run" -eq 1 ]; then
+        echo "    (dry-run) write $APT_SOURCES"
+    else
+        apt_sources "$_suite" > "$APT_SOURCES"
+        chmod 0644 "$APT_SOURCES"
+    fi
+}
+
 install_local() { # dir holding this script and the binary
     cd "$1" || die "cannot enter $1"
     say "installing the tarball at $(pwd)"
@@ -139,6 +174,15 @@ install_remote() {
 
     say "fetching $_name"
     fetch "$_base/$_name" "$TD/$_name"
+    _keyring=0
+    case "$_name" in
+        *.deb)
+            if [ "$no_apt_repo" -eq 0 ] && grep -q ' hermian-archive-keyring\.gpg$' "$TD/SHA256SUMS"; then
+                fetch "$_base/hermian-archive-keyring.gpg" "$TD/hermian-archive-keyring.gpg"
+                _keyring=1
+            fi
+            ;;
+    esac
 
     if [ "$_verifier" = gh ]; then
         say "verifying $_name with gh attestation"
@@ -154,6 +198,11 @@ install_remote() {
             say "installing $_name with apt"
             run apt-get install -y "$TD/$_name"
             drop_shadow /usr/local/bin/hermian /usr/bin/hermian
+            if [ "$_keyring" -eq 1 ]; then
+                add_apt_repo "$TD" "$1"
+            elif [ "$no_apt_repo" -eq 0 ]; then
+                say "this release has no APT repository key; updates stay manual (rerun this installer)"
+            fi
             ;;
         *)
             say "extracting $_name"
@@ -168,11 +217,13 @@ main() {
     version=$DEFAULT_VERSION
     version_set=0
     dry_run=0
+    no_apt_repo=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --version) [ $# -ge 2 ] || die "--version needs a value"; version=$2; version_set=1; shift 2 ;;
             --version=*) version=${1#--version=}; version_set=1; shift ;;
             --dry-run) dry_run=1; shift ;;
+            --no-apt-repo) no_apt_repo=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown argument: $1 (try --help)" ;;
         esac

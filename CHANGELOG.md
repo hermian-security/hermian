@@ -6,6 +6,16 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Added
+
+- A signed APT repository, `apt.hermian.me`, published by the release
+  workflow: `beta` for every prerelease, `stable` from v0.1.0. On
+  Debian/Ubuntu the installer adds it (key from the release, checked like the
+  `.deb`), so `apt upgrade` keeps Hermian current; `--no-apt-repo` skips it.
+  `hermian uninstall` and `apt purge` remove the entry and the key. Until the
+  repository's signing key is configured, releases and installs behave as
+  before.
+
 ## 0.1.0-beta.10 - 2026-10-16
 
 Redesigned alerts, SSH logins that say which key got in, and a new check

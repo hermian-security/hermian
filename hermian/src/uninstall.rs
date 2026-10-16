@@ -79,6 +79,8 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
 
     remove_pam_line()?;
     let _ = fs::remove_file(paths::PAM_MODULE_PATH);
+    let _ = fs::remove_file(paths::APT_SOURCES_PATH);
+    let _ = fs::remove_file(paths::APT_KEYRING_PATH);
 
     if let Ok(exe) = procsrc::current_exe_path() {
         let _ = fs::remove_file(exe);
