@@ -6,6 +6,11 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.10 - 2026-10-16
+
+Redesigned alerts, SSH logins that say which key got in, and a new check
+for hidden SSH key files.
+
 ### Added
 
 - Hidden SSH key sources are caught. Hermian audits sshd's effective
