@@ -165,14 +165,12 @@ fn coverage_name(key: &str) -> &str {
 
 pub fn render(r: &Report, st: &Style) -> String {
     let mut out = String::new();
-    out.push_str(&format!("\n{}\n\n", st.brand(&r.version)));
     out.push_str(&format!(
-        "{}\n{}\n",
-        st.banner("Hermian report", &format!("last {} days", r.days)),
-        st.rule()
+        "{}\n",
+        st.masthead("report", &format!("last {} days", r.days))
     ));
 
-    out.push_str(&format!("{}\n", st.heading("HOST")));
+    out.push_str(&format!("\n{}\n", st.heading("HOST")));
     out.push_str(&format!("{}\n", st.row("Version", &r.version)));
     out.push_str(&format!(
         "{}\n",
@@ -428,7 +426,7 @@ mod tests {
             text
         );
         assert!(text.contains("Ubuntu 22.04.5 LTS (x86_64)"), "{}", text);
-        assert!(text.contains("hermian  v"), "banner: {}", text);
+        assert!(text.contains("hermian  report"), "masthead: {}", text);
     }
 
     #[test]

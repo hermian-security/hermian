@@ -8,15 +8,106 @@ use crate::ui::Style;
 #[command(
     name = "hermian",
     version,
-    about = "Hermian - silent by default, loud when it matters.",
-    long_about = "Hermian is a lightweight defensive security daemon for Linux. It detects \
-                  high-confidence signs of compromise with deterministic, contextual rules and \
-                  only interrupts you when something genuinely requires attention.",
-    after_help = "Environment:\n  NO_COLOR=1 / HERMIAN_COLOR=always|never   control terminal colour\n\nDocs: https://hermian.me  \u{00B7}  https://github.com/hermian-security/hermian\nSecurity contact: contact@hermian.me"
+    about = "An intrusion alarm for Linux servers. It watches the host and only\nspeaks up when something looks like a real compromise."
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Cmd,
+}
+
+/// The top-level help, grouped by what people reach for. Every visible
+/// subcommand must appear here (a test checks it).
+const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "Everyday",
+        &[
+            (
+                "status",
+                "Is this host protected? Coverage, delivery, overhead",
+            ),
+            ("alerts", "Recent alerts, LOW and up (--all adds INFO)"),
+            (
+                "show <ref>",
+                "One alert in full: chain, evidence, risk, next steps",
+            ),
+            (
+                "report",
+                "A week's summary to share, with nothing private in it",
+            ),
+            ("collect <ref>", "Gather local context for an alert"),
+        ],
+    ),
+    (
+        "Setup",
+        &[
+            ("enable", "Install, enable and start; re-run after upgrades"),
+            ("notify-test", "Check alert channels and send a test alert"),
+            ("test", "Self-test against synthetic attacks"),
+        ],
+    ),
+    (
+        "Response",
+        &[
+            ("blocked", "Addresses blocked from Telegram buttons"),
+            ("unblock <ip>", "Lift a block before it expires"),
+            ("isolate", "Cut the network, keep your management access"),
+            ("unisolate", "Lift isolation"),
+        ],
+    ),
+    ("Remove", &[("uninstall", "Remove Hermian from this host")]),
+];
+
+/// `hermian`'s command, dressed in the identity: the banner on top, the
+/// commands grouped, brand colours, examples and links at the end. The
+/// colours are only used on a terminal (and not with NO_COLOR).
+pub fn command() -> clap::Command {
+    use clap::builder::styling::{Ansi256Color, AnsiColor, Styles};
+    use clap::CommandFactory;
+    let st = Style::detect();
+    let accent = Ansi256Color(141).on_default();
+    let styles = Styles::styled()
+        .header(accent.bold())
+        .usage(accent.bold())
+        .literal(AnsiColor::BrightWhite.on_default().bold())
+        .placeholder(AnsiColor::BrightBlack.on_default())
+        .valid(accent)
+        .invalid(Ansi256Color(204).on_default().bold())
+        .error(Ansi256Color(204).on_default().bold());
+
+    let mut groups = String::new();
+    for (name, cmds) in COMMAND_GROUPS {
+        groups.push_str(&format!("{}\n", st.accent(&st.bold(name))));
+        for (cmd, what) in *cmds {
+            groups.push_str(&format!(
+                "  {}{}{}\n",
+                st.bold(cmd),
+                " ".repeat(16usize.saturating_sub(cmd.chars().count())),
+                what
+            ));
+        }
+        groups.push('\n');
+    }
+    let after = format!(
+        "{}\n  sudo hermian status\n  sudo hermian alerts -s high\n  sudo hermian show 7\n\n\
+         {}\n  NO_COLOR=1, or HERMIAN_COLOR=always|never\n\n\
+         {}  https://hermian.me\n{}  https://github.com/hermian-security/hermian\n\
+         {}  contact@hermian.me (security reports: SECURITY.md)",
+        st.accent(&st.bold("Examples")),
+        st.accent(&st.bold("Colour")),
+        st.dim("Docs    "),
+        st.dim("Code    "),
+        st.dim("Contact ")
+    );
+    Cli::command()
+        .styles(styles)
+        .before_help(format!("\n{}", st.brand(hermian_core::VERSION)))
+        .help_template(format!(
+            "{{before-help}}{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{}{}\n\
+             {{options}}\n\nRun 'hermian <command> --help' for its options.{{after-help}}",
+            groups,
+            st.accent(&st.bold("Options"))
+        ))
+        .after_help(after)
 }
 
 #[derive(Subcommand)]
@@ -190,12 +281,8 @@ pub fn cmd_test(args: &TestArgs) -> Result<()> {
 
     println!(
         "{}",
-        st.banner(
-            "Hermian detection self-test",
-            &format!("{} scenarios", results.len())
-        )
+        st.masthead("self-test", &format!("{} scenarios", results.len()))
     );
-    println!("{}", st.rule());
     for r in &results {
         let mark = if r.pass {
             st.ok("PASS")
@@ -284,8 +371,7 @@ pub fn cmd_notify_test(args: &NotifyTestArgs) -> Result<()> {
         channels.retain(|c| c == only);
     }
     if channels.is_empty() {
-        println!("{}", st.banner("Hermian notification test", ""));
-        println!("{}", st.rule());
+        println!("{}", st.masthead("notification test", ""));
         println!("  {}", st.warn("No notifying channel is enabled."));
         println!("  Add \"telegram\", \"email\" or \"webhook\" to notifications.channels in");
         println!("  /etc/hermian/config.toml and fill in the matching [notifications.*] section.");
@@ -294,12 +380,11 @@ pub fn cmd_notify_test(args: &NotifyTestArgs) -> Result<()> {
 
     println!(
         "{}",
-        st.banner(
-            "Hermian notification test",
+        st.masthead(
+            "notification test",
             &format!("{} channel(s)", channels.len())
         )
     );
-    println!("{}", st.rule());
 
     let host = crate::procsrc::hostname();
     let finding = Finding::new(
@@ -382,5 +467,36 @@ pub fn severity_filter(s: Option<&str>) -> Result<Option<Severity>> {
             .parse::<Severity>()
             .map(Some)
             .map_err(|_| anyhow::anyhow!("unknown severity '{}' (INFO, LOW, HIGH, CRITICAL)", v)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_lists_every_visible_command_once() {
+        let listed: Vec<&str> = COMMAND_GROUPS
+            .iter()
+            .flat_map(|(_, cmds)| cmds.iter())
+            .map(|(cmd, _)| cmd.split_whitespace().next().unwrap())
+            .collect();
+        let mut visible: Vec<String> = command()
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set() && c.get_name() != "help")
+            .map(|c| c.get_name().to_string())
+            .collect();
+        visible.sort();
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(sorted, visible);
+    }
+
+    #[test]
+    fn help_renders() {
+        let help = command().render_help().to_string();
+        assert!(help.contains("hermian"), "{}", help);
+        assert!(help.contains("Everyday"), "{}", help);
+        assert!(!help.contains("\n\n\n"), "{:?}", help);
     }
 }

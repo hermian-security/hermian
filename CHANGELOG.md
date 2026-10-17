@@ -6,6 +6,16 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- The CLI wears the identity. Every screen (status, alerts, report, test,
+  notify-test) opens with the same header: the mark, `hermian`, the version
+  or screen name, and context on the right. `--help` groups the commands
+  (everyday, setup, response, remove) and ends with examples and links.
+  Severities use the brand colours. `--version` output is unchanged.
+- `hermian status` says so when the shell's `hermian` and the daemon run
+  different versions, which usually means a stale copy earlier in `PATH`.
+
 ### Deprecated
 
 - `general.log_level`, `ssh.off_hours_start` and `ssh.off_hours_end` do

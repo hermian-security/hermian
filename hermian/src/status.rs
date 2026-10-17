@@ -126,6 +126,18 @@ const DETECTIONS: &[(&str, &str)] = &[
     ("d5", "Network correlation"),
 ];
 
+/// When the `hermian` you typed isn't the version the daemon runs: either
+/// an upgrade the daemon hasn't restarted into, or an older copy earlier in
+/// PATH (a build from source in /usr/local/bin) answering instead.
+pub fn version_mismatch(daemon: &str, cli: &str) -> Option<[String; 2]> {
+    (daemon != cli).then(|| {
+        [
+            format!("This command is v{}, the daemon runs v{}.", cli, daemon),
+            "Just upgraded? sudo systemctl restart hermian. If not: type -a hermian".to_string(),
+        ]
+    })
+}
+
 pub fn render_status(state: &StatusState, st: &Style) -> String {
     let mut out = String::new();
     let uptime = (Utc::now() - state.started_at).num_seconds().max(0) as u64;
@@ -150,14 +162,18 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     } else {
         st.ok("PROTECTED")
     };
-    out.push_str(&st.banner(
-        &format!("Hermian {}", state.version),
+    out.push_str(&st.masthead(
+        &format!("v{}", state.version),
         &format!("{} \u{00B7} up {}", state.host, humanize_secs(uptime)),
     ));
     out.push('\n');
-    out.push_str(&st.rule());
+    out.push_str(&format!("  {}\n", health));
+    if let Some(lines) = version_mismatch(&state.version, hermian_core::VERSION) {
+        for l in lines {
+            out.push_str(&format!("  {}\n", st.warn(&l)));
+        }
+    }
     out.push('\n');
-    out.push_str(&format!("  {}\n\n", health));
 
     out.push_str(&st.heading("Coverage"));
     out.push('\n');
@@ -320,9 +336,9 @@ pub fn render_status(state: &StatusState, st: &Style) -> String {
     out.push_str(&st.rule());
     out.push('\n');
     if state.alerts_today == 0 {
-        out.push_str(&st.dim("Nothing needs your attention."));
+        out.push_str(&st.footer("Nothing needs your attention."));
     } else {
-        out.push_str(&st.dim("Review with: hermian alerts"));
+        out.push_str(&st.footer("Review with: hermian alerts"));
     }
     out.push('\n');
     out
@@ -378,12 +394,11 @@ pub fn cmd_status(json: bool) -> Result<()> {
         }
         println!(
             "{}",
-            st.banner(
-                &format!("Hermian {}", hermian_core::VERSION),
+            st.masthead(
+                &format!("v{}", hermian_core::VERSION),
                 &st.warn("NEEDS ROOT")
             )
         );
-        println!("{}", st.rule());
         println!("  Service: {}", unit);
         println!("  Status details are root-only. Run:\n\n    sudo hermian status\n");
         return Ok(());
@@ -402,17 +417,15 @@ pub fn cmd_status(json: bool) -> Result<()> {
             if stale && !pid_alive(state.pid) {
                 println!(
                     "{}",
-                    st.banner(&format!("Hermian {}", state.version), &st.bad("INACTIVE"))
+                    st.masthead(&format!("v{}", state.version), &st.bad("INACTIVE"))
                 );
-                println!("{}", st.rule());
                 println!("  The daemon is not running. Start it with:\n\n    sudo systemctl start hermian\n");
                 println!("  {}", st.dim("Logs: journalctl -u hermian -n 50"));
             } else if stale {
                 println!(
                     "{}",
-                    st.banner(&format!("Hermian {}", state.version), &st.warn("STARTING"))
+                    st.masthead(&format!("v{}", state.version), &st.warn("STARTING"))
                 );
-                println!("{}", st.rule());
                 println!("  Run 'hermian status' again in a moment.");
             } else {
                 print!("{}", render_status(&state, &st));
@@ -421,12 +434,11 @@ pub fn cmd_status(json: bool) -> Result<()> {
         None => {
             println!(
                 "{}",
-                st.banner(
-                    &format!("Hermian {}", hermian_core::VERSION),
+                st.masthead(
+                    &format!("v{}", hermian_core::VERSION),
                     &st.bad("NOT INSTALLED")
                 )
             );
-            println!("{}", st.rule());
             println!("  The daemon has never run on this host. Install it with:\n\n    sudo hermian enable\n");
         }
     }
@@ -467,5 +479,18 @@ mod tests {
         if !p.parent().map(|d| d.exists()).unwrap_or(false) {
             assert!(!state_unreadable());
         }
+    }
+}
+
+#[cfg(test)]
+mod mismatch_tests {
+    use super::*;
+
+    #[test]
+    fn version_mismatch_only_when_versions_differ() {
+        assert!(version_mismatch("0.1.0", "0.1.0").is_none());
+        let [a, b] = version_mismatch("0.1.0-beta.11", "0.1.0").unwrap();
+        assert_eq!(a, "This command is v0.1.0, the daemon runs v0.1.0-beta.11.");
+        assert!(b.contains("type -a hermian"));
     }
 }
