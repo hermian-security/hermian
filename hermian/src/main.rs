@@ -1,4 +1,5 @@
 mod alerts;
+mod audit;
 mod auditnetlink;
 mod authlog;
 mod blocklist;
@@ -45,6 +46,7 @@ fn main() {
         cli::Cmd::Report(args) => report::cmd_report(&args),
         cli::Cmd::Show(args) => alerts::cmd_show(&args),
         cli::Cmd::Test(args) => cli::cmd_test(&args),
+        cli::Cmd::Audit(args) => audit::cmd_audit(&args),
         cli::Cmd::NotifyTest(args) => cli::cmd_notify_test(&args),
         cli::Cmd::Collect(args) => collect::run(&args),
         cli::Cmd::Isolate(args) => isolate::cmd_isolate(&args),
