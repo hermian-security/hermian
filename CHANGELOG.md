@@ -6,6 +6,21 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Added
+
+- A start-up audit, also available as `hermian audit` (`--json`; exits 2
+  when it finds something serious). It looks for signs that the host was
+  compromised before Hermian started: a library in `/etc/ld.so.preload`,
+  programs running and libraries loaded from /tmp, /dev/shm or hidden system
+  directories, programs and libraries in system directories that no package
+  owns, and crontabs and shell profiles that start any of these. If it finds
+  any, you get one alert (CRITICAL when the signs are of more than one
+  kind), and a baseline still learning stops, so the intrusion isn't learned
+  as normal. On a perfctl-infected test host it reported the preload
+  rootkit, the implant and a hidden loader under /var in under a second, with
+  the rootkit loaded into it. Libraries unpacked into /tmp by runtimes such
+  as Nx or Netty are listed as LOW and don't page.
+
 ### Changed
 
 - The installer has the CLI's look: the same header, brand colours on a
