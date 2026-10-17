@@ -134,7 +134,7 @@ pub fn ownership_queries(input: &AuditInput) -> Vec<String> {
     out
 }
 
-fn preload_entries(content: &str) -> Vec<String> {
+pub fn preload_entries(content: &str) -> Vec<String> {
     content
         .lines()
         .map(|l| l.split('#').next().unwrap_or("").trim())

@@ -8,7 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,7 +169,7 @@ fn sender_is_not_sshd(pid: u32) -> bool {
 const JOURNAL_MATCHES: &[&str] = &["_UID=0", "_COMM=sshd", "+", "_UID=0", "_COMM=sshd-session"];
 
 fn spawn_journalctl() -> std::io::Result<Child> {
-    Command::new("journalctl")
+    crate::procsrc::system_command("journalctl")
         .args(["-f", "-n", "0", "-o", "short-iso", "--no-pager", "-q"])
         .args(JOURNAL_MATCHES)
         .stdin(Stdio::null())

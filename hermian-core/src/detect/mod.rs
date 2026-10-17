@@ -42,6 +42,8 @@ pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub flags: &'a VecDeque<FlaggedChain>,
     pub user_names: &'a HashMap<u32, String>,
+    /// Hermian's own pid, or 0.
+    pub self_pid: u32,
     pub now: DateTime<Utc>,
 }
 

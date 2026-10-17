@@ -242,7 +242,8 @@ type Fingerprint = (u64, i64, i64, u64);
 
 fn fingerprint(path: &Path) -> Option<Fingerprint> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::symlink_metadata(path).ok()?;
+    // The host's copy for files hidden from the daemon (procsrc::host_view).
+    let m = std::fs::symlink_metadata(&*procsrc::host_view(&path.to_string_lossy())).ok()?;
     Some((m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
 }
 
@@ -747,7 +748,7 @@ fn content_for(path: &str, is_config: bool) -> Option<String> {
         || name.starts_with(".z")
         || name == ".profile";
     if tracked {
-        procsrc::read_regular_file(path)
+        procsrc::read_host_view(path)
     } else {
         None
     }

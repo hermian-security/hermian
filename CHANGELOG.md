@@ -20,6 +20,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   rootkit, the implant and a hidden loader under /var in under a second, with
   the rootkit loaded into it. Libraries unpacked into /tmp by runtimes such
   as Nx or Netty are listed as LOW and don't page.
+- Hermian protects itself from the kind of rootkit found on that host. The
+  unit hides `/etc/ld.so.preload` from the daemon's own mount namespace, so
+  a preload rootkit can't hook it or the tools it runs, and Hermian still
+  judges the host's copy. The daemon checks its own loaded code at start
+  and every ten minutes and pages CRITICAL ("Hermian itself is hooked") on
+  anything foreign. A ptrace attach to the daemon is CRITICAL whoever does
+  it. The tools it runs (journalctl, nft, systemctl, dpkg) are started by
+  absolute path with a clean environment, and the daemon isn't dumpable.
 
 ### Changed
 

@@ -151,6 +151,61 @@ fn open_no_symlinks(path: &str) -> std::io::Result<fs::File> {
     Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) })
 }
 
+/// PATH for the system tools Hermian runs.
+const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// A system tool (journalctl, nft, systemctl, dpkg...) by absolute path and
+/// with a clean environment, so an LD_PRELOAD, LD_LIBRARY_PATH or PATH that
+/// reached Hermian's environment never reaches the tool, and a planted
+/// `nft` earlier in PATH is never the one that runs.
+pub fn system_command(name: &str) -> std::process::Command {
+    let path = SAFE_PATH
+        .split(':')
+        .map(|d| format!("{}/{}", d, name))
+        .find(|p| std::path::Path::new(p).is_file())
+        .unwrap_or_else(|| name.to_string());
+    let mut c = std::process::Command::new(path);
+    c.env_clear().env("PATH", SAFE_PATH).env("LC_ALL", "C");
+    c
+}
+
+/// Files the unit hides from the daemon's own mount namespace
+/// (`InaccessiblePaths=` in hermian.service), so a preload rootkit can't
+/// hook the daemon or the tools it runs. Hermian still has to judge them, so
+/// it reads the host's copies, through PID 1's root.
+pub const HIDDEN_FROM_DAEMON: &[&str] = &["/etc/ld.so.preload"];
+
+/// Where to look at `path` from inside the daemon: the host's view for the
+/// files above, the path itself otherwise.
+pub fn host_view(path: &str) -> std::borrow::Cow<'_, str> {
+    if HIDDEN_FROM_DAEMON.contains(&path) {
+        std::borrow::Cow::Owned(format!("/proc/1/root{}", path))
+    } else {
+        std::borrow::Cow::Borrowed(path)
+    }
+}
+
+/// [`read_regular_file`], but for the host's copy of a file hidden from the
+/// daemon. /proc/1/root is a link we pick ourselves; the file itself is
+/// opened without following a symlink and must be a regular file.
+pub fn read_host_view(path: &str) -> Option<String> {
+    if !HIDDEN_FROM_DAEMON.contains(&path) {
+        return read_regular_file(path);
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
+        .open(&*host_view(path))
+        .ok()?;
+    if !f.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    f.take(MAX_WATCHED_READ).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 pub fn exe_of(pid: u32) -> Option<(String, bool)> {
     let link = fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
     let raw = link.to_string_lossy().into_owned();
@@ -666,7 +721,7 @@ pub fn file_in_package_database(path: &str) -> Option<bool> {
         ("rpm", vec!["-qf"]),
         ("pacman", vec!["-Qo"]),
     ] {
-        let out = std::process::Command::new(cmd)
+        let out = system_command(cmd)
             .args(&args)
             .arg(path)
             .stdin(std::process::Stdio::null())
@@ -709,6 +764,34 @@ pub fn current_exe_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn system_tools_run_by_absolute_path_with_a_clean_environment() {
+        // Any variable proves the environment is cleared; LD_PRELOAD itself
+        // would leak into tests running alongside.
+        std::env::set_var("HERMIAN_TEST_LEAK", "leaked");
+        let c = system_command("sh");
+        let prog = c.get_program().to_string_lossy().into_owned();
+        assert!(prog.starts_with('/') && prog.ends_with("/sh"), "{}", prog);
+        let out = system_command("sh")
+            .args(["-c", "echo \"${HERMIAN_TEST_LEAK:-unset} $PATH\""])
+            .output()
+            .unwrap();
+        std::env::remove_var("HERMIAN_TEST_LEAK");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("unset {}", SAFE_PATH)
+        );
+    }
+
+    #[test]
+    fn hidden_files_are_read_from_the_host_view() {
+        assert_eq!(
+            host_view("/etc/ld.so.preload"),
+            "/proc/1/root/etc/ld.so.preload"
+        );
+        assert_eq!(host_view("/etc/crontab"), "/etc/crontab");
+    }
 
     #[test]
     fn trusted_paths_root_does_not_own_lose_their_trust() {
