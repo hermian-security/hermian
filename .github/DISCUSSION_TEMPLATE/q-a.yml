@@ -4,7 +4,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Stuck, or got an alert for something you did? Ask here. The [FAQ](https://github.com/hermian-security/hermian/discussions/categories/announcements) may already have the answer, and the [beta guide](https://hermian.me/beta) has every setup step.
+        Stuck, or got an alert for something you did? Ask here. The [FAQ](https://github.com/hermian-security/hermian/discussions/83) may already have the answer, and the [beta guide](https://hermian.me/beta) has every setup step.
         Found a security problem in Hermian itself? Don't post it here: see [SECURITY.md](https://github.com/hermian-security/hermian/blob/main/SECURITY.md).
   - type: dropdown
     id: kind
