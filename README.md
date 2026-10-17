@@ -63,6 +63,37 @@ It's not built for:
   reporting;
 - **hosts you can't debug**: the burn-in matrix isn't finished yet.
 
+## What it watches
+
+Five rule families, each judging what happened in context: who started it,
+from where, and whether someone was logged in to do it.
+
+| Rule | What it catches |
+|---|---|
+| **D1 · Process chains** | A web server or database starting a shell, a download, or downloaded code (web shells, RCE). Programs run from /tmp, /dev/shm or /var/tmp with nobody logged in. Execution from a deleted file or from memory (memfd, fileless). Anything run from /tmp inside a chain already flagged. |
+| **D2 · SSH and accounts** | Logins from a source never seen before, root logins, a login right after a burst of failures, brute force (one digest, not one page per attempt). Logins with a key from a hidden key file, and sshd settings that point at one (`AuthorizedKeysFile /dev/.cache/...`). sshd config changes with nobody logged in. New or changed privileged accounts and group memberships. |
+| **D3 · Persistence** | Cron, anacron and at jobs (CRITICAL when they download and run code). Shell profiles, system-wide and per user. systemd units, system and user, and units enabled behind systemctl's back. SSH keys added to authorized_keys. `/etc/ld.so.preload` and new loader paths. PAM (pam_exec, modules from odd paths), `/etc/environment` preloads, rc.local, udev `RUN+=` rules, kernel modules to load at boot. |
+| **D4 · Privilege escalation** | New setuid/setgid binaries and file capabilities outside system directories. sudoers changes (password-less sudo above all). passwd/shadow edited outside the user tools. `LD_PRELOAD` in unattended processes. ptrace attaches by anything that isn't a debugger. |
+| **D5 · Network** | Connections from a chain already flagged (C2, exfiltration), a web server reaching a new external destination, a program's first ever connection, and new listening ports (HIGH when a suspicious process opens one). |
+
+And around the rules:
+
+- **Novelty, learned.** For its first 24 hours Hermian learns this host's
+  normal logins, destinations and network programs, then reports what's new
+  once (details under [Day to day](#day-to-day)).
+- **Noise control.** One incident pages once. Repeats fold into one LOW
+  summary that lists what varied, and an incident that keeps going pages
+  less and less often. Logins, edits and installs by an operator in a session,
+  by a package manager or by config management are context, not alerts.
+- **Self-protection.** Hermian reports on itself: its binary or config
+  changed, the daemon down or frozen (the watchdog restarts it, and it says so
+  at the next start), dropped events, CPUs it can't see, and a stop notice
+  before it goes quiet.
+- **Response, when you want it.** Telegram buttons to block a source or cut an
+  SSH session, network isolation by hand or automatically on CRITICAL, with
+  your management networks always reachable. All of it is off until you turn it
+  on.
+
 ## Install
 
 You need Linux with systemd and kernel 5.4+. eBPF needs 5.8+; older kernels
