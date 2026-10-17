@@ -14,7 +14,7 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
+    audit, auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
     isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, sshkeys, status,
     tgbot, watchers,
 };
@@ -51,6 +51,12 @@ fn save_engine_state(engine: &Engine) {
 
 pub fn run() -> Result<()> {
     config::require_root()?;
+    // Not dumpable: no core dumps with alert data in them, and other users'
+    // processes can't ptrace it or read its memory through /proc.
+    // SAFETY: plain prctl with integer arguments.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
     let cfg = config::load_config()?;
     let allowlist = cfg.allowlist.clone();
     let host = if cfg.general.hostname.is_empty() {
@@ -90,6 +96,7 @@ pub fn run() -> Result<()> {
     heartbeat::install_panic_note(paths::panic_note_file());
 
     let mut engine = Engine::new(cfg.clone(), allowlist, baseline, host);
+    engine.self_pid = std::process::id();
     if let Some(st) = load_engine_state() {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
         engine.root_warning_snoozed_until = st.root_warning_snoozed_until;
@@ -415,6 +422,39 @@ async fn async_main(
         );
     }
 
+    // Start-up audit. An intrusion already in place when Hermian starts is
+    // invisible to the rules until it acts, and the baseline would learn its
+    // routine as normal: on a failed audit, learning stops and novelty is
+    // judged from now on, against nothing learned on this host.
+    // Hermian checks itself first: injected code would make everything
+    // below untrustworthy. Then again every ten minutes (cheap when the
+    // daemon's mappings haven't changed).
+    let mut self_maps: Vec<String> = Vec::new();
+    run_self_check(&mut engine, &notifier, &mut self_maps);
+
+    let signs = audit::run_audit();
+    if signs.iter().any(|s| s.severity >= Severity::High) {
+        let learning = engine.baseline.enabled && !engine.baseline.complete;
+        if learning {
+            engine.baseline = Baseline::judging_from(Utc::now(), engine.baseline.duration_hours);
+            let _ = config::save_baseline(&engine.baseline);
+        }
+        let note = learning.then_some(
+            "learning stopped, so nothing on this host is learned as normal; new sources, \
+             destinations and programs are judged from now on",
+        );
+        if let Some(f) = hermian_core::audit::finding(&signs, note) {
+            emit_self(&notifier, engine.alert_from(f, Utc::now()));
+        }
+        log_daemon(
+            Severity::High,
+            &format!(
+                "start-up audit: {} sign(s) of an earlier intrusion (hermian audit)",
+                signs.len()
+            ),
+        );
+    }
+
     write_status_snapshot(
         &engine,
         &notifier,
@@ -515,6 +555,7 @@ async fn async_main(
                 // start and every ten minutes, each reported once.
                 if std::time::Instant::now() >= next_sshd_audit {
                     next_sshd_audit = std::time::Instant::now() + Duration::from_secs(600);
+                    run_self_check(&mut engine, &notifier, &mut self_maps);
                     tokio::task::spawn_blocking(sshkeys::refresh);
                 }
                 if let Some(sshd_t) = sshkeys::take_fresh() {
@@ -1143,6 +1184,20 @@ fn reload_signature(functional: bool, config_hash: &str) -> String {
         format!("selfprotect|config-reload|{}", config_hash)
     } else {
         "selfprotect|config-reload-noop".to_string()
+    }
+}
+
+/// See [`audit::self_check`].
+fn run_self_check(engine: &mut Engine, notifier: &notify::Notifier, last: &mut Vec<String>) {
+    let Some(signs) = audit::self_check(last) else {
+        return;
+    };
+    if let Some(f) = audit::self_finding(&signs) {
+        log_daemon(
+            Severity::Critical,
+            "self-check: the daemon has foreign code loaded",
+        );
+        emit_self(notifier, engine.alert_from(f, Utc::now()));
     }
 }
 

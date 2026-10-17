@@ -20,6 +20,31 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
     if ev.target_pid == ev.pid {
         return Vec::new();
     }
+    // Attaching to Hermian itself is how its memory gets rewritten or its
+    // events filtered. No exemption, debuggers included: nobody needs to
+    // debug the live daemon on a production host.
+    if ctx.self_pid != 0 && ev.target_pid == ctx.self_pid {
+        return vec![Finding::new(
+            DetectionId::D4,
+            Severity::Critical,
+            "A process attached to Hermian with ptrace",
+            &format!("d4|ptrace-hermian|{}|{}", ev.comm, ev.uid),
+        )
+        .what(format!(
+            "{} (pid {}, uid {}) attached to the Hermian daemon (pid {}) with ptrace.",
+            ev.comm, ev.pid, ev.uid, ev.target_pid
+        ))
+        .chain(ctx.chain_nodes(ev.pid))
+        .why(
+            "ptrace lets a process read and rewrite another's memory. Used on Hermian, it can \
+             blind it or make it report nothing, while it still looks healthy.",
+        )
+        .actions([
+            "Find who started the attaching process and why.",
+            "Restart Hermian (systemctl restart hermian) to drop any injected code.",
+            "Treat the host as compromised if the attach wasn't yours.",
+        ])];
+    }
     // The exe comes from the tree: a binary merely named gdb isn't a debugger.
     // With no exe at all (a forked child we never saw exec), the name alone
     // would be trusted, and `prctl(PR_SET_NAME, "gdb")` costs nothing, so

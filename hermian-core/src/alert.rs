@@ -311,6 +311,41 @@ impl Alert {
             })
     }
 
+    /// The alert as a channel sees it with `notifications.content =
+    /// "minimal"`: severity, rule family, reference and host, and the command
+    /// to read the rest on the host. No addresses, users, paths, commands or
+    /// process names, and no buttons (they'd need that context).
+    pub fn minimal(&self) -> Alert {
+        let short = self.short_ref();
+        Alert {
+            ref_id: self.ref_id.clone(),
+            ts: self.ts,
+            host: self.host.clone(),
+            severity: self.severity,
+            detection: self.detection,
+            title: format!("{} alert", self.detection.family()),
+            what: format!(
+                "{} alert {} on {}. The details stay on the host.",
+                self.severity.as_str(),
+                short,
+                self.host
+            ),
+            chain: Vec::new(),
+            chain_pids: Vec::new(),
+            facts: Vec::new(),
+            why: String::new(),
+            actions: vec![format!("sudo hermian show {}", short)],
+            signature: self.signature.clone(),
+            repeats: self.repeats,
+            offers: Vec::new(),
+        }
+    }
+
+    /// "025" for HER-2026-1017-025: what `hermian show` takes for today.
+    pub fn short_ref(&self) -> &str {
+        self.ref_id.rsplit('-').next().unwrap_or(&self.ref_id)
+    }
+
     /// One-line summary suitable for logs and chat previews.
     pub fn headline(&self) -> String {
         format!(
@@ -760,6 +795,39 @@ fn render_compact(alert: &Alert) -> String {
 mod tests {
     use super::*;
     use crate::events::DetectionId;
+
+    /// What leaves the host in minimal mode: nothing about the machine but
+    /// its name, and how to read the alert there.
+    #[test]
+    fn minimal_alert_carries_no_details() {
+        let f = Finding::new(
+            DetectionId::D2,
+            Severity::High,
+            "SSH login with a key from a hidden key file",
+            "d2|x",
+        )
+        .what("User 'root' authenticated from 203.0.113.9 with a key in /dev/.cache/rdpii.")
+        .fact("Source", "203.0.113.9")
+        .why("A hidden key file is a backdoor.")
+        .action("Remove /dev/.cache/rdpii.")
+        .offer(crate::response::ResponseAction::Block {
+            sources: vec!["203.0.113.9".parse().unwrap()],
+        });
+        let a = Alert::from_finding(f, "HER-2026-1017-025".into(), "web-01".into(), Utc::now());
+        let m = a.minimal();
+        assert_eq!(
+            m.what,
+            "HIGH alert 025 on web-01. The details stay on the host."
+        );
+        assert_eq!(m.title, "SSH alert");
+        assert_eq!(m.actions, vec!["sudo hermian show 025"]);
+        assert!(m.facts.is_empty() && m.chain.is_empty() && m.why.is_empty());
+        assert!(m.offers.is_empty(), "no buttons without context");
+        let all = serde_json::to_string(&m).unwrap();
+        for leak in ["203.0.113.9", "root", "/dev/.cache", "hidden key"] {
+            assert!(!all.contains(leak), "{} leaked: {}", leak, all);
+        }
+    }
 
     #[test]
     fn untrusted_text_is_escaped_once() {

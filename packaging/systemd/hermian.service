@@ -56,6 +56,16 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# A preload rootkit hooks every dynamically linked program at exec: the
+# daemon and the tools it runs (journalctl, nft, systemctl) too. In the
+# service's mount namespace /etc/ld.so.preload is /dev/null, so nothing is
+# preloaded, whatever the host's copy says now or later; Hermian judges that
+# copy through /proc/1/root. A bind mount, not InaccessiblePaths=-: with the
+# "-", systemd first asks whether the file exists, and a rootkit already in
+# PID 1 answers no (seen on a perfctl host). Without a file to mount over,
+# systemd creates an empty one, which loads nothing.
+BindReadOnlyPaths=/dev/null:/etc/ld.so.preload
+UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 # MemoryDenyWriteExecute is intentionally NOT set: the eBPF perf ring buffer
 # requires a shared writable mmap and the option blocks it (EPERM at mmap).
 SystemCallArchitectures=native

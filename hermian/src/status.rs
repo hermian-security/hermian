@@ -372,7 +372,7 @@ pub fn state_unreadable() -> bool {
 /// `systemctl is-active hermian`, which needs no privileges. Also used by
 /// the watchdog to judge the unit state.
 pub(crate) fn unit_state() -> String {
-    std::process::Command::new("systemctl")
+    crate::procsrc::system_command("systemctl")
         .args(["is-active", "hermian"])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

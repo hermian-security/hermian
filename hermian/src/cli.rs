@@ -43,6 +43,10 @@ const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("enable", "Install, enable and start; re-run after upgrades"),
             ("notify-test", "Check alert channels and send a test alert"),
             ("test", "Self-test against synthetic attacks"),
+            (
+                "audit",
+                "Look for signs of an intrusion from before Hermian",
+            ),
         ],
     ),
     (
@@ -122,6 +126,8 @@ pub enum Cmd {
     Show(ShowArgs),
     /// Run the detection self-test against synthetic attack scenarios
     Test(TestArgs),
+    /// Look for signs that this host was compromised before Hermian started
+    Audit(AuditArgs),
     /// Verify notification channels and send a test alert through them
     NotifyTest(NotifyTestArgs),
     /// Collect a forensic context bundle for an alert
@@ -144,6 +150,13 @@ pub enum Cmd {
     /// Dead-man switch (used by the hermian-watchdog systemd timer)
     #[command(hide = true)]
     Watchdog,
+}
+
+#[derive(clap::Args)]
+pub struct AuditArgs {
+    /// One JSON object per sign
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args)]

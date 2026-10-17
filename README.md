@@ -260,9 +260,29 @@ bot_token = "123456789:AAH..."
 chat_id = "-1001234567890"
 ```
 
-Email (SMTP or sendmail) and webhooks (Slack, Discord, ntfy, or plain JSON)
-work too, configured in the same file. HIGH and CRITICAL alerts notify by
+Email (SMTP or sendmail) and webhooks (Slack, Discord, ntfy, Matrix, or plain
+JSON) work too, configured in the same file. HIGH and CRITICAL alerts notify by
 default.
+
+### Keeping alerts in-house
+
+Hermian sends nothing anywhere unless you add a channel, and you pick where it
+goes. To keep everything inside your organisation, use a channel you host: your
+own [ntfy](https://ntfy.sh) server, a Matrix homeserver, email through your own
+mail server, or a webhook into your SIEM. Telegram, Slack and Discord are cloud
+services. If you use one, set `content = "minimal"`: the message then says only
+"HIGH alert 025 on web-01" and the command to read it on the host. No addresses,
+users, paths or commands leave the server, and no buttons are sent.
+
+```toml
+[notifications]
+content = "minimal"            # full | minimal
+
+[notifications.webhook]        # Matrix, on your homeserver
+format = "matrix"
+url = "https://matrix.example.org/_matrix/client/v3/rooms/!roomid:example.org/send/m.room.message"
+token = "syt_..."              # the bot account's access token
+```
 
 Then make sure it works:
 
@@ -274,7 +294,10 @@ sudo hermian notify-test
 
 Telegram alerts can carry buttons: **Block** on the brute-force digest, and
 **Ignore**, **Disconnect session**, or **Disconnect and block** on suspicious
-SSH logins. They act right away, so only allow people you trust:
+SSH logins. Block and Disconnect ask first: the buttons turn into **Confirm**
+and **Cancel**, and Confirm expires after two minutes. Every button works once,
+expires after 15 minutes (`action_ttl_mins`), and is only accepted from the
+configured chat and from the users you list, so only list people you trust:
 
 ```toml
 [notifications.telegram]
@@ -298,6 +321,7 @@ sudo hermian alerts -s high          # only HIGH and CRITICAL
 sudo hermian show 1                  # today's alert 001
 sudo hermian collect HER-2026-0921-001
 sudo hermian test                    # synthetic engine checks, not live coverage
+sudo hermian audit                   # signs of an intrusion from before Hermian
 sudo hermian report                  # a week's summary to share, nothing private
 ```
 
@@ -311,6 +335,14 @@ For the first 24 hours Hermian learns your normal SSH sources and network
 activity. After that, a source or destination counts as new the first time it
 shows up, not every time it comes back (destinations are grouped by /24, or
 /64 for IPv6). Put exceptions in the config's allowlist, each with a `reason`.
+
+Learning only makes sense on a host that isn't already compromised. Every time
+it starts, Hermian runs `hermian audit`. The audit checks `/etc/ld.so.preload`,
+programs and libraries running from temporary or hidden directories, code in
+system directories that no package installed, and crontabs and profiles that
+start any of it. If it finds something, you get one alert listing what it found,
+and learning stops, so the intrusion isn't learned as normal. A rootkit can hide
+from the audit, so a clean result isn't a guarantee.
 
 Network isolation needs your management CIDRs configured first. Read the
 response settings and limits in [PROJECT.md](PROJECT.md), section 6, before you
