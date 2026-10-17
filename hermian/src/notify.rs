@@ -54,6 +54,9 @@ pub struct Notifier {
 /// stalls (a hung disk) during an alert flood, memory mustn't grow forever.
 const NOTIFIER_QUEUE: usize = 8192;
 
+// Both are sent by value on purpose: alerts are the hot path and stay
+// unboxed, and a reconfigure is rare enough that its size doesn't matter.
+#[allow(clippy::large_enum_variant)]
 enum Msg {
     Alert(Alert),
     Reconfigure(NotificationsCfg),
@@ -604,6 +607,14 @@ pub fn store_and_send(alert: &Alert, cfg: &NotificationsCfg) -> Vec<(String, Str
 }
 
 fn send_classified(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), SendError> {
+    // Minimal content: what leaves the host is the reference, not the story.
+    let minimal;
+    let alert = if cfg.content == "minimal" && leaves_host(channel) {
+        minimal = alert.minimal();
+        &minimal
+    } else {
+        alert
+    };
     match channel {
         "stdout" => {
             println!("{}", hermian_core::render(alert, Theme::Plain));
@@ -614,6 +625,11 @@ fn send_classified(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Resu
         "email" => crate::channels::email::send(alert, &cfg.email),
         other => Err(SendError::permanent(format!("unknown channel {}", other))),
     }
+}
+
+/// Channels that send the alert to someone else's server.
+fn leaves_host(channel: &str) -> bool {
+    matches!(channel, "webhook" | "telegram" | "email")
 }
 
 fn mark_delivered(state: &Arc<Mutex<NotifyState>>, alert: &Alert) {
@@ -827,6 +843,19 @@ pub mod webhook {
                 })
             }
             "discord" => discord(alert),
+            // m.room.message; Matrix clients render formatted_body.
+            "matrix" => json!({
+                "msgtype": "m.text",
+                "body": compact,
+                "format": "org.matrix.custom.html",
+                "formatted_body": format!(
+                    "<b>{}</b> \u{00B7} {}<br>{}<br><code>hermian show {}</code>",
+                    html_escape(&title),
+                    html_escape(&alert.host),
+                    html_escape(&alert.what),
+                    html_escape(alert.short_ref())
+                ),
+            }),
             "ntfy" => json!({
                 "title": format!("Hermian {} on {}", alert.severity.as_str(), alert.host),
                 "message": compact,
@@ -900,13 +929,34 @@ pub mod webhook {
         out
     }
 
+    fn html_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    /// Matrix sends are a PUT to `<room send endpoint>/<transaction id>`; the
+    /// id makes a retried delivery post once.
+    pub fn matrix_url(base: &str, alert: &Alert) -> String {
+        let txn: String = format!("hermian-{}-{}", alert.ref_id, alert.ts.timestamp_millis())
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        format!("{}/{}", base.trim_end_matches('/'), txn)
+    }
+
     pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), SendError> {
         let body = payload(alert, &cfg.format);
         let agent = ureq::AgentBuilder::new()
             .timeout(Duration::from_secs(cfg.timeout_secs.clamp(2, 60)))
             .user_agent(&format!("hermian/{}", hermian_core::VERSION))
             .build();
-        let mut req = agent.post(&cfg.url).set("Content-Type", "application/json");
+        let mut req = if cfg.format == "matrix" {
+            agent.put(&matrix_url(&cfg.url, alert))
+        } else {
+            agent.post(&cfg.url)
+        }
+        .set("Content-Type", "application/json");
         if !cfg.token.is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", cfg.token));
         }
@@ -956,6 +1006,19 @@ mod tests {
             .contains("HIGH"));
         let d = webhook::payload(&a, "discord");
         assert_eq!(d["embeds"][0]["color"], 0x9A8CF7);
+        let m = webhook::payload(&a, "matrix");
+        assert_eq!(m["msgtype"], "m.text");
+        assert!(m["formatted_body"]
+            .as_str()
+            .unwrap()
+            .contains("hermian show 001"));
+        assert_eq!(
+            webhook::matrix_url("https://m.example/_matrix/client/v3/rooms/!r:m.example/send/m.room.message/", &a),
+            format!(
+                "https://m.example/_matrix/client/v3/rooms/!r:m.example/send/m.room.message/hermian-HER-2025-0101-001-{}",
+                a.ts.timestamp_millis()
+            )
+        );
         let n = webhook::payload(&a, "ntfy");
         assert_eq!(n["priority"], 4);
     }

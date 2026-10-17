@@ -229,9 +229,29 @@ bot_token = "123456789:AAH..."
 chat_id = "-1001234567890"
 ```
 
-Email (SMTP or sendmail) and webhooks (Slack, Discord, ntfy, or plain JSON)
-work too, configured in the same file. HIGH and CRITICAL alerts notify by
+Email (SMTP or sendmail) and webhooks (Slack, Discord, ntfy, Matrix, or plain
+JSON) work too, configured in the same file. HIGH and CRITICAL alerts notify by
 default.
+
+### Keeping alerts in-house
+
+Hermian sends nothing anywhere unless you add a channel, and you pick where it
+goes. To keep everything inside your organisation, use a channel you host: your
+own [ntfy](https://ntfy.sh) server, a Matrix homeserver, email through your own
+mail server, or a webhook into your SIEM. Telegram, Slack and Discord are cloud
+services. If you use one, set `content = "minimal"`: the message then says only
+"HIGH alert 025 on web-01" and the command to read it on the host. No addresses,
+users, paths or commands leave the server, and no buttons are sent.
+
+```toml
+[notifications]
+content = "minimal"            # full | minimal
+
+[notifications.webhook]        # Matrix, on your homeserver
+format = "matrix"
+url = "https://matrix.example.org/_matrix/client/v3/rooms/!roomid:example.org/send/m.room.message"
+token = "syt_..."              # the bot account's access token
+```
 
 Then make sure it works:
 
@@ -243,7 +263,10 @@ sudo hermian notify-test
 
 Telegram alerts can carry buttons: **Block** on the brute-force digest, and
 **Ignore**, **Disconnect session**, or **Disconnect and block** on suspicious
-SSH logins. They act right away, so only allow people you trust:
+SSH logins. Block and Disconnect ask first: the buttons turn into **Confirm**
+and **Cancel**, and Confirm expires after two minutes. Every button works once,
+expires after 15 minutes (`action_ttl_mins`), and is only accepted from the
+configured chat and from the users you list, so only list people you trust:
 
 ```toml
 [notifications.telegram]

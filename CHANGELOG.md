@@ -8,6 +8,13 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Added
 
+- `notifications.content = "minimal"`: Telegram, email and webhooks get
+  only "HIGH alert 025 on web-01" and the command to read it on the host,
+  with no addresses, users, paths or commands, and no buttons. journald and
+  the alert file keep everything.
+- Matrix as a webhook format (`format = "matrix"`), for alerts that stay on
+  your own homeserver. Deliveries carry a transaction id, so a retry posts
+  once.
 - A start-up audit, also available as `hermian audit` (`--json`; exits 2
   when it finds something serious). It looks for signs that the host was
   compromised before Hermian started: a library in `/etc/ld.so.preload`,
@@ -33,6 +40,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   absolute path with a clean environment, and the daemon isn't dumpable.
 
 ### Changed
+
+- Block and Disconnect buttons ask first: the keyboard turns into Confirm
+  and Cancel, Confirm expires after two minutes, and Cancel puts the
+  buttons back. Buttons now expire after 15 minutes by default (was 30).
 
 - The installer has the CLI's look: the same header, brand colours on a
   terminal (`NO_COLOR` and `HERMIAN_COLOR` respected), one line per step,
