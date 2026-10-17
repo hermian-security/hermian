@@ -29,7 +29,7 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     // window for it to isolate the host again. The watchdog timer goes too,
     // or it would point at a binary that is about to disappear.
     for unit in ["hermian-watchdog.timer", "hermian"] {
-        let _ = std::process::Command::new("systemctl")
+        let _ = crate::procsrc::system_command("systemctl")
             .args(["disable", "--now", unit])
             .output();
     }
@@ -73,7 +73,7 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     if let Some(cfg_dir) = paths::config_path().parent() {
         let _ = fs::remove_dir(cfg_dir); // only if empty
     }
-    let _ = std::process::Command::new("systemctl")
+    let _ = crate::procsrc::system_command("systemctl")
         .args(["daemon-reload"])
         .output();
 
@@ -108,7 +108,7 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
 
 /// Whether dpkg has the hermian package installed.
 fn package_installed() -> bool {
-    std::process::Command::new("dpkg-query")
+    crate::procsrc::system_command("dpkg-query")
         .args(["-W", "-f=${Status}", "hermian"])
         .output()
         .map(|o| o.status.success() && dpkg_status_installed(&String::from_utf8_lossy(&o.stdout)))
@@ -124,7 +124,7 @@ fn dpkg_status_installed(status: &str) -> bool {
 /// `dpkg --purge hermian`. The maintainer scripts only redo what uninstall
 /// already did (units, PAM lines, state), so missing files are fine.
 fn purge_package() -> bool {
-    std::process::Command::new("dpkg")
+    crate::procsrc::system_command("dpkg")
         .args(["--purge", "hermian"])
         .env("DEBIAN_FRONTEND", "noninteractive")
         .stdout(std::process::Stdio::null())

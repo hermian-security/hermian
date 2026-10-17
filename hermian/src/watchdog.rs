@@ -267,7 +267,7 @@ fn unit_active_for() -> Option<Duration> {
 }
 
 fn systemctl_show(prop: &str) -> Option<String> {
-    let out = std::process::Command::new("systemctl")
+    let out = crate::procsrc::system_command("systemctl")
         .args(["show", "hermian", "-p", prop])
         .output()
         .ok()?;
@@ -279,7 +279,7 @@ fn systemctl_show(prop: &str) -> Option<String> {
 }
 
 fn systemctl(args: &[&str]) -> Result<(), String> {
-    let out = std::process::Command::new("systemctl")
+    let out = crate::procsrc::system_command("systemctl")
         .args(args)
         .output()
         .map_err(|e| format!("failed to run systemctl: {}", e))?;

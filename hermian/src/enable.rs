@@ -345,7 +345,7 @@ fn pam_config_with_hook(content: &str) -> Option<String> {
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let out = std::process::Command::new("systemctl")
+    let out = crate::procsrc::system_command("systemctl")
         .args(args)
         .output()
         .context("failed to run systemctl (is this a systemd host?)")?;

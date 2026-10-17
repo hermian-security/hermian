@@ -35,7 +35,7 @@ fn table_script() -> String {
 }
 
 fn nft(args: &[&str]) -> Result<String> {
-    let out = std::process::Command::new("nft")
+    let out = crate::procsrc::system_command("nft")
         .args(args)
         .output()
         .context("failed to run nft (install nftables)")?;
@@ -52,7 +52,7 @@ fn nft(args: &[&str]) -> Result<String> {
 
 fn nft_script(script: &str) -> Result<()> {
     use std::io::Write;
-    let mut child = std::process::Command::new("nft")
+    let mut child = crate::procsrc::system_command("nft")
         .args(["-f", "-"])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -409,7 +409,7 @@ mod tests {
     #[ignore]
     fn nft_accepts_the_block_table() {
         use std::io::Write;
-        let mut child = std::process::Command::new("nft")
+        let mut child = crate::procsrc::system_command("nft")
             .args(["-c", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

@@ -56,6 +56,14 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# A preload rootkit hooks every dynamically linked program at exec: the
+# daemon and the tools it runs (journalctl, nft, systemctl) too. In the
+# service's mount namespace the file is unreadable, so nothing is preloaded;
+# Hermian judges the host's copy through /proc/1/root. Only a file present
+# when the service starts is covered: one created later pages CRITICAL (D3),
+# and the next restart covers it.
+InaccessiblePaths=-/etc/ld.so.preload
+UnsetEnvironment=LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT
 # MemoryDenyWriteExecute is intentionally NOT set: the eBPF perf ring buffer
 # requires a shared writable mmap and the option blocks it (EPERM at mmap).
 SystemCallArchitectures=native
