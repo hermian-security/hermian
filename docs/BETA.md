@@ -90,8 +90,14 @@ steps are right under the list.
 
 ## Questions, problems, false positives
 
-Open an issue: https://github.com/hermian-security/hermian/issues
-Or write to contact@hermian.me.
+Everything happens in GitHub Discussions:
+https://github.com/hermian-security/hermian/discussions
+
+- Start here and the FAQ: pinned at the top.
+- Q&A: setup problems, alerts that were you, anything you're unsure about.
+- Announcements: new betas. Click "Watch" to hear about them.
+
+Rather not post in public? Write to contact@hermian.me.
 
 A security problem in Hermian itself goes to SECURITY.md, privately.
 

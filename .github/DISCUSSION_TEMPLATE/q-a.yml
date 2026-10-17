@@ -1,0 +1,38 @@
+title: ""
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Stuck, or got an alert for something you did? Ask here. The [FAQ](https://github.com/hermian-security/hermian/discussions/categories/announcements) may already have the answer, and the [beta guide](https://hermian.me/beta) has every setup step.
+        Found a security problem in Hermian itself? Don't post it here: see [SECURITY.md](https://github.com/hermian-security/hermian/blob/main/SECURITY.md).
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What is it about?
+      options:
+        - Install or setup
+        - An alert for something I did (false positive)
+        - Notifications (Telegram, email, webhook)
+        - A question about how Hermian works
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: For a false positive, the alert's title and rule (e.g. "D1 Binary executed from a transient directory") and what you were doing at the time.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output, if any
+      description: An error, or `sudo hermian status`. Remove host names, IP addresses and user names you'd rather keep private.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version and system
+      placeholder: "hermian --version, and the distro (e.g. Ubuntu 22.04, arm64)"
