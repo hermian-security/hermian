@@ -82,8 +82,20 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     let _ = fs::remove_file(paths::APT_SOURCES_PATH);
     let _ = fs::remove_file(paths::APT_KEYRING_PATH);
 
-    if let Ok(exe) = procsrc::current_exe_path() {
-        let _ = fs::remove_file(exe);
+    // Installed from the .deb: let dpkg remove its own files and forget the
+    // package. Deleting the binary by hand left `dpkg -l` showing
+    // "ii hermian", so apt still thought it was installed.
+    let purged = package_installed() && purge_package();
+    if !purged {
+        if package_installed() {
+            eprintln!(
+                "hermian: dpkg --purge hermian failed; the files are gone but run it \
+                 yourself so apt forgets the package"
+            );
+        }
+        if let Ok(exe) = procsrc::current_exe_path() {
+            let _ = fs::remove_file(exe);
+        }
     }
 
     println!("{}", st.ok("Hermian removed."));
@@ -92,6 +104,34 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         st.dim("No unit, state, logs, PAM hook, or privileged process remains.")
     );
     Ok(())
+}
+
+/// Whether dpkg has the hermian package installed.
+fn package_installed() -> bool {
+    std::process::Command::new("dpkg-query")
+        .args(["-W", "-f=${Status}", "hermian"])
+        .output()
+        .map(|o| o.status.success() && dpkg_status_installed(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false)
+}
+
+/// "install ok installed" is installed; "half-installed", "config-files"
+/// and "not-installed" aren't, nor is a missing status.
+fn dpkg_status_installed(status: &str) -> bool {
+    status.split_whitespace().last() == Some("installed")
+}
+
+/// `dpkg --purge hermian`. The maintainer scripts only redo what uninstall
+/// already did (units, PAM lines, state), so missing files are fine.
+fn purge_package() -> bool {
+    std::process::Command::new("dpkg")
+        .args(["--purge", "hermian"])
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && !package_installed()
 }
 
 /// Only delete absolute paths with a `hermian` component, without `..`.
@@ -146,5 +186,14 @@ mod tests {
         assert!(!safe_to_remove(Path::new("/var/lib")));
         assert!(!safe_to_remove(Path::new("relative/hermian")));
         assert!(!safe_to_remove(Path::new("/var/lib/hermian/../../..")));
+    }
+
+    #[test]
+    fn only_a_fully_installed_package_counts() {
+        assert!(dpkg_status_installed("install ok installed"));
+        assert!(!dpkg_status_installed("install ok half-installed"));
+        assert!(!dpkg_status_installed("deinstall ok config-files"));
+        assert!(!dpkg_status_installed("unknown ok not-installed"));
+        assert!(!dpkg_status_installed(""));
     }
 }
