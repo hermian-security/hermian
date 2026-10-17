@@ -28,8 +28,10 @@ pub enum ConfigError {
     WebhookUrl,
     #[error("notifications.webhook.url must start with https:// or http://")]
     WebhookScheme,
-    #[error("notifications.webhook.format must be one of generic, slack, discord, ntfy")]
+    #[error("notifications.webhook.format must be one of generic, slack, discord, ntfy, matrix")]
     WebhookFormat,
+    #[error("notifications.content must be full or minimal")]
+    Content,
     #[error("notifications.telegram.bot_token is required (format: 123456:ABC-DEF...)")]
     TelegramToken,
     #[error("notifications.telegram.chat_id is required")]
@@ -225,7 +227,7 @@ impl Default for TelegramCfg {
             timeout_secs: 10,
             actions: false,
             allowed_user_ids: Vec::new(),
-            action_ttl_mins: 30,
+            action_ttl_mins: 15,
         }
     }
 }
@@ -284,6 +286,10 @@ pub struct NotificationsCfg {
     /// Minimum severity that is *notified* (sent to webhook/telegram/email/
     /// stdout). Everything is always written to journald/file regardless.
     pub min_severity: String,
+    /// What leaves the host: "full" (default) or "minimal" (severity, rule
+    /// family, reference and host only; see [`crate::Alert::minimal`]).
+    /// journald and the alert file always get everything.
+    pub content: String,
     pub webhook: WebhookCfg,
     pub telegram: TelegramCfg,
     pub email: EmailCfg,
@@ -295,6 +301,7 @@ impl Default for NotificationsCfg {
             channels: vec!["journald".to_string(), "file".to_string()],
             dedup_window_secs: 300,
             min_severity: "HIGH".to_string(),
+            content: "full".to_string(),
             webhook: WebhookCfg::default(),
             telegram: TelegramCfg::default(),
             email: EmailCfg::default(),
@@ -361,7 +368,7 @@ pub const SUPPORTED_CHANNELS: &[&str] =
     &["journald", "file", "stdout", "webhook", "telegram", "email"];
 pub const SUPPORTED_EMAIL_TRANSPORTS: &[&str] = &["smtp", "sendmail"];
 pub const SUPPORTED_SMTP_SECURITY: &[&str] = &["starttls", "tls", "none"];
-pub const SUPPORTED_WEBHOOK_FORMATS: &[&str] = &["generic", "slack", "discord", "ntfy"];
+pub const SUPPORTED_WEBHOOK_FORMATS: &[&str] = &["generic", "slack", "discord", "ntfy", "matrix"];
 
 impl Config {
     pub fn parse(toml_text: &str) -> Result<Config, toml::de::Error> {
@@ -424,6 +431,9 @@ impl Config {
         }
         if self.notifications.min_severity.parse::<Severity>().is_err() {
             return Err(ConfigError::MinSeverity);
+        }
+        if !["full", "minimal"].contains(&self.notifications.content.as_str()) {
+            return Err(ConfigError::Content);
         }
         if self.notifications.has_channel("webhook") {
             let w = &self.notifications.webhook;
@@ -528,6 +538,11 @@ d5_network = true          # connections from flagged chains, new destinations, 
 channels = ["journald", "file"]
 dedup_window_secs = 300
 min_severity = "HIGH"
+# What Telegram, email and webhooks receive. "full": the whole alert.
+# "minimal": "HIGH alert 025 on web-01" and the command to read it here,
+# with no addresses, users, paths or commands (and no buttons). journald and
+# the alert file always get everything.
+content = "full"
 
 [notifications.telegram]
 # 1. Message @BotFather, /newbot, copy the token.
@@ -546,7 +561,7 @@ timeout_secs = 10
 # daemon the firewall and kill capabilities these need).
 actions = false
 allowed_user_ids = []          # numbers, no quotes, e.g. [123456789]
-action_ttl_mins = 30           # buttons expire after this
+action_ttl_mins = 15           # buttons expire after this
 
 [notifications.email]
 transport = "smtp"             # smtp | sendmail (use the host's MTA)
@@ -563,7 +578,10 @@ sendmail_path = "/usr/sbin/sendmail"
 
 [notifications.webhook]
 url = ""
-format = "generic"      # generic | slack | discord | ntfy
+format = "generic"      # generic | slack | discord | ntfy | matrix
+# matrix: url is the room's send endpoint on your homeserver,
+#   https://matrix.example.org/_matrix/client/v3/rooms/!roomid:example.org/send/m.room.message
+#   and token the bot account's access token.
 token = ""
 timeout_secs = 10
 
