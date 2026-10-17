@@ -268,7 +268,7 @@ finish() {
     printf '    %ssudo hermian status%s        coverage and health\n' "$S_BOLD" "$S_RST"
     printf '    %ssudo hermian notify-test%s   after adding Telegram, email or a webhook\n' "$S_BOLD" "$S_RST"
     printf '    %s/etc/hermian/config.toml%s   where those go\n\n' "$S_BOLD" "$S_RST"
-    printf '  %sDocs  https://hermian.me%s\n\n' "$S_DIM" "$S_RST"
+    printf '  %sDocs  https://hermian.me/docs%s\n\n' "$S_DIM" "$S_RST"
 }
 
 main() {

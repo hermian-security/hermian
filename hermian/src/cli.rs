@@ -90,7 +90,7 @@ pub fn command() -> clap::Command {
     let after = format!(
         "{}\n  sudo hermian status\n  sudo hermian alerts -s high\n  sudo hermian show 7\n\n\
          {}\n  NO_COLOR=1, or HERMIAN_COLOR=always|never\n\n\
-         {}  https://hermian.me\n{}  https://github.com/hermian-security/hermian\n\
+         {}  https://hermian.me/docs\n{}  https://github.com/hermian-security/hermian\n\
          {}  contact@hermian.me (security reports: SECURITY.md)",
         st.accent(&st.bold("Examples")),
         st.accent(&st.bold("Colour")),
