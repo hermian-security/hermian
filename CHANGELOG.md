@@ -6,6 +6,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0-beta.12 - 2026-10-17
+
+The CLI gets the identity: one header on every screen, grouped help, brand
+colours. Retired config settings are commented out on upgrade, and `status`
+warns when the command and the daemon are different versions.
+
 ### Changed
 
 - The CLI wears the identity. Every screen (status, alerts, report, test,
