@@ -121,9 +121,97 @@ pub fn cmd_audit(args: &AuditArgs) -> Result<()> {
     Ok(())
 }
 
+/// Hermian looking at itself: code mapped into the daemon from where it
+/// shouldn't come, that no package owns, or that /etc/ld.so.preload injects.
+/// `last` is the mapped set judged last time; the package database is only
+/// asked again when it changes. `None`: nothing changed.
+pub fn self_check(last: &mut Vec<String>) -> Option<Vec<Sign>> {
+    let mapped = mapped_code(Path::new("/proc/self/maps"));
+    if *last == mapped {
+        return None;
+    }
+    last.clone_from(&mapped);
+    let me = ProcView {
+        pid: std::process::id(),
+        comm: "hermian".into(),
+        exe: fs::read_link("/proc/self/exe")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        mapped: mapped.clone(),
+    };
+    let input = AuditInput {
+        processes: vec![me],
+        ..Default::default()
+    };
+    let owners = Owners::query(&audit::ownership_queries(&input));
+    let mut signs = audit::audit(&input, &|p| owners.owned(p));
+    let preload = crate::procsrc::read_host_view("/etc/ld.so.preload").unwrap_or_default();
+    for lib in audit::preload_entries(&preload) {
+        let loaded = mapped.iter().any(|m| {
+            let m = m.trim_end_matches(" (deleted)");
+            m == lib || usr_alias(m).as_deref() == Some(lib.as_str())
+        });
+        if loaded {
+            signs.insert(
+                0,
+                Sign {
+                    kind: audit::SignKind::Preload,
+                    severity: Severity::Critical,
+                    what: format!(
+                        "the daemon has loaded {}, which /etc/ld.so.preload injects into every \
+                         program",
+                        lib
+                    ),
+                    path: lib,
+                },
+            );
+        }
+    }
+    signs.retain(|s| s.severity >= Severity::High);
+    Some(signs)
+}
+
+/// The alert for a failed self-check.
+pub fn self_finding(signs: &[Sign]) -> Option<hermian_core::Finding> {
+    if signs.is_empty() {
+        return None;
+    }
+    let mut f = hermian_core::Finding::new(
+        hermian_core::DetectionId::Self_,
+        Severity::Critical,
+        "Hermian itself is hooked",
+        &format!(
+            "selfprotect|hooked|{}",
+            hermian_core::detect::content_tag(
+                &signs
+                    .iter()
+                    .map(|s| s.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        ),
+    )
+    .what("Code that doesn't belong to Hermian is loaded into the running daemon.");
+    for s in signs.iter().take(8) {
+        f = f.fact("Found", &s.what);
+    }
+    Some(
+        f.why(
+            "Injected code can filter what Hermian sees and reports, while it still looks \
+             healthy. Its alerts from here on can't be trusted.",
+        )
+        .actions([
+            "Restart Hermian (systemctl restart hermian) and check this alert doesn't come back.",
+            "Run 'hermian audit' and treat the host as compromised.",
+            "Check that /etc/systemd/system/hermian.service still has InaccessiblePaths=-/etc/ld.so.preload.",
+        ]),
+    )
+}
+
 fn gather() -> AuditInput {
     AuditInput {
-        preload: fs::read_to_string("/etc/ld.so.preload").ok(),
+        // The host's copy: the unit hides this file from the daemon itself.
+        preload: crate::procsrc::read_host_view("/etc/ld.so.preload"),
         processes: processes(),
         autostart: autostart_files(),
     }
@@ -262,7 +350,7 @@ impl Owners {
                 ask.push(a);
             }
         }
-        let out = std::process::Command::new("dpkg-query")
+        let out = crate::procsrc::system_command("dpkg-query")
             .arg("-S")
             .args(&ask)
             .stdin(std::process::Stdio::null())

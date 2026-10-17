@@ -19,7 +19,7 @@ use crate::ui::Style;
 const TABLE: &str = "hermian";
 
 fn run_nft(args: &[&str]) -> Result<()> {
-    let out = std::process::Command::new("nft")
+    let out = crate::procsrc::system_command("nft")
         .args(args)
         .output()
         .context("failed to run nft (install nftables)")?;
@@ -35,7 +35,7 @@ fn run_nft(args: &[&str]) -> Result<()> {
 }
 
 pub fn is_isolated() -> bool {
-    std::process::Command::new("nft")
+    crate::procsrc::system_command("nft")
         .args(["list", "table", "inet", TABLE])
         .output()
         .map(|o| o.status.success())
@@ -309,7 +309,7 @@ pub fn apply_isolation(management_cidrs: &[String], egress: &Egress) -> Result<(
         }
     }
     let script = ruleset(management_cidrs, egress);
-    let mut child = std::process::Command::new("nft")
+    let mut child = crate::procsrc::system_command("nft")
         .args(["-f", "-"])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -367,7 +367,7 @@ fn revert_args(minutes: u32, nft: &str) -> Vec<String> {
 pub fn schedule_revert(minutes: u32) -> Result<()> {
     cancel_revert();
     let nft = find_nft().context("nft not found")?;
-    let out = std::process::Command::new("systemd-run")
+    let out = crate::procsrc::system_command("systemd-run")
         .args(revert_args(minutes, nft))
         .output()
         .context("failed to run systemd-run")?;
@@ -381,10 +381,10 @@ pub fn schedule_revert(minutes: u32) -> Result<()> {
 }
 
 fn cancel_revert() {
-    let _ = std::process::Command::new("systemctl")
+    let _ = crate::procsrc::system_command("systemctl")
         .args(["stop", &format!("{}.timer", REVERT_UNIT)])
         .output();
-    let _ = std::process::Command::new("systemctl")
+    let _ = crate::procsrc::system_command("systemctl")
         .args(["reset-failed", &format!("{}.service", REVERT_UNIT)])
         .output();
 }
@@ -623,7 +623,7 @@ mod tests {
             ],
         };
         let script = ruleset(&["203.0.113.0/24".into(), "2001:db8::/32".into()], &e);
-        let mut child = std::process::Command::new("nft")
+        let mut child = crate::procsrc::system_command("nft")
             .args(["-c", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
