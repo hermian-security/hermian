@@ -21,9 +21,12 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   the rootkit loaded into it. Libraries unpacked into /tmp by runtimes such
   as Nx or Netty are listed as LOW and don't page.
 - Hermian protects itself from the kind of rootkit found on that host. The
-  unit hides `/etc/ld.so.preload` from the daemon's own mount namespace, so
-  a preload rootkit can't hook it or the tools it runs, and Hermian still
-  judges the host's copy. The daemon checks its own loaded code at start
+  unit mounts /dev/null over `/etc/ld.so.preload` in the daemon's own mount
+  namespace, so a preload rootkit can't hook it or the tools it runs, even
+  when systemd itself is already hooked, and Hermian still judges the host's
+  copy. Where the file doesn't exist, systemd creates an empty one to mount
+  over; an empty preload file is no longer an alert, and uninstall removes it
+  if it's still empty. The daemon checks its own loaded code at start
   and every ten minutes and pages CRITICAL ("Hermian itself is hooked") on
   anything foreign. A ptrace attach to the daemon is CRITICAL whoever does
   it. The tools it runs (journalctl, nft, systemctl, dpkg) are started by

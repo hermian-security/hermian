@@ -77,6 +77,13 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         .args(["daemon-reload"])
         .output();
 
+    // The empty mount point systemd made for the unit's preload bind mount.
+    // Only if it's still empty: content would be someone else's (or a
+    // rootkit's, which is evidence).
+    if fs::metadata("/etc/ld.so.preload").is_ok_and(|m| m.is_file() && m.len() == 0) {
+        let _ = fs::remove_file("/etc/ld.so.preload");
+    }
+
     remove_pam_line()?;
     let _ = fs::remove_file(paths::PAM_MODULE_PATH);
     let _ = fs::remove_file(paths::APT_SOURCES_PATH);

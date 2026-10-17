@@ -221,6 +221,11 @@ fn ld_preload(ev: &FileEvent, _ctx: &Ctx) -> Option<Finding> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_string)
         .collect();
+    // An empty file preloads nothing. Hermian's own unit has systemd create
+    // one to mount over, so an empty one is neither news nor a threat.
+    if libs.is_empty() && ev.kind != FileKind::Removed {
+        return None;
+    }
     let mut f = Finding::new(
         DetectionId::D3,
         Severity::Critical,

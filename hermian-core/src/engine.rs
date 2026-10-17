@@ -1564,6 +1564,25 @@ mod tests {
         assert!(a.facts.iter().any(|f| f.value.contains("/tmp/libevil.so")));
     }
 
+    /// systemd creates an empty /etc/ld.so.preload to bind-mount over for
+    /// Hermian's own unit; that paged CRITICAL on a clean host.
+    #[test]
+    fn an_empty_ld_preload_is_not_an_alert() {
+        let mut eng = engine_without_baseline();
+        let alerts = eng.process(Event::File(file(
+            Utc::now(),
+            "/etc/ld.so.preload",
+            FileKind::Created,
+            None,
+            Some("# nothing\n\n"),
+        )));
+        assert!(
+            !alerts.iter().any(|a| a.detection == DetectionId::D3),
+            "{:?}",
+            alerts
+        );
+    }
+
     #[test]
     fn systemd_dropin_overriding_execstart_is_critical() {
         let mut eng = engine_without_baseline();
