@@ -120,8 +120,11 @@ pub fn evaluate_exec(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
         DetectionId::D4,
         Severity::High,
         "LD_PRELOAD injection in an unattended process",
-        &format!("d4|ld-preload-env|{}|{}", ev.comm, ev.uid),
+        // Per chain, not per program: one implant preloading into node,
+        // timeout and ls is one incident.
+        &format!("d4|ld-preload-env|{}|{}", ctx.incident_root(ev.pid), ev.uid),
     )
+    .varies("Executables", &ev.exe)
     .what(format!(
         "{} (pid {}) was executed with LD_PRELOAD set while no interactive session was involved.",
         ev.comm, ev.pid

@@ -27,6 +27,33 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   terminal (`NO_COLOR` and `HERMIAN_COLOR` respected), one line per step,
   and next steps at the end. It now says whether the service is actually
   running, and apt's own output is quieter.
+- One incident, one page. A flagged process calling out to many addresses
+  pages once instead of once per address, and one implant preloading into
+  several programs of the same chain pages once instead of once per
+  program. The LOW "Repeated:" summary lists what differed (the first
+  destinations or executables and how many). An incident still going when
+  its 5-minute window closes gets a longer one next time (15, 45 minutes,
+  then hourly); a quiet window resets it. Found on a live infected host,
+  where a miner paged 56 times in an hour.
+
+### Fixed
+
+- The baseline no longer learns an intrusion as normal. Connections from a
+  chain D1 flagged, or from a program running out of /tmp, /dev/shm or a
+  deleted file, aren't learned, and neither is a login through a hidden key
+  file. On an infected host the implant's programs and its C2 addresses
+  used to become "known", which silenced the novelty rules for them.
+- `hermian enable --no-baseline` skips the learning period as its help
+  says. It used to switch the novelty rules off for good. A missing
+  baseline.json now starts a new learning period instead of doing the same.
+- 0.0.0.0, `::` and loopback are no longer recorded as destinations.
+
+### Fixed
+
+- `hermian uninstall` on an apt or .deb install finishes with
+  `dpkg --purge hermian`. It used to delete the files itself and leave dpkg
+  listing the package as installed (`ii hermian`), so apt still thought
+  Hermian was there.
 
 ### Fixed
 

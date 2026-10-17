@@ -104,6 +104,34 @@ impl<'a> Ctx<'a> {
     }
 
     /// Structured process chain for `pid`, focus on the last node.
+    /// The process an incident hangs from: the first one in `pid`'s chain
+    /// below init and the system daemons (sshd, cron), by executable. On buki,
+    /// systemd > javax64 > sh > node and systemd > javax64 > sh > timeout
+    /// both give javax64's.
+    pub fn incident_root(&self, pid: u32) -> String {
+        let chain = self.tree.chain_of(pid);
+        chain
+            .iter()
+            .find(|p| {
+                p.pid > 1
+                    && !matches!(
+                        crate::proctree::role_of(&p.comm, &p.exe),
+                        crate::proctree::Role::System
+                            | crate::proctree::Role::Sshd
+                            | crate::proctree::Role::Cron
+                    )
+            })
+            .or(chain.last())
+            .map(|p| {
+                if p.exe.is_empty() {
+                    p.comm.clone()
+                } else {
+                    p.exe.clone()
+                }
+            })
+            .unwrap_or_else(|| pid.to_string())
+    }
+
     pub fn chain_nodes(&self, pid: u32) -> Vec<ChainNode> {
         chain_from_procs(&self.tree.chain_of(pid), self.user_names)
     }

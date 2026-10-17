@@ -38,8 +38,11 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 DetectionId::D5,
                 Severity::High,
                 "Outbound connection from a flagged process chain",
-                &format!("d5|connect-flagged|{}|{}", ev.comm, ev.daddr),
+                // Per program, not per address: a miner or proxy calling 40
+                // addresses is one incident, and the summary lists them.
+                &format!("d5|connect-flagged|{}", connector_key),
             )
+            .varies("Destinations", &dest)
             .what(format!(
                 "{} (pid {}) connected to {} within ten minutes of its chain being flagged by D1.",
                 ev.comm, ev.pid, dest
