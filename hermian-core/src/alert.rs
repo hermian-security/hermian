@@ -82,6 +82,11 @@ pub struct Finding {
     /// Responses an operator could choose (shown as buttons where supported).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offers: Vec<crate::response::ResponseAction>,
+    /// What differs between repeats of one incident (a destination, an
+    /// executable). Not part of the signature: the dedup summary lists the
+    /// values it folded instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub varies: Option<Fact>,
 }
 
 impl Finding {
@@ -98,7 +103,18 @@ impl Finding {
             signature: signature.to_string(),
             pids: Vec::new(),
             offers: Vec::new(),
+            varies: None,
         }
+    }
+
+    /// Name the detail that changes from one repeat to the next. `label` is
+    /// the plural used in the summary ("Destinations").
+    pub fn varies(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
+        self.varies = Some(Fact {
+            label: label.into(),
+            value: value.into(),
+        });
+        self
     }
 
     /// Offer a response the operator can choose.

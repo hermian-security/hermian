@@ -254,10 +254,21 @@ impl Engine {
                 if self.cfg.detections.d5_network {
                     findings.extend(detect::d5::evaluate_connect(&e, &self.ctx(now)));
                 }
-                self.baseline.observe_dest(e.daddr, now);
+                // Never learn from what's already suspect: on an infected host
+                // the implant's programs and its C2 would otherwise become
+                // "normal" during (and after) the learning window.
                 let exe = detect::d5::connector_exe(&self.tree, e.pid, &e.comm);
-                self.baseline
-                    .observe_connector(&detect::d5::connector_key(&exe, e.uid), now);
+                let suspect = self.ctx(now).has_recent_flag(
+                    e.pid,
+                    detect::FLAG_WINDOW_SECS,
+                    Some(DetectionId::D1),
+                ) || crate::events::is_suspicious_exec_dir(&exe)
+                    || exe.ends_with("(deleted)");
+                if !suspect {
+                    self.baseline.observe_dest(e.daddr, now);
+                    self.baseline
+                        .observe_connector(&detect::d5::connector_key(&exe, e.uid), now);
+                }
             }
             Event::Ptrace(e) => {
                 if self.cfg.detections.d4_priv_esc {
@@ -313,7 +324,13 @@ impl Engine {
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
                     self.record_brute_force(&e, now);
                 }
-                if e.result == AuthResult::Success {
+                // A login through a hidden key file is a backdoor, not a
+                // habit: learning its key or source would make the same key
+                // routine through a normal authorized_keys later.
+                let backdoor = findings
+                    .iter()
+                    .any(|f| f.signature.starts_with(detect::d2::HIDDEN_KEY_LOGIN_SIG));
+                if e.result == AuthResult::Success && !backdoor {
                     if let Some(ip) = e.rhost {
                         self.baseline.observe_ssh_source(ip, now);
                         if e.user == "root" {
@@ -1143,6 +1160,94 @@ mod tests {
         assert!(d2[0].what.contains("/dev/.cache/rdpii"), "{}", d2[0].what);
     }
 
+    /// A hidden-key login teaches the baseline nothing: its key and address
+    /// would otherwise make the same backdoor key routine later.
+    #[test]
+    fn hidden_key_login_is_not_learned() {
+        use crate::events::SshKey;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            Baseline::new(true, 24, Utc::now()),
+            "h".into(),
+        );
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let login = |file: &str| {
+            Event::Auth(AuthEvent {
+                ts: Utc::now(),
+                result: AuthResult::Success,
+                user: "root".into(),
+                rhost: Some(ip),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+                method: AuthMethod::PublicKey,
+                port: None,
+                key: Some(SshKey {
+                    kind: "ED25519".into(),
+                    fingerprint: "SHA256:R+6n3".into(),
+                    file: Some(file.into()),
+                    line: Some(1),
+                    comment: None,
+                }),
+            })
+        };
+        eng.process(login("/dev/.cache/rdpii"));
+        assert!(!eng.baseline.key_is_known("root", "SHA256:R+6n3"));
+        assert!(!eng.baseline.ssh_source_is_known(ip));
+        // The same key through the normal file is learned as usual.
+        eng.process(login("/root/.ssh/authorized_keys"));
+        assert!(eng.baseline.key_is_known("root", "SHA256:R+6n3"));
+    }
+
+    /// buki, 2026-10-17: learning from a flagged chain put the miner's
+    /// programs and ~155 proxy addresses into the baseline. A flagged chain,
+    /// or a program running from /tmp or a deleted file, teaches it nothing.
+    #[test]
+    fn suspect_connections_are_not_learned() {
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            Baseline::new(true, 24, Utc::now()),
+            "h".into(),
+        );
+        let t = Utc::now();
+        let connect = |pid: u32, comm: &str, last: u8| {
+            Event::Connect(ConnectEvent {
+                ts: t,
+                pid,
+                uid: 0,
+                daddr: IpAddr::from([72, 195, 34, last]),
+                dport: 1080,
+                comm: comm.into(),
+                container: false,
+            })
+        };
+        // Flagged by D1: nginx > bash.
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
+        eng.process(connect(200, "bash", 1));
+        // From a transient directory, and from a deleted binary.
+        eng.process(exec(t, 300, 1, 0, "multipathd", "/tmp/.perf.c/multipathd"));
+        eng.process(connect(300, "multipathd", 2));
+        eng.process(exec(t, 400, 1, 0, "httpd", "/usr/sbin/httpd (deleted)"));
+        eng.process(connect(400, "httpd", 3));
+        assert!(
+            eng.baseline.known_dests.is_empty(),
+            "{:?}",
+            eng.baseline.known_dests
+        );
+        assert!(
+            eng.baseline.known_connectors.is_empty(),
+            "{:?}",
+            eng.baseline.known_connectors
+        );
+        // An ordinary program is learned as before.
+        eng.process(exec(t, 500, 1, 0, "apt", "/usr/bin/apt"));
+        eng.process(connect(500, "apt", 4));
+        assert!(eng.baseline.dest_is_known(IpAddr::from([72, 195, 34, 4])));
+        assert_eq!(eng.baseline.known_connectors.len(), 1);
+    }
+
     /// A source first seen after the learning window is novel once, then
     /// known: the second login from it must not page again (it used to,
     /// because the known-source set froze when the window closed).
@@ -1757,6 +1862,92 @@ mod tests {
             "{:?}",
             alerts
         );
+    }
+
+    /// buki, 2026-10-17: a flagged miner calling 40 SOCKS proxies paged once
+    /// per address. One incident is one page, plus one summary naming them.
+    #[test]
+    fn flagged_chain_calling_many_addresses_pages_once() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
+        let mut d5_high = 0;
+        for i in 0..50u8 {
+            let alerts = eng.process_at(
+                Event::Connect(ConnectEvent {
+                    ts: t + Duration::seconds(i64::from(i)),
+                    pid: 200,
+                    uid: 33,
+                    daddr: IpAddr::from([77, 239, 112, i]),
+                    dport: 1080,
+                    comm: "bash".into(),
+                    container: false,
+                }),
+                t + Duration::seconds(i64::from(i)),
+            );
+            d5_high += alerts
+                .iter()
+                .filter(|a| a.detection == DetectionId::D5 && a.severity == Severity::High)
+                .count();
+        }
+        assert_eq!(d5_high, 1);
+        let summaries = eng.tick(t + Duration::seconds(400));
+        let s = summaries
+            .iter()
+            .find(|a| a.detection == DetectionId::D5)
+            .unwrap_or_else(|| panic!("no D5 summary: {:?}", summaries));
+        assert_eq!(s.severity, Severity::Low);
+        let dests = s
+            .facts
+            .iter()
+            .find(|f| f.label == "Destinations")
+            .expect("destinations listed");
+        assert!(dests
+            .value
+            .starts_with("77.239.112.0:1080, 77.239.112.1:1080"));
+        assert!(dests.value.ends_with("(50 distinct)"), "{}", dests.value);
+    }
+
+    /// buki: one implant preloading into node, timeout and ls is one incident.
+    #[test]
+    fn ld_preload_into_several_programs_of_one_chain_pages_once() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 50, 1, 0, "javax64", "/tmp/.perf.c/javax64"));
+        let mut high = 0;
+        for (i, (comm, exe)) in [
+            ("node", "/usr/bin/node"),
+            ("timeout", "/usr/bin/timeout"),
+            ("ls", "/usr/bin/ls"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pid = 300 + i as u32;
+            eng.process(exec(t, pid, 50, 0, "sh", "/usr/bin/dash"));
+            let alerts = eng.process(Event::Exec(ExecEvent {
+                ts: t,
+                pid: pid + 10,
+                ppid: pid,
+                uid: 0,
+                gid: 0,
+                comm: (*comm).into(),
+                exe: (*exe).into(),
+                argv0: (*comm).into(),
+                ld_preload: true,
+                deleted_exe: false,
+                tty_nr: 0,
+                container: false,
+                container_id: None,
+            }));
+            high += alerts
+                .iter()
+                .filter(|a| a.detection == DetectionId::D4 && a.severity == Severity::High)
+                .count();
+        }
+        assert_eq!(high, 1);
     }
 
     #[test]
