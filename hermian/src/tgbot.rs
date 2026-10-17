@@ -7,6 +7,9 @@
 //! during isolation since Telegram stays reachable). A press is only acted
 //! on if it comes from the configured chat *and* from one of
 //! `allowed_user_ids`; anything else is refused and logged.
+//!
+//! Destructive actions (Block, Disconnect) take two presses: the first swaps
+//! the keyboard for "Confirm" and "Cancel", which expire after two minutes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +28,19 @@ const PREFIX: &str = "hm:";
 const MAX_PENDING: usize = 2000;
 /// Long-poll wait, seconds. The HTTP timeout must be longer.
 const POLL_SECS: u64 = 25;
+/// How long a "Confirm" button stays valid.
+const CONFIRM_SECS: i64 = 120;
+
+/// Where a button sits in the two-step flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// One of the alert's own buttons, at this position.
+    Offer(usize),
+    /// "Confirm: ..." for a destructive offer.
+    Confirm,
+    /// "Cancel": put the alert's buttons back.
+    Cancel,
+}
 
 #[derive(Debug, Clone)]
 pub struct Pending {
@@ -32,6 +48,24 @@ pub struct Pending {
     pub alert_ref: String,
     pub expires: DateTime<Utc>,
     pub message_id: Option<i64>,
+    pub step: Step,
+}
+
+/// What the poller does after answering a press.
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    /// Carry out this action.
+    pub request: Option<ActionRequest>,
+    /// Replace the message's buttons with these (empty: remove them).
+    pub keyboard: Option<(i64, Vec<(String, String)>)>,
+}
+
+/// Block and Disconnect change the host: they ask first.
+fn needs_confirmation(a: &ResponseAction) -> bool {
+    matches!(
+        a,
+        ResponseAction::Block { .. } | ResponseAction::Disconnect { .. }
+    )
 }
 
 /// A press that passed every check, for the daemon to carry out.
@@ -95,7 +129,7 @@ pub fn register(
     };
     s.retain(|_, p| p.expires > now);
     let mut out = Vec::new();
-    for a in actions {
+    for (i, a) in actions.iter().enumerate() {
         let id = random_id();
         s.insert(
             id.clone(),
@@ -104,6 +138,7 @@ pub fn register(
                 alert_ref: alert_ref.to_string(),
                 expires,
                 message_id: None,
+                step: Step::Offer(i),
             },
         );
         out.push((format!("{}{}", PREFIX, id), a.label()));
@@ -143,13 +178,28 @@ pub fn keyboard(buttons: &[(String, String)]) -> Value {
     json!({ "inline_keyboard": rows })
 }
 
-/// Decide what to do with one callback query. Returns the text to show the
-/// presser and, if every check passed, the action to carry out.
-pub fn handle_callback(
-    cq: &Value,
-    cfg: &TelegramCfg,
+/// The alert's own buttons still pending, in their original order.
+fn offers_of(
+    s: &HashMap<String, Pending>,
+    alert_ref: &str,
     now: DateTime<Utc>,
-) -> (String, Option<ActionRequest>) {
+) -> Vec<(String, String)> {
+    let mut v: Vec<(usize, String, String)> = s
+        .iter()
+        .filter(|(_, p)| p.alert_ref == alert_ref && p.expires > now)
+        .filter_map(|(id, p)| match p.step {
+            Step::Offer(i) => Some((i, format!("{}{}", PREFIX, id), p.action.label())),
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, d, l)| (d, l)).collect()
+}
+
+/// Decide what to do with one callback query. Returns the text to show the
+/// presser and what to do next.
+pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome) {
+    let none = Outcome::default;
     let from_id = cq["from"]["id"].as_i64();
     let who = describe_user(&cq["from"]);
     let chat_ok = cq["message"]["chat"]["id"]
@@ -157,10 +207,13 @@ pub fn handle_callback(
         .map(|id| id.to_string() == cfg.chat_id.trim())
         .unwrap_or(false);
     if !cfg.actions_enabled() {
-        return ("Response buttons are turned off on this host.".into(), None);
+        return (
+            "Response buttons are turned off on this host.".into(),
+            none(),
+        );
     }
     if !chat_ok {
-        return ("Not from the configured chat.".into(), None);
+        return ("Not from the configured chat.".into(), none());
     }
     let allowed = from_id.is_some_and(|id| cfg.allowed_user_ids.contains(&id));
     if !allowed {
@@ -171,33 +224,130 @@ pub fn handle_callback(
                 who
             ),
         );
-        return ("You're not allowed to do this.".into(), None);
+        return ("You're not allowed to do this.".into(), none());
     }
     let Some(id) = cq["data"].as_str().and_then(|d| d.strip_prefix(PREFIX)) else {
-        return ("Unknown button.".into(), None);
+        return ("Unknown button.".into(), none());
     };
     let Ok(mut s) = store().lock() else {
-        return ("Try again.".into(), None);
+        return ("Try again.".into(), none());
     };
     let Some(p) = s.remove(id) else {
-        return ("This button has expired or was already used.".into(), None);
+        return (
+            "This button has expired or was already used.".into(),
+            none(),
+        );
     };
+    let message_id = p
+        .message_id
+        .or_else(|| cq["message"]["message_id"].as_i64());
+    let restore =
+        |s: &HashMap<String, Pending>| message_id.map(|m| (m, offers_of(s, &p.alert_ref, now)));
     if p.expires <= now {
-        return ("This button has expired.".into(), None);
+        let text = if p.step == Step::Confirm {
+            "The confirmation expired; press the button again."
+        } else {
+            "This button has expired."
+        };
+        // A stale confirmation shouldn't leave the alert without buttons.
+        let keyboard = if p.step == Step::Confirm {
+            restore(&s)
+        } else {
+            None
+        };
+        s.retain(|_, o| {
+            !(o.alert_ref == p.alert_ref && matches!(o.step, Step::Confirm | Step::Cancel))
+        });
+        return (
+            text.into(),
+            Outcome {
+                request: None,
+                keyboard,
+            },
+        );
     }
+    match p.step {
+        Step::Offer(_) if needs_confirmation(&p.action) => {
+            // Keep the offer for Cancel, and ask.
+            let label = p.action.label();
+            let alert_ref = p.alert_ref.clone();
+            s.insert(id.to_string(), p.clone());
+            let until = now + chrono::Duration::seconds(CONFIRM_SECS);
+            let mut step = |st: Step| {
+                let nid = random_id();
+                s.insert(
+                    nid.clone(),
+                    Pending {
+                        action: p.action.clone(),
+                        alert_ref: alert_ref.clone(),
+                        expires: until,
+                        message_id,
+                        step: st,
+                    },
+                );
+                format!("{}{}", PREFIX, nid)
+            };
+            let confirm = step(Step::Confirm);
+            let cancel = step(Step::Cancel);
+            let keyboard = message_id.map(|m| {
+                (
+                    m,
+                    vec![
+                        (confirm, format!("Confirm: {}", label)),
+                        (cancel, "Cancel".to_string()),
+                    ],
+                )
+            });
+            return (
+                format!("{}? Press Confirm within 2 minutes.", label),
+                Outcome {
+                    request: None,
+                    keyboard,
+                },
+            );
+        }
+        Step::Cancel => {
+            s.retain(|_, o| {
+                !(o.alert_ref == p.alert_ref && matches!(o.step, Step::Confirm | Step::Cancel))
+            });
+            return (
+                "Cancelled. Nothing was changed.".into(),
+                Outcome {
+                    request: None,
+                    keyboard: restore(&s),
+                },
+            );
+        }
+        _ => {}
+    }
+    // An offer that needs no confirmation, or a confirmed one.
+    let mut keyboard = None;
     if p.action.settles() {
         // One choice per alert: its other buttons stop working.
         s.retain(|_, other| other.alert_ref != p.alert_ref);
+    } else if p.step == Step::Confirm {
+        // Not settling (one source of a digest): retire the confirmation and
+        // the offer it confirmed, and give the rest of the buttons back.
+        let action = p.action.clone();
+        s.retain(|_, o| {
+            !(o.alert_ref == p.alert_ref
+                && (matches!(o.step, Step::Confirm | Step::Cancel) || o.action == action))
+        });
+        keyboard = restore(&s);
     }
     let req = ActionRequest {
         action: p.action.clone(),
         alert_ref: p.alert_ref.clone(),
         by: who,
-        message_id: p
-            .message_id
-            .or_else(|| cq["message"]["message_id"].as_i64()),
+        message_id,
     };
-    (format!("{}: on it.", p.action.label()), Some(req))
+    (
+        format!("{}: on it.", p.action.label()),
+        Outcome {
+            request: Some(req),
+            keyboard,
+        },
+    )
 }
 
 fn describe_user(from: &Value) -> String {
@@ -291,7 +441,7 @@ fn poll_loop(
                     if cq.is_null() {
                         continue;
                     }
-                    let (text, req) = handle_callback(cq, &current, Utc::now());
+                    let (text, outcome) = handle_callback(cq, &current, Utc::now());
                     if let Some(cq_id) = cq["id"].as_str() {
                         let _ = call(
                             &current,
@@ -300,7 +450,19 @@ fn poll_loop(
                             Duration::from_secs(10),
                         );
                     }
-                    if let Some(req) = req {
+                    if let Some((mid, buttons)) = &outcome.keyboard {
+                        let _ = call(
+                            &current,
+                            "editMessageReplyMarkup",
+                            json!({
+                                "chat_id": current.chat_id,
+                                "message_id": mid,
+                                "reply_markup": keyboard(buttons),
+                            }),
+                            Duration::from_secs(10),
+                        );
+                    }
+                    if let Some(req) = outcome.request {
                         if tx.blocking_send(req).is_err() {
                             return;
                         }
@@ -388,6 +550,16 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Press, and for a destructive action press Confirm too.
+    fn press_confirmed(data: &str, now: DateTime<Utc>) -> Outcome {
+        let (_, first) = handle_callback(&press(data, 42, -1001), &cfg(), now);
+        if first.request.is_some() {
+            return first;
+        }
+        let (_, buttons) = first.keyboard.expect("confirmation keyboard");
+        handle_callback(&press(&buttons[0].0, 42, -1001), &cfg(), now).1
+    }
+
     #[test]
     fn only_allowed_users_in_the_chat_can_press() {
         let now = Utc::now();
@@ -400,18 +572,103 @@ mod tests {
             now,
         );
         let data = &b[0].0;
-        let (msg, req) = handle_callback(&press(data, 99, -1001), &cfg(), now);
-        assert!(req.is_none(), "{}", msg);
-        let (_, req) = handle_callback(&press(data, 42, -2002), &cfg(), now);
-        assert!(req.is_none(), "wrong chat");
+        let (msg, out) = handle_callback(&press(data, 99, -1001), &cfg(), now);
+        assert!(out.request.is_none() && out.keyboard.is_none(), "{}", msg);
+        let (_, out) = handle_callback(&press(data, 42, -2002), &cfg(), now);
+        assert!(out.request.is_none(), "wrong chat");
         // The refused presses didn't use the button up.
-        let (_, req) = handle_callback(&press(data, 42, -1001), &cfg(), now);
-        let req = req.expect("allowed user in the right chat");
+        let out = press_confirmed(data, now);
+        let req = out.request.expect("allowed user in the right chat");
         assert_eq!(req.by, "@op (id 42)");
         assert_eq!(req.message_id, Some(7));
         // One-time.
-        let (msg, req) = handle_callback(&press(data, 42, -1001), &cfg(), now);
-        assert!(req.is_none() && msg.contains("expired or was already used"));
+        let (msg, out) = handle_callback(&press(data, 42, -1001), &cfg(), now);
+        assert!(out.request.is_none() && msg.contains("expired or was already used"));
+    }
+
+    #[test]
+    fn destructive_actions_ask_first() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-7",
+            &[
+                ResponseAction::Ignore {
+                    sources: vec![],
+                    hours: 0,
+                },
+                ResponseAction::Disconnect {
+                    source: ip("198.51.100.7"),
+                    port: Some(1),
+                    user: "root".into(),
+                    block: true,
+                },
+            ],
+            30,
+            now,
+        );
+        // First press: nothing happens yet, the keyboard asks.
+        let (msg, out) = handle_callback(&press(&b[1].0, 42, -1001), &cfg(), now);
+        assert!(out.request.is_none(), "{}", msg);
+        let (mid, ask) = out.keyboard.expect("asks");
+        assert_eq!(mid, 7);
+        assert_eq!(ask[0].1, "Confirm: Disconnect and block");
+        assert_eq!(ask[1].1, "Cancel");
+        // Cancel puts the alert's buttons back, in order, and acts on nothing.
+        let (msg, out) = handle_callback(&press(&ask[1].0, 42, -1001), &cfg(), now);
+        assert!(out.request.is_none() && msg.contains("Cancelled"));
+        let (_, back) = out.keyboard.unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1].1, "Disconnect and block");
+        // The cancelled Confirm is gone.
+        assert!(handle_callback(&press(&ask[0].0, 42, -1001), &cfg(), now)
+            .1
+            .request
+            .is_none());
+        // Ask again and confirm: now it acts.
+        let (_, out) = handle_callback(&press(&back[1].0, 42, -1001), &cfg(), now);
+        let (_, ask) = out.keyboard.unwrap();
+        let (_, out) = handle_callback(&press(&ask[0].0, 42, -1001), &cfg(), now);
+        assert!(matches!(
+            out.request.map(|r| r.action),
+            Some(ResponseAction::Disconnect { .. })
+        ));
+    }
+
+    #[test]
+    fn a_confirmation_expires_after_two_minutes() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-8",
+            &[ResponseAction::Block {
+                sources: vec![ip("198.51.100.7")],
+            }],
+            30,
+            now,
+        );
+        let (_, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
+        let (_, ask) = out.keyboard.unwrap();
+        let later = now + chrono::Duration::seconds(CONFIRM_SECS + 1);
+        let (msg, out) = handle_callback(&press(&ask[0].0, 42, -1001), &cfg(), later);
+        assert!(out.request.is_none() && msg.contains("expired"), "{}", msg);
+        // The original button is back and still works.
+        let (_, back) = out.keyboard.expect("buttons restored");
+        assert_eq!(back.len(), 1);
+    }
+
+    #[test]
+    fn ignore_needs_no_confirmation() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-9",
+            &[ResponseAction::Ignore {
+                sources: vec![],
+                hours: 0,
+            }],
+            30,
+            now,
+        );
+        let (_, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
+        assert!(out.request.is_some() && out.keyboard.is_none());
     }
 
     #[test]
@@ -434,10 +691,12 @@ mod tests {
             30,
             now,
         );
-        let (_, req) = handle_callback(&press(&b[1].0, 42, -1001), &cfg(), now);
-        assert!(req.is_some());
-        let (_, req) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
-        assert!(req.is_none(), "the other button went with the choice");
+        assert!(press_confirmed(&b[1].0, now).request.is_some());
+        let (_, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
+        assert!(
+            out.request.is_none(),
+            "the other button went with the choice"
+        );
 
         let b = register(
             "HER-T-3",
@@ -449,8 +708,8 @@ mod tests {
             now,
         );
         let later = now + chrono::Duration::minutes(2);
-        let (msg, req) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), later);
-        assert!(req.is_none() && msg.contains("expired"), "{}", msg);
+        let (msg, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), later);
+        assert!(out.request.is_none() && msg.contains("expired"), "{}", msg);
     }
 
     #[test]
@@ -469,12 +728,13 @@ mod tests {
             30,
             now,
         );
-        assert!(handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now)
-            .1
-            .is_some());
-        assert!(handle_callback(&press(&b[1].0, 42, -1001), &cfg(), now)
-            .1
-            .is_some());
+        let first = press_confirmed(&b[0].0, now);
+        assert!(first.request.is_some());
+        // The keyboard comes back with the other source's button only.
+        let (_, rest) = first.keyboard.expect("remaining buttons");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].1, "Block 203.0.113.9");
+        assert!(press_confirmed(&b[1].0, now).request.is_some());
     }
 
     #[test]
@@ -493,6 +753,7 @@ mod tests {
         c.actions = false;
         assert!(handle_callback(&press(&b[0].0, 42, -1001), &c, now)
             .1
+            .request
             .is_none());
     }
 
@@ -607,17 +868,39 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let shutdown = Arc::new(AtomicBool::new(false));
         spawn_poller(Arc::new(Mutex::new(cfg())), tx, shutdown.clone()).unwrap();
-        let req = {
+        // The allowed press asks for confirmation: the keyboard is swapped.
+        let ask = {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
-                if let Ok(r) = rx.try_recv() {
-                    break r;
+                let edit = calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(m, _)| m == "editMessageReplyMarkup")
+                    .cloned();
+                if let Some((_, body)) = edit {
+                    break body;
                 }
-                assert!(std::time::Instant::now() < deadline, "no action request");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no confirmation asked"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
         shutdown.store(true, Ordering::Relaxed);
+        assert!(rx.try_recv().is_err(), "nothing done before Confirm");
+        let kb = &ask["reply_markup"]["inline_keyboard"];
+        assert_eq!(kb[0][0]["text"], "Confirm: Disconnect and block");
+        let confirm = kb[0][0]["callback_data"].as_str().unwrap();
+        let (_, out) = handle_callback(
+            &json!({
+                "id": "q-confirm", "from": { "id": 42, "username": "op" },
+                "message": { "message_id": 1, "chat": { "id": -1001 } }, "data": confirm }),
+            &cfg(),
+            Utc::now(),
+        );
+        let req = out.request.expect("confirmed");
         assert_eq!(req.by, "@op (id 42)");
         assert_eq!(req.message_id, Some(555), "message id from sendMessage");
         assert!(matches!(
