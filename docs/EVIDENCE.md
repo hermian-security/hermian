@@ -56,6 +56,13 @@ The maintainer's VPS (since 2026-09-20). Ubuntu 22.04.5, kernel 5.15.0-170,
   the release installed the .deb and added apt.hermian.me; apt verified the
   repository's signature and lists Hermian from it. An earlier tarball
   install's binary was removed so the package's took over (#58).
+- Signal to noise (2026-10-17, beta.12): from daemon start to snapshot,
+  11 h 44 min, 925,648 events and 3 notifications, plus one LOW repeat
+  that was logged, not sent. All four were logins with the planted hidden
+  key above, so none was a false alarm. Same window: 23 MB of memory,
+  about 0.06% of one core on average. Counted from the alert files since
+  started_at; the status screen's "today" alert count resets at midnight
+  UTC, so don't pair it with events processed.
 
 
 3. Not proven yet
