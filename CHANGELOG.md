@@ -33,6 +33,13 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   baseline.json now starts a new learning period instead of doing the same.
 - 0.0.0.0, `::` and loopback are no longer recorded as destinations.
 
+### Fixed
+
+- `hermian uninstall` on an apt or .deb install finishes with
+  `dpkg --purge hermian`. It used to delete the files itself and leave dpkg
+  listing the package as installed (`ii hermian`), so apt still thought
+  Hermian was there.
+
 ## 0.1.0-beta.12 - 2026-10-17
 
 The CLI gets the identity: one header on every screen, grouped help, brand
