@@ -290,6 +290,7 @@ sudo hermian alerts -s high          # only HIGH and CRITICAL
 sudo hermian show 1                  # today's alert 001
 sudo hermian collect HER-2026-0921-001
 sudo hermian test                    # synthetic engine checks, not live coverage
+sudo hermian audit                   # signs of an intrusion from before Hermian
 sudo hermian report                  # a week's summary to share, nothing private
 ```
 
@@ -303,6 +304,14 @@ For the first 24 hours Hermian learns your normal SSH sources and network
 activity. After that, a source or destination counts as new the first time it
 shows up, not every time it comes back (destinations are grouped by /24, or
 /64 for IPv6). Put exceptions in the config's allowlist, each with a `reason`.
+
+Learning only makes sense on a host that isn't already compromised. Every time
+it starts, Hermian runs `hermian audit`. The audit checks `/etc/ld.so.preload`,
+programs and libraries running from temporary or hidden directories, code in
+system directories that no package installed, and crontabs and profiles that
+start any of it. If it finds something, you get one alert listing what it found,
+and learning stops, so the intrusion isn't learned as normal. A rootkit can hide
+from the audit, so a clean result isn't a guarantee.
 
 Network isolation needs your management CIDRs configured first. Read the
 response settings and limits in [PROJECT.md](PROJECT.md), section 6, before you

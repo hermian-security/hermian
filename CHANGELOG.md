@@ -15,6 +15,29 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - Matrix as a webhook format (`format = "matrix"`), for alerts that stay on
   your own homeserver. Deliveries carry a transaction id, so a retry posts
   once.
+- A start-up audit, also available as `hermian audit` (`--json`; exits 2
+  when it finds something serious). It looks for signs that the host was
+  compromised before Hermian started: a library in `/etc/ld.so.preload`,
+  programs running and libraries loaded from /tmp, /dev/shm or hidden system
+  directories, programs and libraries in system directories that no package
+  owns, and crontabs and shell profiles that start any of these. If it finds
+  any, you get one alert (CRITICAL when the signs are of more than one
+  kind), and a baseline still learning stops, so the intrusion isn't learned
+  as normal. On a perfctl-infected test host it reported the preload
+  rootkit, the implant and a hidden loader under /var in under a second, with
+  the rootkit loaded into it. Libraries unpacked into /tmp by runtimes such
+  as Nx or Netty are listed as LOW and don't page.
+- Hermian protects itself from the kind of rootkit found on that host. The
+  unit mounts /dev/null over `/etc/ld.so.preload` in the daemon's own mount
+  namespace, so a preload rootkit can't hook it or the tools it runs, even
+  when systemd itself is already hooked, and Hermian still judges the host's
+  copy. Where the file doesn't exist, systemd creates an empty one to mount
+  over; an empty preload file is no longer an alert, and uninstall removes it
+  if it's still empty. The daemon checks its own loaded code at start
+  and every ten minutes and pages CRITICAL ("Hermian itself is hooked") on
+  anything foreign. A ptrace attach to the daemon is CRITICAL whoever does
+  it. The tools it runs (journalctl, nft, systemctl, dpkg) are started by
+  absolute path with a clean environment, and the daemon isn't dumpable.
 
 ### Changed
 
@@ -46,9 +69,6 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   says. It used to switch the novelty rules off for good. A missing
   baseline.json now starts a new learning period instead of doing the same.
 - 0.0.0.0, `::` and loopback are no longer recorded as destinations.
-
-### Fixed
-
 - `hermian uninstall` on an apt or .deb install finishes with
   `dpkg --purge hermian`. It used to delete the files itself and leave dpkg
   listing the package as installed (`ii hermian`), so apt still thought

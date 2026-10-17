@@ -27,6 +27,10 @@ case "$1" in
         rm -f /etc/pam.d/sshd.hermian-bak
         rm -rf /etc/hermian /var/lib/hermian /var/log/hermian /run/hermian
         rm -f /etc/sysctl.d/60-hermian.conf
+        # systemd creates an empty one to mount over (hermian.service); an
+        # empty file loads nothing, but it's ours to clean up. Never one
+        # with content.
+        [ -f /etc/ld.so.preload ] && [ ! -s /etc/ld.so.preload ] && rm -f /etc/ld.so.preload
         # The APT repository install.sh adds (same paths as hermian uninstall).
         rm -f /etc/apt/sources.list.d/hermian.sources /usr/share/keyrings/hermian-archive-keyring.gpg
         remove_units

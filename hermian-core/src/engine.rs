@@ -88,6 +88,9 @@ pub struct Engine {
     pub root_password_login: bool,
     /// The root-password warning is left out of digests until then.
     pub root_warning_snoozed_until: Option<DateTime<Utc>>,
+    /// The daemon's own pid (0 when not running as the daemon): anything
+    /// attaching to it is an attack on Hermian itself.
+    pub self_pid: u32,
 }
 
 fn day_key(now: DateTime<Utc>) -> String {
@@ -123,6 +126,7 @@ impl Engine {
             ignored_sources: HashMap::new(),
             root_password_login: false,
             root_warning_snoozed_until: None,
+            self_pid: 0,
         }
     }
 
@@ -202,6 +206,7 @@ impl Engine {
             cfg: &self.cfg,
             flags: &self.flags,
             user_names: &self.user_names,
+            self_pid: self.self_pid,
             now,
         }
     }
@@ -319,6 +324,7 @@ impl Engine {
                         cfg: &self.cfg,
                         flags: &self.flags,
                         user_names: &self.user_names,
+                        self_pid: self.self_pid,
                         now,
                     };
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
@@ -1558,6 +1564,25 @@ mod tests {
         assert!(a.facts.iter().any(|f| f.value.contains("/tmp/libevil.so")));
     }
 
+    /// systemd creates an empty /etc/ld.so.preload to bind-mount over for
+    /// Hermian's own unit; that paged CRITICAL on a clean host.
+    #[test]
+    fn an_empty_ld_preload_is_not_an_alert() {
+        let mut eng = engine_without_baseline();
+        let alerts = eng.process(Event::File(file(
+            Utc::now(),
+            "/etc/ld.so.preload",
+            FileKind::Created,
+            None,
+            Some("# nothing\n\n"),
+        )));
+        assert!(
+            !alerts.iter().any(|a| a.detection == DetectionId::D3),
+            "{:?}",
+            alerts
+        );
+    }
+
     #[test]
     fn systemd_dropin_overriding_execstart_is_critical() {
         let mut eng = engine_without_baseline();
@@ -1782,6 +1807,26 @@ mod tests {
             DetectionId::D4,
             Severity::High
         ));
+    }
+
+    /// Even a real debugger attaching to the daemon is an attack on Hermian.
+    #[test]
+    fn ptrace_attach_to_hermian_is_critical() {
+        let mut eng = engine_without_baseline();
+        eng.self_pid = 4242;
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 4242, 1, 0, "hermian", "/usr/bin/hermian"));
+        eng.process(exec(t, 600, 1, 0, "gdb", "/usr/bin/gdb"));
+        let a = eng.process(Event::Ptrace(PtraceEvent {
+            ts: t,
+            pid: 600,
+            uid: 0,
+            comm: "gdb".into(),
+            target_pid: 4242,
+            request: 16,
+        }));
+        assert!(has(&a, DetectionId::D4, Severity::Critical), "{:?}", a);
     }
 
     #[test]
