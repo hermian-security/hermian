@@ -175,5 +175,41 @@ class AptRepoTests(unittest.TestCase):
                          "Signed-By: /usr/share/keyrings/hermian-archive-keyring.gpg\n")
 
 
+@unittest.skipIf(SH is None, "needs a POSIX sh")
+class StyleTests(unittest.TestCase):
+    """The installer's header and closing lines, plain and in colour."""
+
+    def sh(self, call, **env):
+        text = INSTALL.read_text(encoding="utf-8")
+        start = text.index("say() {")
+        end = text.index("\nmain() {")
+        base = {k: v for k, v in os.environ.items() if k not in ("NO_COLOR", "HERMIAN_COLOR")}
+        base.update(env)
+        return subprocess.run([SH, "-c", text[start:end] + "\n" + call], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True, timeout=30,
+                              env=base, encoding="utf-8").stdout
+
+    def test_plain_when_not_a_terminal(self):
+        out = self.sh("init_style; dry_run=1; masthead v1.2.3; say step; finish", LANG="C")
+        self.assertNotIn("\x1b", out)
+        self.assertIn("///*  hermian  installer", out)
+        self.assertIn("  * step", out)
+        self.assertIn("Dry run: nothing was changed.", out)
+
+    def test_header_fills_the_width(self):
+        out = self.sh("init_style; masthead v1.2.3", LANG="C")
+        line = out.splitlines()[1]
+        self.assertTrue(line.endswith("v1.2.3"), out)
+        self.assertEqual(len(line), 72, repr(line))
+
+    def test_colour_and_glyphs_when_asked(self):
+        out = self.sh("init_style; masthead v1.2.3", HERMIAN_COLOR="always", LANG="C.UTF-8")
+        self.assertIn("╱╱╱\x1b[38;5;141m●", out)
+
+    def test_never_wins(self):
+        out = self.sh("init_style; masthead v1", HERMIAN_COLOR="never", LANG="C.UTF-8")
+        self.assertNotIn("\x1b", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -24,12 +24,14 @@ set -eu
 REPO=hermian-security/hermian
 DEFAULT_VERSION=v0.1.0-beta.12   # release packaging rewrites this to the tag
 
-say() { echo "==> $*"; }
-die() { echo "hermian: $*" >&2; exit 1; }
+# Styling comes from init_style (called by main); unset, everything is plain.
+say() { echo "  ${S_ACC:-}${G_STEP:-==>}${S_RST:-} $*"; }
+note() { echo "  ${S_WARN:-}!${S_RST:-} $*"; }
+die() { echo "  ${S_BAD:-}${G_FAIL:-x}${S_RST:-} hermian: $*" >&2; exit 1; }
 
 run() {
     if [ "$dry_run" -eq 1 ]; then
-        echo "    (dry-run) $*"
+        echo "    ${S_DIM:-}(dry-run) $*${S_RST:-}"
     else
         "$@"
     fi
@@ -89,7 +91,7 @@ drop_shadow() { # old new
     _old=$("$1" --version 2>/dev/null || true)
     case "$_old" in
         "hermian "*) ;;
-        *) echo "hermian: leaving $1 alone (not a hermian binary)"; return 0 ;;
+        *) note "leaving $1 alone (not a hermian binary)"; return 0 ;;
     esac
     say "removing $1 (${_old#hermian }, from an earlier tarball install); $2 replaces it"
     run rm -f "$1"
@@ -116,10 +118,10 @@ apt_sources() { # suite
 # Hermian like any other package.
 add_apt_repo() { # dir-with-keyring tag
     _suite=$(apt_suite "$2")
-    say "adding the APT repository apt.hermian.me ($_suite): apt upgrade keeps Hermian current"
+    say "adding apt.hermian.me ($_suite), so apt upgrade keeps Hermian current"
     run install -D -m 0644 "$1/hermian-archive-keyring.gpg" "$APT_KEYRING"
     if [ "$dry_run" -eq 1 ]; then
-        echo "    (dry-run) write $APT_SOURCES"
+        echo "    ${S_DIM:-}(dry-run) write $APT_SOURCES${S_RST:-}"
     else
         apt_sources "$_suite" > "$APT_SOURCES"
         chmod 0644 "$APT_SOURCES"
@@ -130,7 +132,7 @@ install_local() { # dir holding this script and the binary
     cd "$1" || die "cannot enter $1"
     say "installing the tarball at $(pwd)"
     install_tree .
-    say "done - check with: hermian status"
+    finish
 }
 
 # Where this script lives, when it runs from a file. Piped into `sh`, $0 is
@@ -158,9 +160,8 @@ install_remote() {
     elif command -v gh >/dev/null 2>&1; then
         _verifier=gh
     else
-        echo "hermian: no cosign or gh here; checking the download against SHA256SUMS"
-        echo "hermian: only. That catches corruption, not tampering. Verify later:"
-        echo "hermian: see 'Verify manually' in the README."
+        note "no cosign or gh here, so only SHA256SUMS is checked: that catches"
+        note "corruption, not tampering. See 'Verify manually' in the README."
     fi
 
     if command -v apt-get >/dev/null 2>&1; then
@@ -190,13 +191,17 @@ install_remote() {
             die "gh could not verify $_name (gh auth login? or install cosign)"
     fi
 
-    (cd "$TD" && sha256sum -c SHA256SUMS --ignore-missing) || die "checksum mismatch"
+    _sums=$(cd "$TD" && sha256sum -c SHA256SUMS --ignore-missing 2>&1) || {
+        printf '%s\n' "$_sums" >&2
+        die "checksum mismatch"
+    }
+    say "checksums match"
 
     case "$_name" in
         *.deb)
             chmod 755 "$TD"   # so apt's sandbox user can read the .deb
             say "installing $_name with apt"
-            run apt-get install -y "$TD/$_name"
+            run apt-get install -y -qq "$TD/$_name"
             drop_shadow /usr/local/bin/hermian /usr/bin/hermian
             if [ "$_keyring" -eq 1 ]; then
                 add_apt_repo "$TD" "$1"
@@ -210,10 +215,64 @@ install_remote() {
             install_tree "$TD/${_name%.tar.gz}"
             ;;
     esac
-    say "done - check with: hermian status"
+    finish
+}
+
+# The CLI's look: brand colours on a terminal (not with NO_COLOR, or
+# HERMIAN_COLOR=never), the logo's glyphs when the locale is UTF-8.
+init_style() {
+    S_ACC='' S_DIM='' S_BOLD='' S_BAD='' S_OK='' S_WARN='' S_RST=''
+    case "${HERMIAN_COLOR:-}" in
+        always) _color=1 ;;
+        never) _color=0 ;;
+        *) if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then _color=1; else _color=0; fi ;;
+    esac
+    if [ "$_color" -eq 1 ]; then
+        _e=$(printf '\033')
+        S_ACC="$_e[38;5;141m" S_DIM="$_e[2m" S_BOLD="$_e[1m" S_BAD="$_e[1;38;5;204m"
+        S_OK="$_e[38;5;114m" S_WARN="$_e[38;5;214m" S_RST="$_e[0m"
+    fi
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+        *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+            G_MARK='╱╱╱' G_DOT='●' G_STEP='•' G_OK='✓' G_FAIL='✗'
+            G_RULE='──────────────────────────────────────────────────────────────────────' ;;
+        *)
+            G_MARK='///' G_DOT='*' G_STEP='*' G_OK='ok' G_FAIL='x'
+            G_RULE='----------------------------------------------------------------------' ;;
+    esac
+}
+
+# Same header as the CLI's screens: mark, name, screen, context on the right.
+masthead() { # right
+    _pad=$((72 - 26 - ${#1}))
+    _sp='  '
+    while [ "$_pad" -gt 2 ]; do _sp="$_sp "; _pad=$((_pad - 1)); done
+    printf '\n  %s%s%s%s  %shermian%s  %sinstaller%s%s%s%s%s\n  %s%s%s\n' \
+        "$G_MARK" "$S_ACC" "$G_DOT" "$S_RST" "$S_BOLD" "$S_RST" "$S_DIM" "$S_RST" \
+        "$_sp" "$S_DIM" "$1" "$S_RST" "$S_DIM" "$G_RULE" "$S_RST"
+}
+
+finish() {
+    printf '  %s%s%s\n' "$S_DIM" "$G_RULE" "$S_RST"
+    if [ "$dry_run" -eq 1 ]; then
+        printf '  %s%s%s Dry run: nothing was changed.\n\n' "$S_OK" "$G_OK" "$S_RST"
+        return
+    fi
+    if systemctl is-active --quiet hermian 2>/dev/null; then
+        printf '  %s%s%s Hermian is installed and running.\n\n' "$S_OK" "$G_OK" "$S_RST"
+    else
+        printf '  %s%s%s Hermian is installed, but not running yet:\n' "$S_WARN" "!" "$S_RST"
+        printf '    sudo systemctl status hermian\n\n'
+    fi
+    printf '  %sNEXT%s\n' "$S_DIM" "$S_RST"
+    printf '    %ssudo hermian status%s        coverage and health\n' "$S_BOLD" "$S_RST"
+    printf '    %ssudo hermian notify-test%s   after adding Telegram, email or a webhook\n' "$S_BOLD" "$S_RST"
+    printf '    %s/etc/hermian/config.toml%s   where those go\n\n' "$S_BOLD" "$S_RST"
+    printf '  %sDocs  https://hermian.me/docs%s\n\n' "$S_DIM" "$S_RST"
 }
 
 main() {
+    init_style
     version=$DEFAULT_VERSION
     version_set=0
     dry_run=0
@@ -230,12 +289,18 @@ main() {
     done
     case "$version" in v*) ;; *) version="v$version" ;; esac
 
+    here=$(script_dir || true)
+    if [ -n "$here" ] && [ -f "$here/hermian" ]; then
+        masthead "local tarball"
+    else
+        masthead "$version"
+    fi
+
     if [ "$dry_run" -eq 0 ]; then
         [ "$(id -u)" -eq 0 ] || die "run as root: pipe to 'sudo sh', or use --dry-run"
         command -v systemctl >/dev/null 2>&1 || die "systemd is required"
     fi
 
-    here=$(script_dir || true)
     if [ -n "$here" ] && [ -f "$here/hermian" ]; then
         [ "$version_set" -eq 0 ] ||
             die "--version picks a download; this script is inside an extracted tarball ($here)"
