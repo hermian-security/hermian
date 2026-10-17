@@ -1759,6 +1759,92 @@ mod tests {
         );
     }
 
+    /// buki, 2026-10-17: a flagged miner calling 40 SOCKS proxies paged once
+    /// per address. One incident is one page, plus one summary naming them.
+    #[test]
+    fn flagged_chain_calling_many_addresses_pages_once() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
+        let mut d5_high = 0;
+        for i in 0..50u8 {
+            let alerts = eng.process_at(
+                Event::Connect(ConnectEvent {
+                    ts: t + Duration::seconds(i64::from(i)),
+                    pid: 200,
+                    uid: 33,
+                    daddr: IpAddr::from([77, 239, 112, i]),
+                    dport: 1080,
+                    comm: "bash".into(),
+                    container: false,
+                }),
+                t + Duration::seconds(i64::from(i)),
+            );
+            d5_high += alerts
+                .iter()
+                .filter(|a| a.detection == DetectionId::D5 && a.severity == Severity::High)
+                .count();
+        }
+        assert_eq!(d5_high, 1);
+        let summaries = eng.tick(t + Duration::seconds(400));
+        let s = summaries
+            .iter()
+            .find(|a| a.detection == DetectionId::D5)
+            .unwrap_or_else(|| panic!("no D5 summary: {:?}", summaries));
+        assert_eq!(s.severity, Severity::Low);
+        let dests = s
+            .facts
+            .iter()
+            .find(|f| f.label == "Destinations")
+            .expect("destinations listed");
+        assert!(dests
+            .value
+            .starts_with("77.239.112.0:1080, 77.239.112.1:1080"));
+        assert!(dests.value.ends_with("(50 distinct)"), "{}", dests.value);
+    }
+
+    /// buki: one implant preloading into node, timeout and ls is one incident.
+    #[test]
+    fn ld_preload_into_several_programs_of_one_chain_pages_once() {
+        let mut eng = engine_without_baseline();
+        let t = Utc::now();
+        eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
+        eng.process(exec(t, 50, 1, 0, "javax64", "/tmp/.perf.c/javax64"));
+        let mut high = 0;
+        for (i, (comm, exe)) in [
+            ("node", "/usr/bin/node"),
+            ("timeout", "/usr/bin/timeout"),
+            ("ls", "/usr/bin/ls"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pid = 300 + i as u32;
+            eng.process(exec(t, pid, 50, 0, "sh", "/usr/bin/dash"));
+            let alerts = eng.process(Event::Exec(ExecEvent {
+                ts: t,
+                pid: pid + 10,
+                ppid: pid,
+                uid: 0,
+                gid: 0,
+                comm: (*comm).into(),
+                exe: (*exe).into(),
+                argv0: (*comm).into(),
+                ld_preload: true,
+                deleted_exe: false,
+                tty_nr: 0,
+                container: false,
+                container_id: None,
+            }));
+            high += alerts
+                .iter()
+                .filter(|a| a.detection == DetectionId::D4 && a.severity == Severity::High)
+                .count();
+        }
+        assert_eq!(high, 1);
+    }
+
     #[test]
     fn dns_to_a_learned_server_is_ignored_and_to_a_new_one_is_judged() {
         let mut baseline = Baseline::new(true, 24, Utc::now());
