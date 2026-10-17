@@ -21,6 +21,18 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   then hourly); a quiet window resets it. Found on a live infected host,
   where a miner paged 56 times in an hour.
 
+### Fixed
+
+- The baseline no longer learns an intrusion as normal. Connections from a
+  chain D1 flagged, or from a program running out of /tmp, /dev/shm or a
+  deleted file, aren't learned, and neither is a login through a hidden key
+  file. On an infected host the implant's programs and its C2 addresses
+  used to become "known", which silenced the novelty rules for them.
+- `hermian enable --no-baseline` skips the learning period as its help
+  says. It used to switch the novelty rules off for good. A missing
+  baseline.json now starts a new learning period instead of doing the same.
+- 0.0.0.0, `::` and loopback are no longer recorded as destinations.
+
 ## 0.1.0-beta.12 - 2026-10-17
 
 The CLI gets the identity: one header on every screen, grouped help, brand

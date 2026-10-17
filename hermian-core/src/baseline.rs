@@ -122,6 +122,15 @@ impl Baseline {
         }
     }
 
+    /// No learning period: novelty is judged from `now` on, against an empty
+    /// baseline (`hermian enable --no-baseline`, for freshly provisioned
+    /// hosts). Unlike `new(false, ..)`, novelty rules stay on.
+    pub fn judging_from(now: DateTime<Utc>, duration_hours: u32) -> Self {
+        let mut b = Baseline::new(true, duration_hours, now);
+        b.complete = true;
+        b
+    }
+
     /// Drop connector keys built with an older scheme. A finished baseline
     /// relearns connectors for another `duration_hours` instead of flagging
     /// every program as new.
@@ -231,6 +240,10 @@ impl Baseline {
 
     pub fn observe_dest(&mut self, ip: IpAddr, now: DateTime<Utc>) {
         self.check_completion(now);
+        // Not destinations anyone calls out to; they only fill the set.
+        if ip.is_unspecified() || ip.is_loopback() {
+            return;
+        }
         if self.known_dests.len() < MAX_LEARNED {
             self.known_dests.insert(ip);
         }
@@ -400,5 +413,25 @@ mod tests {
         assert!(b.connector_is_known("/usr/bin/curl|0"));
         // A value never observed is still novel.
         assert!(!b.ssh_source_is_known("192.0.2.99".parse().unwrap()));
+    }
+
+    /// `--no-baseline` used to write a disabled baseline: every novelty rule
+    /// went quiet for good. It now means "judge from now on".
+    #[test]
+    fn judging_from_now_keeps_novelty_on() {
+        let b = Baseline::judging_from(now(), 24);
+        assert!(b.can_judge_novelty());
+        assert!(b.can_judge_connectors(now()));
+        assert!(!Baseline::new(false, 24, now()).can_judge_novelty());
+    }
+
+    #[test]
+    fn unspecified_and_loopback_destinations_are_not_learned() {
+        let mut b = Baseline::new(true, 24, now());
+        for ip in ["0.0.0.0", "::", "127.0.0.1", "::1"] {
+            b.observe_dest(ip.parse().unwrap(), now());
+        }
+        assert!(b.known_dests.is_empty());
+        assert!(b.known_dest_nets.is_empty());
     }
 }

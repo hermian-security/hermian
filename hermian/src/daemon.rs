@@ -58,7 +58,20 @@ pub fn run() -> Result<()> {
     } else {
         cfg.general.hostname.clone()
     };
-    let mut baseline = config::load_baseline()?;
+    // No baseline.json (deleted to start over, or started without `hermian
+    // enable`): learn afresh. Loading it as Default used to mean "disabled",
+    // which silently switched every novelty rule off.
+    let mut baseline = if paths::baseline_file().exists() {
+        config::load_baseline()?
+    } else {
+        let fresh = Baseline::new(
+            cfg.baseline.enabled,
+            cfg.baseline.duration_hours,
+            Utc::now(),
+        );
+        config::save_baseline(&fresh)?;
+        fresh
+    };
     if cfg.baseline.enabled && !baseline.complete && baseline.started_at.is_none() {
         baseline = Baseline::new(true, cfg.baseline.duration_hours, Utc::now());
         config::save_baseline(&baseline)?;

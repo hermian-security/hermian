@@ -213,7 +213,7 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         DetectionId::D2,
                         Severity::High,
                         "SSH login with a key from a hidden key file",
-                        &format!("d2|hidden-key-login|{}|{}", ev.user, k.fingerprint),
+                        &format!("{}{}|{}", HIDDEN_KEY_LOGIN_SIG, ev.user, k.fingerprint),
                     )
                     .what(format!(
                         "User '{}' authenticated{} from {}. The key is in {}, on {}, not in \
@@ -305,6 +305,10 @@ fn key_facts(ev: &AuthEvent) -> Vec<(&'static str, String)> {
 
 /// sshd settings that decide which keys open the door. Each value is one or
 /// more paths (`AuthorizedKeysFile`) or a command and its arguments.
+/// Signature prefix of the hidden-key login alert. The engine checks it so a
+/// backdoor key is never learned as a known key.
+pub const HIDDEN_KEY_LOGIN_SIG: &str = "d2|hidden-key-login|";
+
 const KEY_SOURCE_SETTINGS: &[(&str, &str)] = &[
     ("authorizedkeysfile", "AuthorizedKeysFile"),
     ("authorizedkeyscommand", "AuthorizedKeysCommand"),

@@ -254,10 +254,21 @@ impl Engine {
                 if self.cfg.detections.d5_network {
                     findings.extend(detect::d5::evaluate_connect(&e, &self.ctx(now)));
                 }
-                self.baseline.observe_dest(e.daddr, now);
+                // Never learn from what's already suspect: on an infected host
+                // the implant's programs and its C2 would otherwise become
+                // "normal" during (and after) the learning window.
                 let exe = detect::d5::connector_exe(&self.tree, e.pid, &e.comm);
-                self.baseline
-                    .observe_connector(&detect::d5::connector_key(&exe, e.uid), now);
+                let suspect = self.ctx(now).has_recent_flag(
+                    e.pid,
+                    detect::FLAG_WINDOW_SECS,
+                    Some(DetectionId::D1),
+                ) || crate::events::is_suspicious_exec_dir(&exe)
+                    || exe.ends_with("(deleted)");
+                if !suspect {
+                    self.baseline.observe_dest(e.daddr, now);
+                    self.baseline
+                        .observe_connector(&detect::d5::connector_key(&exe, e.uid), now);
+                }
             }
             Event::Ptrace(e) => {
                 if self.cfg.detections.d4_priv_esc {
@@ -313,7 +324,13 @@ impl Engine {
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
                     self.record_brute_force(&e, now);
                 }
-                if e.result == AuthResult::Success {
+                // A login through a hidden key file is a backdoor, not a
+                // habit: learning its key or source would make the same key
+                // routine through a normal authorized_keys later.
+                let backdoor = findings
+                    .iter()
+                    .any(|f| f.signature.starts_with(detect::d2::HIDDEN_KEY_LOGIN_SIG));
+                if e.result == AuthResult::Success && !backdoor {
                     if let Some(ip) = e.rhost {
                         self.baseline.observe_ssh_source(ip, now);
                         if e.user == "root" {
@@ -1141,6 +1158,94 @@ mod tests {
         assert_eq!(d2[0].severity, Severity::High, "{:?}", d2[0]);
         assert!(d2[0].title.contains("hidden key file"), "{}", d2[0].title);
         assert!(d2[0].what.contains("/dev/.cache/rdpii"), "{}", d2[0].what);
+    }
+
+    /// A hidden-key login teaches the baseline nothing: its key and address
+    /// would otherwise make the same backdoor key routine later.
+    #[test]
+    fn hidden_key_login_is_not_learned() {
+        use crate::events::SshKey;
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            Baseline::new(true, 24, Utc::now()),
+            "h".into(),
+        );
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let login = |file: &str| {
+            Event::Auth(AuthEvent {
+                ts: Utc::now(),
+                result: AuthResult::Success,
+                user: "root".into(),
+                rhost: Some(ip),
+                service: "sshd".into(),
+                tty: "ssh".into(),
+                method: AuthMethod::PublicKey,
+                port: None,
+                key: Some(SshKey {
+                    kind: "ED25519".into(),
+                    fingerprint: "SHA256:R+6n3".into(),
+                    file: Some(file.into()),
+                    line: Some(1),
+                    comment: None,
+                }),
+            })
+        };
+        eng.process(login("/dev/.cache/rdpii"));
+        assert!(!eng.baseline.key_is_known("root", "SHA256:R+6n3"));
+        assert!(!eng.baseline.ssh_source_is_known(ip));
+        // The same key through the normal file is learned as usual.
+        eng.process(login("/root/.ssh/authorized_keys"));
+        assert!(eng.baseline.key_is_known("root", "SHA256:R+6n3"));
+    }
+
+    /// buki, 2026-10-17: learning from a flagged chain put the miner's
+    /// programs and ~155 proxy addresses into the baseline. A flagged chain,
+    /// or a program running from /tmp or a deleted file, teaches it nothing.
+    #[test]
+    fn suspect_connections_are_not_learned() {
+        let mut eng = Engine::new(
+            Config::default(),
+            Allowlist::default(),
+            Baseline::new(true, 24, Utc::now()),
+            "h".into(),
+        );
+        let t = Utc::now();
+        let connect = |pid: u32, comm: &str, last: u8| {
+            Event::Connect(ConnectEvent {
+                ts: t,
+                pid,
+                uid: 0,
+                daddr: IpAddr::from([72, 195, 34, last]),
+                dport: 1080,
+                comm: comm.into(),
+                container: false,
+            })
+        };
+        // Flagged by D1: nginx > bash.
+        eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
+        eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
+        eng.process(connect(200, "bash", 1));
+        // From a transient directory, and from a deleted binary.
+        eng.process(exec(t, 300, 1, 0, "multipathd", "/tmp/.perf.c/multipathd"));
+        eng.process(connect(300, "multipathd", 2));
+        eng.process(exec(t, 400, 1, 0, "httpd", "/usr/sbin/httpd (deleted)"));
+        eng.process(connect(400, "httpd", 3));
+        assert!(
+            eng.baseline.known_dests.is_empty(),
+            "{:?}",
+            eng.baseline.known_dests
+        );
+        assert!(
+            eng.baseline.known_connectors.is_empty(),
+            "{:?}",
+            eng.baseline.known_connectors
+        );
+        // An ordinary program is learned as before.
+        eng.process(exec(t, 500, 1, 0, "apt", "/usr/bin/apt"));
+        eng.process(connect(500, "apt", 4));
+        assert!(eng.baseline.dest_is_known(IpAddr::from([72, 195, 34, 4])));
+        assert_eq!(eng.baseline.known_connectors.len(), 1);
     }
 
     /// A source first seen after the learning window is novel once, then

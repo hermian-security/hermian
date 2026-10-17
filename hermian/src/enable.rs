@@ -228,11 +228,18 @@ fn init_baseline(cfg: &hermian_core::Config, no_baseline: bool) -> Result<()> {
     if paths::baseline_file().exists() {
         return Ok(());
     }
-    let baseline = Baseline::new(
-        cfg.baseline.enabled && !no_baseline,
-        cfg.baseline.duration_hours,
-        Utc::now(),
-    );
+    // --no-baseline skips the learning period, it doesn't switch novelty off:
+    // it used to write a disabled baseline, and every novelty rule went quiet
+    // for good.
+    let baseline = if no_baseline && cfg.baseline.enabled {
+        Baseline::judging_from(Utc::now(), cfg.baseline.duration_hours)
+    } else {
+        Baseline::new(
+            cfg.baseline.enabled,
+            cfg.baseline.duration_hours,
+            Utc::now(),
+        )
+    };
     config::save_baseline(&baseline)
 }
 
