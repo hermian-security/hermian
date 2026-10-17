@@ -6,6 +6,13 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Changed
+
+- The installer has the CLI's look: the same header, brand colours on a
+  terminal (`NO_COLOR` and `HERMIAN_COLOR` respected), one line per step,
+  and next steps at the end. It now says whether the service is actually
+  running, and apt's own output is quieter.
+
 ## 0.1.0-beta.12 - 2026-10-17
 
 The CLI gets the identity: one header on every screen, grouped help, brand
