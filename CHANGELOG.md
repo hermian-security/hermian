@@ -12,6 +12,14 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   terminal (`NO_COLOR` and `HERMIAN_COLOR` respected), one line per step,
   and next steps at the end. It now says whether the service is actually
   running, and apt's own output is quieter.
+- One incident, one page. A flagged process calling out to many addresses
+  pages once instead of once per address, and one implant preloading into
+  several programs of the same chain pages once instead of once per
+  program. The LOW "Repeated:" summary lists what differed (the first
+  destinations or executables and how many). An incident still going when
+  its 5-minute window closes gets a longer one next time (15, 45 minutes,
+  then hourly); a quiet window resets it. Found on a live infected host,
+  where a miner paged 56 times in an hour.
 
 ### Fixed
 
