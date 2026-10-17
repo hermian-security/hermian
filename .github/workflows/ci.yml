@@ -21,6 +21,37 @@ env:
   HERMIAN_EBPF_NIGHTLY: nightly-2026-09-17
 
 jobs:
+  # Docs-only PRs skip the build jobs. Skipped jobs still satisfy required
+  # checks; skipping the whole workflow (paths-ignore) would leave them
+  # pending forever. Pushes always run everything: the release gate wants
+  # every required check green on the tagged commit. If this job fails, the
+  # builds run anyway.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            files=$(git diff --name-only "$BASE...$HEAD")
+            printf '%s\n' "$files"
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '(\.md$|^docs/|^LICENSE$|^NOTICE$)'; then
+              code=false
+            fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   harness:
     name: validation harness (non-root)
     runs-on: ubuntu-latest
@@ -47,25 +78,39 @@ jobs:
 
   core:
     name: core (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() }}
+    env:
+      CODE: ${{ needs.changes.outputs.code }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+    # Skipped per step, not per job: a skipped matrix job reports its check
+    # without the matrix value, so 'core (ubuntu-latest)' would never arrive.
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - if: env.CODE != 'false'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - if: env.CODE != 'false'
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy -p hermian-core --all-targets --locked -- -D warnings
-      - run: cargo test -p hermian-core --locked
+      - if: env.CODE != 'false'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - if: env.CODE != 'false'
+        run: cargo fmt --all -- --check
+      - if: env.CODE != 'false'
+        run: cargo clippy -p hermian-core --all-targets --locked -- -D warnings
+      - if: env.CODE != 'false'
+        run: cargo test -p hermian-core --locked
 
   linux:
     name: daemon + eBPF (linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -140,6 +185,8 @@ jobs:
   # required check; the release workflow still gates on the five above.
   arm64:
     name: clippy (arm64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -159,6 +206,8 @@ jobs:
   # setting). Known vulnerabilities, yanked crates, licenses, sources.
   supply-chain:
     name: supply chain (cargo-deny)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -174,6 +223,8 @@ jobs:
   # The declared rust-version must keep building.
   msrv:
     name: msrv (1.91)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
