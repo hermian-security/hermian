@@ -32,10 +32,11 @@ mod uninstall;
 mod watchdog;
 mod watchers;
 
-use clap::Parser;
+use clap::FromArgMatches;
 
 fn main() {
-    let cli = cli::Cli::parse();
+    let cli =
+        cli::Cli::from_arg_matches(&cli::command().get_matches()).unwrap_or_else(|e| e.exit());
     let result = match cli.cmd {
         cli::Cmd::Run => daemon::run(),
         cli::Cmd::Enable(args) => enable::run(&args),

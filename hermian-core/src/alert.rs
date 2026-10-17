@@ -416,10 +416,12 @@ fn palette(theme: Theme, severity: Severity) -> Palette {
         return NO_COLOR;
     }
     let sev = match severity {
-        Severity::Critical => "\x1b[1;38;5;196m",
-        Severity::High => "\x1b[1;38;5;208m",
-        Severity::Low => "\x1b[1;38;5;220m",
-        Severity::Info => "\x1b[1;38;5;245m",
+        // The identity's palette: CRITICAL in the brand red, HIGH in the
+        // accent purple, LOW and INFO in quieter greys.
+        Severity::Critical => "\x1b[1;38;5;204m",
+        Severity::High => "\x1b[1;38;5;141m",
+        Severity::Low => "\x1b[1;38;5;146m",
+        Severity::Info => "\x1b[1;38;5;244m",
     };
     Palette {
         reset: "\x1b[0m",

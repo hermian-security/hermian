@@ -116,8 +116,7 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
     }
 
     if alerts.is_empty() {
-        println!("{}", st.banner("Hermian alerts", ""));
-        println!("{}", st.rule());
+        println!("{}", st.masthead("alerts", ""));
         println!("  {}", st.dim("No alerts recorded."));
         if hidden > 0 {
             println!(
@@ -130,8 +129,8 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
 
     println!(
         "{}",
-        st.banner(
-            "Hermian alerts",
+        st.masthead(
+            "alerts",
             &format!(
                 "{} shown{}",
                 alerts.len(),
@@ -142,7 +141,6 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
             )
         )
     );
-    println!("{}", st.rule());
     for a in &alerts {
         let sev = st.sev(a.severity, &format!("{:<8}", a.severity.as_str()));
         let when = a.ts.format("%m-%d %H:%M").to_string();
@@ -164,9 +162,9 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
     }
     println!("{}", st.rule());
     println!(
-        "  {}",
-        st.dim(&format!(
-            "hermian show <ref>  \u{00B7}  hermian collect <ref>  \u{00B7}  newest first, latest {}",
+        "{}",
+        st.footer(&format!(
+            "Newest first, latest {}  \u{00B7}  details: hermian show <ref>",
             ago(alerts[0].ts)
         ))
     );

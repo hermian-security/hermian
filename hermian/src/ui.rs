@@ -60,27 +60,35 @@ impl Style {
     }
 
     pub fn bad(&self, s: &str) -> String {
-        self.wrap("1;38;5;196", s)
+        self.wrap("1;38;5;204", s)
     }
 
+    /// Severity in the identity's palette: CRITICAL in the brand red, HIGH
+    /// in the accent purple, LOW and INFO in quieter greys.
     pub fn sev(&self, s: Severity, text: &str) -> String {
         let code = match s {
-            Severity::Critical => "1;38;5;196",
-            Severity::High => "1;38;5;208",
-            Severity::Low => "38;5;220",
-            Severity::Info => "38;5;245",
+            Severity::Critical => "1;38;5;204",
+            Severity::High => "1;38;5;141",
+            Severity::Low => "38;5;146",
+            Severity::Info => "38;5;244",
         };
         self.wrap(code, text)
     }
 
-    /// Heavy rule the full width.
+    /// A thin rule, indented like the text so it lines up with the
+    /// masthead and the rows (columns 3 to WIDTH).
     pub fn rule(&self) -> String {
-        self.dim(&"\u{2500}".repeat(WIDTH))
+        format!("  {}", self.dim(&"\u{2500}".repeat(WIDTH - 2)))
     }
 
-    /// Section heading, upper-cased and dimmed.
+    /// Section heading, upper-cased and dimmed, indented like the rows.
     pub fn heading(&self, s: &str) -> String {
-        self.label(&s.to_uppercase())
+        format!("  {}", self.label(&s.to_uppercase()))
+    }
+
+    /// A closing line under the last rule, dimmed and indented.
+    pub fn footer(&self, s: &str) -> String {
+        format!("  {}", self.dim(s))
     }
 
     /// `label ........ value` row with dotted leader.
@@ -97,10 +105,33 @@ impl Style {
         )
     }
 
-    /// Two-column header line: left bold, right dimmed, aligned to WIDTH.
-    pub fn banner(&self, left: &str, right: &str) -> String {
-        let pad = WIDTH.saturating_sub(left.chars().count() + right.chars().count());
-        format!("{}{}{}", self.bold(left), " ".repeat(pad), self.dim(right))
+    /// The header every screen opens with, and the rule under it:
+    ///
+    /// ```text
+    ///   ╱╱╱●  hermian  v0.1.0-beta.11                     web-01 · up 6h
+    ///   ────────────────────────────────────────────────────────────────
+    /// ```
+    ///
+    /// `what` is a version ("v0.1.0") or the screen's name ("alerts");
+    /// `right` is context and may already carry colour.
+    pub fn masthead(&self, what: &str, right: &str) -> String {
+        let left_len =
+            2 + BRAND_STROKES.chars().count() + 1 + 2 + "hermian".len() + 2 + what.chars().count();
+        let pad = WIDTH.saturating_sub(left_len + visible_len(right)).max(2);
+        format!(
+            "  {}{}  {}  {}{}{}\n{}",
+            BRAND_STROKES,
+            self.accent(BRAND_DOT),
+            self.bold("hermian"),
+            self.dim(what),
+            " ".repeat(pad),
+            if right.contains('\x1b') {
+                right.to_string()
+            } else {
+                self.dim(right)
+            },
+            self.rule()
+        )
     }
 
     /// The brand accent (the logo's signal dot). Truecolor when the terminal
@@ -139,6 +170,21 @@ impl Style {
 const BRAND_STROKES: &str = "\u{2571}\u{2571}\u{2571}";
 const BRAND_DOT: &str = "\u{25CF}";
 pub const TAGLINE: &str = "Silent by default. Loud when it matters.";
+
+/// Printed width of `s`: characters, not counting ANSI colour codes.
+pub fn visible_len(s: &str) -> usize {
+    let mut n = 0;
+    let mut in_esc = false;
+    for c in s.chars() {
+        match (in_esc, c) {
+            (false, '\x1b') => in_esc = true,
+            (true, 'm') => in_esc = false,
+            (true, _) => {}
+            (false, _) => n += 1,
+        }
+    }
+    n
+}
 
 fn stdout_is_tty() -> bool {
     // SAFETY: isatty on a fixed, valid fd.
@@ -201,5 +247,40 @@ mod tests {
         );
         assert!(b.contains("\u{25CF}\x1b[0m"), "{:?}", b);
         assert!(b.contains("\x1b[1mhermian\x1b[0m"), "{:?}", b);
+    }
+
+    #[test]
+    fn masthead_fills_the_width() {
+        let st = Style { color: false };
+        let m = st.masthead("alerts", "8 shown");
+        let first = m.lines().next().unwrap();
+        assert!(first.starts_with("  \u{2571}\u{2571}\u{2571}\u{25CF}  hermian  alerts "));
+        assert!(first.ends_with("8 shown"));
+        assert_eq!(first.chars().count(), WIDTH);
+        assert_eq!(m.lines().nth(1).unwrap(), st.rule());
+    }
+
+    #[test]
+    fn masthead_width_ignores_colour() {
+        let plain = Style { color: false }.masthead("v1", "up 2h");
+        let col = Style { color: true }.masthead("v1", "up 2h");
+        assert_eq!(
+            visible_len(col.lines().next().unwrap()),
+            visible_len(plain.lines().next().unwrap())
+        );
+    }
+
+    #[test]
+    fn visible_len_skips_escapes() {
+        assert_eq!(visible_len("\x1b[1;38;5;204mHIGH\x1b[0m x"), 6);
+        assert_eq!(visible_len("\u{25CF}"), 1);
+    }
+
+    #[test]
+    fn headings_and_footers_line_up_with_rows() {
+        let st = Style { color: false };
+        assert_eq!(st.heading("Coverage"), "  COVERAGE");
+        assert_eq!(st.footer("done"), "  done");
+        assert!(st.row("a", "b").starts_with("  a "));
     }
 }
