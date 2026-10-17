@@ -323,7 +323,8 @@ see. Thank you.
 <!-- testers:start (one line per tester; see "Join them" below) -->
 <!-- testers:end -->
 
-**Join them.** Run Hermian for a week, then open a
+**Join them.** The whole beta, step by step, is in [docs/BETA.md](docs/BETA.md).
+Run Hermian for a week, then open a
 [beta report](https://github.com/hermian-security/hermian/issues/new?template=beta-report.yml) with the output of `sudo hermian report` (counts and
 versions only, nothing private). After that, [edit this file](https://github.com/hermian-security/hermian/edit/main/README.md): GitHub
 forks it for you. Add one line between the two `testers` markers, with your
@@ -336,6 +337,7 @@ your report:
 
 ## More
 
+- [Beta testing](docs/BETA.md): every step, from install to the report.
 - [Several servers](docs/FLEET.md): one Telegram group for all of them, rollout and updates.
 - [Evidence](docs/EVIDENCE.md): what's verified, the burn-in plan, and the
   false-positive log.
