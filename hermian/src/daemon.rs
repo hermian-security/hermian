@@ -101,8 +101,8 @@ pub fn run() -> Result<()> {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
         engine.root_warning_snoozed_until = st.root_warning_snoozed_until;
     }
-    if let Some(on) = sessions::root_password_login() {
-        engine.set_root_password_login(on);
+    if let Some(auth) = sessions::sshd_auth() {
+        engine.set_sshd_auth(auth.root_password, auth.password, auth.per_match);
     }
     engine.set_user_names(procsrc::load_user_names());
     for path in ["/etc/passwd", "/etc/group"] {
@@ -450,8 +450,33 @@ async fn async_main(
             "learning stopped, so nothing on this host is learned as normal; new sources, \
              destinations and programs are judged from now on",
         );
-        if let Some(f) = hermian_core::audit::finding(&signs, note) {
-            emit_self(&notifier, engine.alert_from(f, Utc::now()));
+        if let Some(mut f) = hermian_core::audit::finding(&signs, note) {
+            // The same findings at every restart (an install restarts more
+            // than once) page once a day, not each time.
+            let now = Utc::now();
+            let saved = paths::state_dir().join("audit-last");
+            match fs::read_to_string(&saved)
+                .ok()
+                .and_then(|t| audit_repeat_of(&t, &f.signature, now))
+            {
+                Some(at) => {
+                    f.severity = Severity::Info;
+                    f = f.fact(
+                        "Repeat",
+                        format!(
+                            "Same findings as at {} UTC, paged then",
+                            at.format("%-d %b %H:%M")
+                        ),
+                    );
+                }
+                None => {
+                    let _ = config::write_secure(
+                        &saved,
+                        &format!("{} {}", f.signature, now.timestamp()),
+                    );
+                }
+            }
+            emit_self(&notifier, engine.alert_from(f, now));
         }
         log_daemon(
             Severity::High,
@@ -543,6 +568,9 @@ async fn async_main(
                     report_dropped_events(&mut engine, &notifier, &grown, &dropped_now);
                 }
                 dropped_seen = dropped_now;
+                for (channel, note) in notifier.take_failing() {
+                    report_channel_failing(&mut engine, &notifier, &channel, &note);
+                }
                 let conflicts = tgbot::take_conflicts();
                 if conflicts >= 2 {
                     report_bot_conflict(&mut engine, &notifier, conflicts);
@@ -557,10 +585,10 @@ async fn async_main(
                     let days = current_cfg.general.alert_retention_days;
                     tokio::task::spawn_blocking(move || retention::run(days));
                     // sshd settings can change any time; recheck hourly.
-                    tokio::task::spawn_blocking(sessions::refresh_root_password_login);
+                    tokio::task::spawn_blocking(sessions::refresh_sshd_auth);
                 }
-                if let Some(on) = sessions::cached_root_password_login() {
-                    engine.set_root_password_login(on);
+                if let Some(auth) = sessions::cached_sshd_auth() {
+                    engine.set_sshd_auth(auth.root_password, auth.password, auth.per_match);
                 }
                 // Hidden key sources in sshd's effective config: audited at
                 // start and every ten minutes, each reported once.
@@ -664,6 +692,39 @@ fn report_dropped_events(
             ),
         );
     }
+}
+
+/// Page when a channel has been failing for a while. The page goes to every
+/// channel: the working ones deliver it, so a dead bot or mailbox doesn't
+/// silently cut the host off.
+fn report_channel_failing(
+    engine: &mut Engine,
+    notifier: &notify::Notifier,
+    channel: &str,
+    note: &str,
+) {
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::High,
+            "Alerts aren't reaching one of the channels",
+            &format!(
+                "Delivery to {} has been failing for more than 15 minutes ({}). Alerts for it \
+                 are queued on this host and go out when it works again.",
+                channel, note
+            ),
+            "A revoked bot token, a full mailbox or a dead webhook means alerts stop arriving \
+             there without anyone noticing. Blocking the way out is also how an intruder \
+             silences a monitor.",
+            &[
+                "Check the channel's settings and run 'sudo hermian notify-test'.",
+                "If the host can't reach it at all, check its outbound network.",
+            ],
+            &[("Channel", channel), ("Problem", note)],
+            &format!("selfprotect|channel-failing|{}", channel),
+        ),
+    );
 }
 
 /// Page when something else keeps reading this bot's button presses: each
@@ -938,6 +999,28 @@ async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal:
         .map(|m| planned_restart(&m, Utc::now()))
         .unwrap_or(false);
     let _ = fs::remove_file(&marker);
+    // `systemctl restart`: the daemon is back in seconds. A plain stop (what
+    // an intruder does) stays HIGH.
+    let restarting = !planned && systemd_restarting();
+    if restarting {
+        let alert = self_alert(
+            engine,
+            Severity::Info,
+            "Hermian is restarting",
+            &format!(
+                "systemd is restarting the daemon ({}). Monitoring resumes in a few seconds.",
+                signal
+            ),
+            "Logged for the record. A stop, as opposed to a restart, is still paged.",
+            &[],
+            &[("Signal", signal)],
+            &format!("selfprotect|restart|{}", Utc::now().timestamp()),
+        );
+        if let Some(a) = alert {
+            notifier.send(a);
+        }
+        return;
+    }
     if planned {
         let alert = self_alert(
             engine,
@@ -977,6 +1060,38 @@ async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal:
             .wait_delivered(&ref_id, Duration::from_secs(STOP_NOTICE_WAIT_SECS))
             .await;
     }
+}
+
+/// Whether systemd is restarting the unit rather than stopping it: while it
+/// stops, a restart job is queued for it.
+fn systemd_restarting() -> bool {
+    procsrc::system_command("systemctl")
+        .args(["list-jobs", "--no-legend", "--plain"])
+        .output()
+        .map(|o| restart_job_in(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or(false)
+}
+
+/// `systemctl list-jobs` lines: "JOB UNIT TYPE STATE".
+fn restart_job_in(jobs: &str) -> bool {
+    jobs.lines().any(|l| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        w.len() >= 3
+            && w[1] == "hermian.service"
+            && matches!(w[2], "restart" | "try-restart" | "reload-or-restart")
+    })
+}
+
+/// When the same start-up audit findings (`signature`) were last paged, if
+/// that was under a day ago. `saved` is "<signature> <unix time>".
+fn audit_repeat_of(
+    saved: &str,
+    signature: &str,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    let (sig, ts) = saved.trim().rsplit_once(' ')?;
+    let at = chrono::DateTime::from_timestamp(ts.parse().ok()?, 0)?;
+    (sig == signature && now - at < chrono::Duration::hours(24) && at <= now).then_some(at)
 }
 
 /// How long shutdown waits for the stop notice. The unit's TimeoutStopSec
@@ -1235,16 +1350,21 @@ fn reload_config(
         Ok(new_cfg) => {
             let diff = configdiff::diff(current_cfg, &new_cfg);
             let functional = diff.is_functional();
+            // Loosening (fewer or other destinations, a rule off, a wider
+            // exception) is how a host gets blinded: CRITICAL. Tuning and
+            // tightening are recorded without paging.
             let alert = self_alert(
                 engine,
-                if functional {
+                if !functional {
+                    Severity::Info
+                } else if diff.weakens {
                     Severity::Critical
                 } else {
-                    Severity::Info
+                    Severity::Low
                 },
                 if !functional {
                     "Hermian configuration reloaded with no functional change"
-                } else if diff.destinations_changed {
+                } else if diff.destinations_changed && diff.weakens {
                     "Hermian alert destinations changed and reloaded"
                 } else {
                     "Hermian configuration changed and reloaded"
@@ -1257,7 +1377,7 @@ fn reload_config(
             );
             // If alerts are being repointed, the old destinations must hear
             // about it too: otherwise the notice goes only to whoever did it.
-            if diff.destinations_changed {
+            if diff.destinations_changed && diff.weakens {
                 if let Some(a) = &alert {
                     notify_old_destinations(a.clone(), current_cfg.notifications.clone());
                 }
@@ -1524,6 +1644,37 @@ mod tests {
 
     /// The upgrade restart (#198 on the test VPS) paged HIGH. Only a fresh
     /// marker from `hermian enable` makes a stop routine.
+    #[test]
+    fn a_restart_job_is_told_from_a_stop() {
+        assert!(restart_job_in("812 hermian.service restart running\n"));
+        assert!(!restart_job_in("812 hermian.service stop running\n"));
+        assert!(!restart_job_in("90 nginx.service restart running\n"));
+        assert!(!restart_job_in(""));
+    }
+
+    #[test]
+    fn the_same_audit_pages_once_a_day() {
+        let now = Utc::now();
+        let saved = format!(
+            "d3|startup-audit|abc {}",
+            (now - chrono::Duration::hours(2)).timestamp()
+        );
+        assert!(audit_repeat_of(&saved, "d3|startup-audit|abc", now).is_some());
+        assert!(
+            audit_repeat_of(&saved, "d3|startup-audit|xyz", now).is_none(),
+            "other findings"
+        );
+        let old = format!(
+            "d3|startup-audit|abc {}",
+            (now - chrono::Duration::hours(30)).timestamp()
+        );
+        assert!(
+            audit_repeat_of(&old, "d3|startup-audit|abc", now).is_none(),
+            "a day later"
+        );
+        assert!(audit_repeat_of("garbage", "d3|startup-audit|abc", now).is_none());
+    }
+
     #[test]
     fn only_a_fresh_marker_is_a_planned_restart() {
         let now = Utc::now();

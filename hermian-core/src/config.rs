@@ -70,6 +70,12 @@ pub enum ConfigError {
     ActionTtl,
     #[error("response.block_duration_hours must be between 1 and 8760")]
     BlockHours,
+    #[error(
+        "allowlist.ssh_keys fingerprint '{0}' must look like SHA256:... (ssh-keygen -lf key.pub)"
+    )]
+    BadFingerprint(String),
+    #[error("ssh.known_key_new_network must be alert or log")]
+    KnownKeyNewNetwork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +140,10 @@ pub struct SshCfg {
     /// A source needs at least this many failures against existing accounts
     /// in a digest period to be listed.
     pub brute_min_attempts: u32,
+    /// A login with a key the account has used before, from a network it
+    /// hasn't: "alert" pages it (root) as usual, "log" records it without
+    /// sending. Passwords and new keys always page.
+    pub known_key_new_network: String,
 }
 
 impl Default for SshCfg {
@@ -146,6 +156,7 @@ impl Default for SshCfg {
             off_hours_end: 6,
             brute_digest_hours: 2,
             brute_min_attempts: 10,
+            known_key_new_network: "alert".to_string(),
         }
     }
 }
@@ -431,6 +442,9 @@ impl Config {
         if !(1..=MAX_WINDOW_SECS).contains(&self.ssh.failed_burst_window_secs) {
             return Err(ConfigError::BurstWindow);
         }
+        if !matches!(self.ssh.known_key_new_network.as_str(), "alert" | "log") {
+            return Err(ConfigError::KnownKeyNewNetwork);
+        }
         if !(1..=MAX_WINDOW_SECS).contains(&self.notifications.dedup_window_secs) {
             return Err(ConfigError::DedupWindow);
         }
@@ -547,6 +561,10 @@ failed_burst_count = 5          # failures in the window; INFO until a login fol
 failed_burst_window_secs = 60
 brute_digest_hours = 2  # failed logins against existing accounts, summed up this often
 brute_min_attempts = 10 # failures a source needs in that period to be listed
+## A login with a key the account has used before, from a network it hasn't
+## used: "alert" pages it like any root login from a new place, "log" records
+## it without sending. Passwords and keys never seen before always page.
+known_key_new_network = "alert"
 
 [detections]
 d1_process_chains = true   # web/db shells, download-and-run, /tmp and fileless execution
@@ -669,6 +687,14 @@ block_duration_hours = 24     # how long a "Block IP" button blocks a source
 #[[allowlist.debuggers]]
 #comm   = "my-profiler"
 #reason = "In-house APM agent uses ptrace"
+
+## A key that logs in from a new address every time, such as a CI runner:
+## its logins never count as coming from a new source. Find the fingerprint
+## with: ssh-keygen -lf deploy_key.pub
+#[[allowlist.ssh_keys]]
+#fingerprint = "SHA256:qQ4bSkAnJmXpNJ6Hd4kFr2Y9pCbAuGN4a3H6zfD0Y1o"
+#user        = "deploy"
+#reason      = "GitLab CI deploy key"
 "#;
 
 #[cfg(test)]

@@ -39,10 +39,12 @@ Each family can be switched off in `[detections]`
 | Fileless execution from memory (memfd) | D1 | `HIGH` |
 | SSH authentication burst | D2 | `INFO` |
 | SSH login after a failed-auth burst | D2 | `HIGH` |
-| SSH brute force against existing accounts | D2 | `HIGH` |
+| SSH brute force against existing accounts | D2 | `HIGH` · `LOW` when no account tried accepts a password |
 | Root login over SSH from a new source | D2 | `HIGH` |
 | Root login over SSH | D2 | `INFO` |
 | Root login with a known key from a nearby address | D2 | `INFO` |
+| Root login with a known key from a new network | D2 | `HIGH` · `LOW` with `known_key_new_network = "log"` |
+| SSH login with a known key from a new network | D2 | `LOW` |
 | Root login from a new source | D2 | `HIGH` |
 | SSH login from a new source | D2 | `LOW` |
 | SSH login with a key from a hidden key file | D2 | `HIGH` |
@@ -92,7 +94,7 @@ Each family can be switched off in `[detections]`
 | New listening port | D5 | `INFO` |
 | Hermian itself is hooked | SELF | `CRITICAL` |
 | Hermian binary modified | SELF | `CRITICAL` |
-| Hermian configuration changed and reloaded | SELF | `CRITICAL` |
+| Hermian configuration changed and reloaded | SELF | `CRITICAL` · `LOW` when nothing is loosened |
 | Hermian alert destinations changed and reloaded | SELF | `CRITICAL` |
 | Hermian configuration modified while stopped | SELF | `CRITICAL` |
 | Hermian configuration unreadable | SELF | `CRITICAL` |
@@ -101,6 +103,8 @@ Each family can be switched off in `[detections]`
 | Hermian integrity record missing | SELF | `HIGH` |
 | Hermian is stopping | SELF | `HIGH` |
 | Hermian is restarting (install or upgrade) | SELF | `INFO` |
+| Hermian is restarting | SELF | `INFO` |
+| Alerts aren't reaching one of the channels | SELF | `HIGH` |
 | Hermian restarted after an unclean shutdown | SELF | `HIGH` |
 | Hermian daemon is not responding | SELF | `HIGH` |
 | Hermian daemon is down | SELF | `CRITICAL` |

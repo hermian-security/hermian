@@ -63,7 +63,27 @@ from unattended writes:
 - Failed logins for usernames that don't exist (`admin`, `test`, `oracle`…)
   never count. Attempts against real accounts are summed up in one
   **brute-force digest** every `ssh.brute_digest_hours` (2 by default), only
-  listing sources with at least `ssh.brute_min_attempts` (10) attempts.
+  listing sources with at least `ssh.brute_min_attempts` (10) attempts. When
+  none of those accounts accepts a password, the digest is recorded, not sent.
+
+## Your own logins
+
+- A login from an address seen before is quiet; so is a known key from a new
+  address on the same network (/16).
+- A known key from a **new network** says so in its title. Logins with one key
+  from several new networks in a row (a CI pipeline) are one alert.
+- CI runners and other automation: allowlist the key
+  (`[[allowlist.ssh_keys]]`), and its logins never count as new. Or use a
+  non-root deploy account: new places for non-root accounts are LOW.
+- Moving around a lot: `ssh.known_key_new_network = "log"`. Passwords and keys
+  never seen before always page.
+
+## Your own changes
+
+- Editing the config pages CRITICAL only when it loosens something; tuning
+  and tightening are LOW.
+- `systemctl restart hermian` is INFO; a stop is still HIGH.
+- The start-up audit pages once for the same findings, not at every start.
 
 ## Allowlists
 

@@ -56,8 +56,8 @@ prohibit-password` and a named account.
 
 `INFO`
 
-Root again, from an address that has logged in as root before. Context, not a
-new incident.
+Root again, from an address that has logged in as root before, or with a key
+in `allowlist.ssh_keys`. Context, not a new incident.
 
 ### Root login with a known key from a nearby address
 
@@ -66,12 +66,40 @@ new incident.
 Root, with a key that has logged in before, from a new address on a network
 root already uses (/16, or /32 for IPv6). A dynamic IP, not a new incident.
 
+### Root login with a known key from a new network / SSH login with a known key from a new network
+
+`HIGH` for root · `LOW` for other accounts, or with
+`ssh.known_key_new_network = "log"`
+
+**Fires when** a key the account has used before logs in from a network it
+hasn't: the owner on another connection (travel, mobile, a VPN), a CI runner
+on a cloud address, or a key that leaked. The alert says it's a known key up
+front, so you can tell at a glance.
+
+**Grouping** One key logging in from several new networks within the dedup
+window is one alert: a CI pipeline's jobs don't page once each.
+
+**Tune** For automation that logs in from a new address every time (GitLab
+or GitHub runners), allowlist its key; its logins then never count as new:
+
+```toml
+[[allowlist.ssh_keys]]
+fingerprint = "SHA256:qQ4b..."   # ssh-keygen -lf deploy_key.pub
+user        = "deploy"           # optional: only for this account
+reason      = "GitLab CI deploy key"
+```
+
+If you move around a lot, `ssh.known_key_new_network = "log"` records these
+without sending them. Passwords and keys never seen before always page, either
+way. A login after a burst of failures, or with a key from a hidden file,
+pages whatever the key.
+
 ### Root login from a new source / SSH login from a new source
 
 `HIGH` for root · `LOW` for other accounts
 
 **Fires when** after the [learning period](baseline), a login comes from an
-address never seen before (and not a known key on a known network).
+address never seen before, with a password or a key never seen before.
 
 **Why** A first-time source proves nothing by itself; it's where a surprise
 login shows up. A root login matching both rules sends one alert, the sharper
@@ -96,7 +124,7 @@ this way is never learned as a known key.
 
 ### SSH brute force against existing accounts
 
-`HIGH`
+`HIGH` · `LOW` when no account tried accepts a password
 
 **Fires when** every `ssh.brute_digest_hours` (2), if failed logins targeted
 accounts that can actually log in (a real shell in `/etc/passwd`), listing
@@ -106,6 +134,13 @@ first.
 **Why** Attempts against usernames that don't exist are background noise and
 never count. Attempts against your real accounts are worth a summary. The
 digest also says when root can log in with a password and is being tried.
+
+On a host where none of the accounts tried accepts a password (`sshd -T`:
+password and keyboard-interactive logins off, or root on `prohibit-password`
+and only root tried), the attempts can't succeed: the digest is recorded as
+LOW, not sent. If sshd has `Match` blocks, which can turn passwords back on
+for some users or addresses, or Hermian couldn't ask sshd, it pages as
+before.
 
 **Buttons** Block each top source, Block all, Ignore 2h, and a 7-day reminder
 for the root-password warning.

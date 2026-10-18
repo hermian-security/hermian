@@ -94,10 +94,21 @@ pub fn disconnect(source: IpAddr, port: Option<u16>) -> Result<Disconnected> {
     })
 }
 
-/// Whether root can log in over SSH with a password, from sshd's effective
-/// configuration (`sshd -T` resolves includes and defaults). `None` if sshd
-/// couldn't be asked.
-pub fn root_password_login() -> Option<bool> {
+/// What sshd accepts, from its effective configuration (`sshd -T` resolves
+/// includes and defaults).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshdAuth {
+    /// Some account can log in with a password (or keyboard-interactive).
+    pub password: bool,
+    /// Root can.
+    pub root_password: bool,
+    /// The config has `Match` blocks, which can change both per user or
+    /// address: `sshd -T` only shows the global settings.
+    pub per_match: bool,
+}
+
+/// `None` if sshd couldn't be asked.
+pub fn sshd_auth() -> Option<SshdAuth> {
     let sshd = ["/usr/sbin/sshd", "/sbin/sshd", "/usr/bin/sshd"]
         .into_iter()
         .find(|p| std::path::Path::new(p).is_file())?;
@@ -105,35 +116,47 @@ pub fn root_password_login() -> Option<bool> {
     if !out.status.success() {
         return None;
     }
-    Some(parse_root_password_login(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    let mut config = procsrc::read_file("/etc/ssh/sshd_config").unwrap_or_default();
+    if let Ok(dir) = std::fs::read_dir("/etc/ssh/sshd_config.d") {
+        for e in dir.flatten() {
+            if e.path().extension().is_some_and(|x| x == "conf") {
+                config.push('\n');
+                config
+                    .push_str(&procsrc::read_file(&e.path().to_string_lossy()).unwrap_or_default());
+            }
+        }
+    }
+    Some(parse_sshd_auth(
+        &String::from_utf8_lossy(&out.stdout),
+        &config,
+    ))
 }
 
-/// Last `sshd -T` answer: 0 unknown, 1 no, 2 yes.
-static ROOT_PW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Last `sshd -T` answer: bit 0 known, 1 password, 2 root password, 3 Match.
+static SSHD_AUTH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Ask sshd again and cache the answer (runs on a blocking thread).
-pub fn refresh_root_password_login() {
-    let v = match root_password_login() {
-        Some(true) => 2,
-        Some(false) => 1,
-        None => 0,
-    };
-    if v != 0 {
-        ROOT_PW.store(v, std::sync::atomic::Ordering::Relaxed);
+pub fn refresh_sshd_auth() {
+    if let Some(a) = sshd_auth() {
+        let bits = 1
+            | (u8::from(a.password) << 1)
+            | (u8::from(a.root_password) << 2)
+            | (u8::from(a.per_match) << 3);
+        SSHD_AUTH.store(bits, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-pub fn cached_root_password_login() -> Option<bool> {
-    match ROOT_PW.load(std::sync::atomic::Ordering::Relaxed) {
-        2 => Some(true),
-        1 => Some(false),
-        _ => None,
-    }
+pub fn cached_sshd_auth() -> Option<SshdAuth> {
+    let bits = SSHD_AUTH.load(std::sync::atomic::Ordering::Relaxed);
+    (bits & 1 == 1).then_some(SshdAuth {
+        password: bits & 2 != 0,
+        root_password: bits & 4 != 0,
+        per_match: bits & 8 != 0,
+    })
 }
 
-fn parse_root_password_login(sshd_t: &str) -> bool {
+/// From `sshd -T` output, and the config files' text for `Match` blocks.
+fn parse_sshd_auth(sshd_t: &str, config: &str) -> SshdAuth {
     let get = |key: &str| {
         sshd_t
             .lines()
@@ -143,7 +166,15 @@ fn parse_root_password_login(sshd_t: &str) -> bool {
     let root_ok = get("permitrootlogin").as_deref() == Some("yes");
     let password = get("passwordauthentication").as_deref() == Some("yes")
         || get("kbdinteractiveauthentication").as_deref() == Some("yes");
-    root_ok && password
+    let per_match = config.lines().any(|l| {
+        let t = l.trim_start().to_ascii_lowercase();
+        t.starts_with("match ") || t.starts_with("match\t")
+    });
+    SshdAuth {
+        password,
+        root_password: root_ok && password,
+        per_match,
+    }
 }
 
 #[cfg(test)]
@@ -179,16 +210,28 @@ mod tests {
 
     #[test]
     fn root_password_login_needs_both_settings() {
+        let auth = |t: &str| parse_sshd_auth(t, "");
         let on = "port 22\npermitrootlogin yes\npasswordauthentication yes\n";
-        assert!(parse_root_password_login(on));
+        assert!(auth(on).root_password);
         let keys_only = "permitrootlogin prohibit-password\npasswordauthentication yes\n";
-        assert!(!parse_root_password_login(keys_only));
+        assert!(!auth(keys_only).root_password);
+        assert!(auth(keys_only).password);
         let no_pw =
             "permitrootlogin yes\npasswordauthentication no\nkbdinteractiveauthentication no\n";
-        assert!(!parse_root_password_login(no_pw));
+        assert!(!auth(no_pw).root_password);
+        assert!(!auth(no_pw).password && !auth(no_pw).per_match);
         let kbd =
             "permitrootlogin yes\npasswordauthentication no\nkbdinteractiveauthentication yes\n";
-        assert!(parse_root_password_login(kbd));
+        assert!(auth(kbd).root_password);
+    }
+
+    #[test]
+    fn a_match_block_makes_keys_only_uncertain() {
+        let no_pw = "passwordauthentication no\nkbdinteractiveauthentication no\n";
+        let cfg = "PasswordAuthentication no\n# Match nothing here\nMatch Address 10.0.0.0/8\n  PasswordAuthentication yes\n";
+        let a = parse_sshd_auth(no_pw, cfg);
+        assert!(a.per_match);
+        assert!(!parse_sshd_auth(no_pw, "# Match is commented\n").per_match);
     }
 
     /// A process named `sshd` holding a connection from 127.0.0.1:<port> is
