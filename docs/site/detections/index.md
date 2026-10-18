@@ -105,6 +105,7 @@ Each family can be switched off in `[detections]`
 | Hermian daemon is not responding | SELF | `HIGH` |
 | Hermian daemon is down | SELF | `CRITICAL` |
 | Hermian dropped telemetry | SELF | `HIGH` |
+| Another host is reading this bot's button presses | SELF | `HIGH` |
 | CPUs came online without eBPF monitoring | SELF | `HIGH` |
 | 32-bit program started (partly unmonitored) | SELF | `LOW` |
 | Hermian is active | SELF | `INFO` |
