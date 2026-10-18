@@ -87,7 +87,7 @@ coverage. It leaves out host names, addresses, users, paths and commands.
 ### `enable`
 
 Installs, enables and starts the daemon: units, directories, config (new
-settings added commented out, nothing you set changed), hashes, baseline,
+settings added switched off, nothing you set changed), hashes, baseline,
 inotify limits, capabilities for buttons and isolation. Safe to re-run; the
 package runs it on every install and upgrade.
 

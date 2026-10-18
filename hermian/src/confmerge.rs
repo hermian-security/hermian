@@ -3,10 +3,15 @@
 //! A fresh install gets the full template, but upgrades never touch an
 //! existing file, so new settings (and whole sections, like Telegram for
 //! configs written by early betas) were invisible to users. This adds
-//! whatever the file lacks, *commented out*, next to where it belongs:
+//! whatever the file lacks, *switched off*, next to where it belongs:
 //!
 //! - a missing setting goes at the end of its section, with its comments;
 //! - a missing section goes at the end of the file.
+//!
+//! Added lines follow the template's convention: explanations keep their
+//! `##`, settings get a single `#` with no space (`#key = value`), so
+//! removing one `#` from any added line either turns a setting on or leaves
+//! a comment, never a broken file.
 //!
 //! Nothing active changes: the result must parse to exactly the same values
 //! as the original, or nothing is written. Settings already present (even
@@ -44,9 +49,14 @@ fn active_key(line: &str) -> Option<String> {
     is_ident(k).then(|| k.to_string())
 }
 
-/// `key` from a commented `# key = value` line (an optional setting).
+/// `key` from a switched-off `#key = value` line (or `# key = value`, as
+/// older versions wrote them). Not from `##` explanations.
 fn commented_key(line: &str) -> Option<String> {
-    let t = line.trim_start().strip_prefix('#')?.trim_start();
+    let t = line.trim_start().strip_prefix('#')?;
+    if t.starts_with('#') {
+        return None;
+    }
+    let t = t.trim_start();
     let (k, _) = t.split_once('=')?;
     let k = k.trim();
     is_ident(k).then(|| k.to_string())
@@ -118,11 +128,13 @@ fn parse_template(t: &str) -> Vec<TemplateSection> {
     out
 }
 
+/// A template line, switched off: settings and headers get one `#`;
+/// explanations (`##`) and settings already off stay as they are.
 fn comment_out(line: &str) -> String {
     if line.trim_start().starts_with('#') || line.trim().is_empty() {
         line.to_string()
     } else {
-        format!("# {}", line)
+        format!("#{}", line)
     }
 }
 
@@ -163,7 +175,7 @@ pub fn retire(user: &str) -> Option<String> {
         };
         for l in &mut lines[start..end] {
             if active_key(l).as_deref() == Some(*key) {
-                *l = format!("# {}   # no longer used; safe to delete", l.trim_end());
+                *l = format!("#{}   # no longer used; safe to delete", l.trim_end());
                 changed = true;
             }
         }
@@ -189,8 +201,12 @@ pub fn merge(user: &str, template: &str, version: &str) -> Option<String> {
     let mut inserts: Vec<(usize, Vec<String>)> = Vec::new();
 
     for sec in parse_template(template) {
-        let marker = format!("# [{}]", sec.path);
-        let has_marker = lines.iter().any(|l| l.trim() == marker);
+        let marker = format!("#[{}]", sec.path);
+        // Older versions wrote "# [section]".
+        let old_marker = format!("# [{}]", sec.path);
+        let has_marker = lines
+            .iter()
+            .any(|l| l.trim() == marker || l.trim() == old_marker);
         // A table defined only implicitly (e.g. `[notifications.telegram]`
         // with no `[notifications]` line) has no body to insert into; its
         // missing keys are appended under a commented header, which stays
@@ -218,7 +234,10 @@ pub fn merge(user: &str, template: &str, version: &str) -> Option<String> {
                 while at > start && lines[at - 1].trim().is_empty() {
                     at -= 1;
                 }
-                let mut block = vec![format!("# New in {} (uncomment to use):", version)];
+                let mut block = vec![format!(
+                    "## New in {}: remove the # from a setting to turn it on.",
+                    version
+                )];
                 block.extend(add);
                 inserts.push((at, block));
             }
@@ -247,11 +266,13 @@ pub fn merge(user: &str, template: &str, version: &str) -> Option<String> {
     if !appended.is_empty() {
         lines.push(String::new());
         lines.push(format!(
-            "# ---- Added by 'hermian enable' ({}): sections this file didn't have. ----",
+            "## ---- Added by 'hermian enable' ({}): sections this file didn't have. ----",
             version
         ));
         lines.push(
-            "# Nothing below is active. Uncomment a section header and its lines to use it.".into(),
+            "## Nothing below is on. To use a section, remove the # from its header and its \
+             settings."
+                .into(),
         );
         lines.extend(appended);
     }
@@ -280,21 +301,21 @@ mod tests {
         let b: toml::Value = toml::from_str(&out).unwrap();
         assert_eq!(a, b);
         // Whole sections, at the end.
-        assert!(out.contains("# [notifications.telegram]"), "{}", out);
-        assert!(out.contains("# bot_token = \"\""));
-        assert!(out.contains("# allowed_user_ids = []"));
-        assert!(out.contains("# [notifications.email]"));
-        assert!(out.contains("# [detections]"));
+        assert!(out.contains("#[notifications.telegram]"), "{}", out);
+        assert!(out.contains("#bot_token = \"\""));
+        assert!(out.contains("#allowed_user_ids = []"));
+        assert!(out.contains("#[notifications.email]"));
+        assert!(out.contains("#[detections]"));
         // Keys missing from existing sections, inside them.
         let resp = out.find("[response]").unwrap();
-        let block = out.find("# block_duration_hours = 24").unwrap();
+        let block = out.find("#block_duration_hours = 24").unwrap();
         let allow = out.find("[allowlist]").unwrap();
         assert!(resp < block && block < allow, "{}", out);
         let ssh = out.find("[ssh]").unwrap();
-        let digest = out.find("# brute_digest_hours = 2").unwrap();
+        let digest = out.find("#brute_digest_hours = 2").unwrap();
         assert!(ssh < digest && digest < out.find("[notifications]").unwrap());
         // Optional settings that are only commented in the template too.
-        assert!(out.contains("# message_thread_id = 12345"));
+        assert!(out.contains("#message_thread_id = 12345"));
         // And the file still loads as a config.
         Config::parse(&out).unwrap().validate().unwrap();
     }
@@ -316,8 +337,8 @@ mod tests {
                     [notifications.telegram]\nbot_token = \"1:secret\"\nchat_id = \"42\"\n";
         let out = merge(user, DEFAULT_CONFIG_TOML, "v").unwrap();
         assert!(out.contains("bot_token = \"1:secret\""));
-        assert!(!out.contains("# bot_token"), "set keys aren't added again");
-        assert!(out.contains("# actions = false"));
+        assert!(!out.contains("#bot_token"), "set keys aren't added again");
+        assert!(out.contains("#actions = false"));
         let a: toml::Value = toml::from_str(user).unwrap();
         assert_eq!(a, toml::from_str::<toml::Value>(&out).unwrap());
     }
@@ -344,7 +365,7 @@ mod tests {
                 .find(|l| l.contains(key))
                 .unwrap_or_else(|| panic!("{} gone entirely", key));
             assert!(
-                line.starts_with("# ") && line.ends_with("safe to delete"),
+                line.starts_with('#') && line.ends_with("safe to delete"),
                 "{}",
                 line
             );
@@ -363,7 +384,7 @@ mod tests {
     fn retire_only_touches_the_right_section() {
         let t = "[ssh]\noff_hours_start = 22\n\n[notifications.webhook]\nurl = \"\"\n";
         let out = retire(t).unwrap();
-        assert!(out.contains("# off_hours_start = 22"));
+        assert!(out.contains("#off_hours_start = 22"));
         assert!(out.contains("url = \"\""));
     }
 
@@ -379,5 +400,29 @@ mod tests {
         assert!(!merged
             .lines()
             .any(|l| l.trim_start().starts_with("log_level")));
+    }
+
+    /// What an upgrade adds follows the template's convention: removing one
+    /// `#` from an added line turns a setting on or leaves a comment.
+    #[test]
+    fn added_lines_are_explanations_or_settings() {
+        let out = merge(BETA2, DEFAULT_CONFIG_TOML, "v").unwrap();
+        let before: Vec<&str> = BETA2.lines().collect();
+        for l in out.lines().filter(|l| !before.contains(l)) {
+            let t = l.trim_start();
+            if !t.starts_with('#') {
+                continue;
+            }
+            assert!(
+                t.starts_with("##") || !t[1..].starts_with(' '),
+                "neither ## nor #setting: {:?}",
+                l
+            );
+        }
+        assert!(!out.contains("# #"), "doubled comment marker:\n{}", out);
+        // An older file's "# [section]" marker still counts as present.
+        let old = format!("{}\n# [notifications.webhook]\n# url = \"\"\n", BETA2);
+        let again = merge(&old, DEFAULT_CONFIG_TOML, "v").unwrap();
+        assert!(!again.contains("#[notifications.webhook]"), "{}", again);
     }
 }

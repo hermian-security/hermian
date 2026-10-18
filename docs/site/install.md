@@ -154,8 +154,8 @@ With the APT repository: `sudo apt update && sudo apt upgrade`. Otherwise
 rerun the installer, or the by-hand steps with a newer `VER`. Read the
 [release notes](https://github.com/hermian-security/hermian/releases) first:
 they list any one-time steps. A restart for an upgrade pages INFO, not HIGH.
-New settings are added to your config file, commented out, without touching
-what you've set.
+New settings are added to your config file, switched off (a single `#` in
+front), without touching what you've set.
 
 ## Uninstall
 

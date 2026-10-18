@@ -83,6 +83,15 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- The config file can't be broken by removing a `#` any more. Explanations
+  now start with `##` and settings that are switched off with a single `#`
+  (`#message_thread_id = 12345`): removing one `#` turns a setting on or
+  leaves a comment. Lines that looked like settings but weren't (the channel
+  list hint, the Telegram setup steps, the notes above allowlist examples)
+  are explanations now. `hermian enable` adds new settings the same way on
+  upgrade, instead of `# # ...` lines. If the file doesn't parse because an
+  explanation lost its `##`, the error says which line. Existing configs
+  aren't rewritten.
 - A tracer no longer floods Hermian. The eBPF ptrace hook passes up only
   attach and seize, the only requests Hermian acts on. strace on any process
   used to send one event per traced syscall: 474,000 lost to a full ring in

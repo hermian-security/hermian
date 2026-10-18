@@ -6,8 +6,15 @@ description: Every setting in /etc/hermian/config.toml - general, baseline, SSH 
 # Configuration
 
 Hermian reads one file: `/etc/hermian/config.toml`, root-only (0600).
-`hermian enable` creates it with every setting and a comment on each, and on
-upgrades adds new settings commented out, without touching yours.
+`hermian enable` creates it with every setting at its default and a note on
+each, and on upgrades adds new settings switched off, without touching yours.
+
+**Two kinds of comment.** Lines starting with `##` explain. A line starting
+with a single `#`, like `#message_thread_id = 12345`, is a setting that's
+switched off: remove that `#` to turn it on. Removing one `#` from an
+explanation leaves a comment, so you can't break the file that way. If an
+edit does break it, the error names the line, and says so when it looks like
+an explanation that lost its `##`.
 
 **Reloading is automatic.** The daemon watches the file:
 
@@ -123,7 +130,9 @@ Details: [Response](response).
 ## `[allowlist]`
 
 Exceptions, each a TOML array entry with a mandatory `reason`. Prefer fixing a
-noisy rule (open an issue) over a broad exception.
+noisy rule (open an issue) over a broad exception. The config file holds a
+switched-off example of each: remove the `#` from every line of one block to
+use it.
 
 | Entry | Fields | Effect |
 |---|---|---|
