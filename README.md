@@ -42,8 +42,9 @@ and the email carry the full record, process chain and evidence included.
 
 > [!NOTE]
 > **It's beta.** Two Ubuntu 22.04 hosts have passed the full attack suite, one
-> of them running Hermian since September 2026. Other distros and longer runs
-> are still to come. Try it on a test host first. What's been verified is
+> of them running Hermian since September 2026, and an Ubuntu 24.04 host ran it
+> live while already compromised. Other distros and longer runs are still to
+> come. Try it on a test host first. What's been verified is
 > in [docs/EVIDENCE.md](docs/EVIDENCE.md), and what it can't do is under
 > [Limits](#limits). Running it for a week? [Become an early tester](#early-testers).
 
@@ -350,8 +351,9 @@ turn it on.
 
 ## Limits
 
-- **One distro so far.** Only Ubuntu 22.04 has run it in the field. RHEL with
-  SELinux, the older-kernel fallback, and arm64 are untested.
+- **Ubuntu only so far.** 22.04 has passed the suites, and 24.04 has run
+  live without them. RHEL with SELinux, the older-kernel fallback, and arm64
+  are untested.
 - **It only sees what it hooks.** Detection runs on kernel and log sources;
   anything outside them is invisible, and one incident can trip more than one
   rule.
