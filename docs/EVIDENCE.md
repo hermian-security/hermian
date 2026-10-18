@@ -63,11 +63,36 @@ The maintainer's VPS (since 2026-09-20). Ubuntu 22.04.5, kernel 5.15.0-170,
   started_at; the status screen's "today" alert count resets at midnight
   UTC, so don't pair it with events processed.
 
+An already compromised host (October 2026). Ubuntu 24.04, kernel 6.8,
+internet-facing. A cryptominer with an /etc/ld.so.preload rootkit had been
+on it for at least a week before Hermian went in. No suites here: the
+point was to see what a real infection looks like from Hermian's side.
+
+- Live run (2026-10-17, beta.12 from the APT repository): about an hour,
+  127 alerts (4 CRITICAL, 75 HIGH, 37 LOW, 11 INFO) over 30,255 events,
+  1.7% CPU and 17 MB of memory. The volume is the malware, and it showed
+  one connection per destination paging on its own; folding those into
+  one incident is due in v0.1.0.
+- Caught: a fake web server spawning a shell (D1), exec from a hidden
+  /tmp directory inside that chain (D1), its outbound connections (D5),
+  root crontab and .profile rewrites (D3), the preload entry (D3,
+  CRITICAL), LD_PRELOAD in unattended processes (D4) and a planted hidden
+  SSH key (D2). The persistence alerts were the malware restoring itself
+  after a cleanup; its first install predates Hermian.
+- Missed: programs disguised as .so files in /usr/lib, immutable bits,
+  timestomped binaries, a SUID binary that was already there, hidden
+  processes, Tor. These are candidates for new rules.
+- Self-protection (2026-10-18, #92): the rootkit is no longer loaded into
+  the daemon.
+- Uninstall: the first run left dpkg listing the package (fixed in #90);
+  the retest on 2026-10-18 left nothing behind.
+
 
 ## 3. Not proven yet
 
-- Any distro but Ubuntu 22.04: Debian, the RHEL family with SELinux, the
-  kernel 5.4 fallback path, and arm64 on real hardware.
+- The suites on anything but Ubuntu 22.04. Ubuntu 24.04 has run live (see
+  2) but not the suites; Debian, the RHEL family with SELinux, the kernel
+  5.4 fallback path and arm64 on real hardware haven't run at all.
 - 72 hours with zero unexplained HIGH alerts on several hosts. The runs
   above were 5-minute workloads.
 - Automatic isolation during a real incident (unit tests only).
