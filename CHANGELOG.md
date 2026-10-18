@@ -8,16 +8,18 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Added
 
-- Every Telegram button press gets a clear answer. One result message per
-  press, naming the host, with one line per address marked `done`,
-  `already` (since when and by whom), `refused` (the rule, named) or
-  `failed` (the cause and the next command). No raw errors. A second Block
-  on an address says it's already blocked and leaves the expiry alone. The
-  used button becomes a label with the outcome, a Block gets an Undo button,
-  pressing a button again or after another admin's choice says who did what,
-  and an expired button gives the command that does the same thing. Buttons
-  survive a restart, and a result that can't be posted is retried, then sent
-  with the next message that gets through.
+- Every Telegram button press gets a clear answer. The used button turns
+  into a label with the outcome ("✓ Blocked 203.0.113.24 · @op 14:02 UTC").
+  Block, Disconnect and Unblock, and anything refused or failed, also get a
+  short reply under the alert: one line per address, ✓ done, · already
+  (since when and by whom), ⊘ refused (the rule, named) or ✗ failed (the
+  cause and what to run), then host, who and when. No raw errors. A second
+  Block on an address says it's already blocked and leaves the expiry alone,
+  a Block gets an Undo button, pressing a button again or after another
+  admin's choice says who did what, and an expired button gives the command
+  that does the same from the host. Buttons survive a restart, and a reply
+  that can't be posted is retried, then sent with the next message that gets
+  through.
 - `hermian block <ip>...` and `hermian disconnect <ip>`, the command-line
   twins of the Block and Disconnect buttons. `hermian unblock` says why an
   address isn't blocked (lifted, by whom, or expired).

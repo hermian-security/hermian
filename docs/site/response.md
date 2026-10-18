@@ -53,34 +53,40 @@ which it doesn't have otherwise.
 
 ### What you're told
 
-Every press gets an answer in under a second ("Block 203.0.113.24 on web-01:
-working on it."), then one result message replying to the alert, naming the
-host, with one line per address:
+A press is acknowledged at once ("On it: Block 203.0.113.24 on web-01"). The
+used button then turns into a label with the outcome:
 
 ```text
-web-01 · Disconnect and block, by @op (id 42)
-done: Blocked 203.0.113.24 until 14:02 UTC tomorrow (24h).
-done: Disconnected root from 203.0.113.24 (1 connection(s) ended).
-note: The block covers 203.0.113.24 only: the key or password they used still works from another address.
+✓ Blocked 203.0.113.24 · @op 14:02 UTC
 ```
 
-| Mark | Meaning |
-|---|---|
-| `done` | The change was made. |
-| `already` | It was already that way, and since when and by whom ("was blocked at 14:02 UTC by @op"). Nothing changed; a second Block doesn't extend the first. |
-| `refused` | A safety rule stopped it, named ("inside your management network 10.0.0.0/8 (response.management_cidrs)"). |
-| `failed` | The cause in a sentence and the next step as a command ("blocking needs nftables, and nft isn't installed. Install it: sudo apt install nftables"). |
+Pressing the label shows the full result. Block, Disconnect and Unblock, and
+anything refused or failed, also get a short reply under the alert, one line
+per address and a footer:
 
-The used button then turns into a label with the outcome ("Block
-203.0.113.24: done · @op 14:02 UTC"); pressing it shows the full result.
+```text
+✓ Blocked 203.0.113.24 until 14:02 UTC tomorrow
+✓ Disconnected root from 203.0.113.24
+Their key or password still works from other addresses.
+web-01 · @op · 14:02 UTC
+```
+
+| Sign | Meaning |
+|---|---|
+| ✓ | Done. |
+| · | Already the case, since when and by whom ("already blocked by @op at 14:02 UTC"). A second Block doesn't extend the first. |
+| ⊘ | Refused by a safety rule, named ("Not blocked: 10.0.0.5 is inside your management network 10.0.0.0/8 (response.management_cidrs)"). |
+| ✗ | Failed: the cause and what to run ("Couldn't block: nftables isn't installed. Run: sudo apt install nftables"). |
+
+Ignore and Snooze change nothing on the host, so they only update the label.
+
 Pressing a button again, or one another admin's choice retired, says who did
-what and when instead of acting twice. A button pressed after
-`action_ttl_mins` says so and gives the command that does the same thing
-(`sudo hermian block 203.0.113.24`), and a message whose buttons all expired
-shows "Buttons expired".
+what instead of acting twice. A button pressed after `action_ttl_mins` says so
+and gives the command that does the same from the host (`sudo hermian block
+203.0.113.24`); a message whose buttons all expired shows "Buttons expired".
 
 Buttons are saved in the state directory, so they still work after a restart.
-If a result can't be posted (Telegram down), it's retried, then sent with the
+A reply that can't be posted (Telegram down) is retried, then sent with the
 next message that gets through. It's in the journal and `hermian alerts`
 either way.
 

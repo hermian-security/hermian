@@ -165,8 +165,8 @@ Says so if it wasn't blocked, and why (lifted, by whom, or expired).
 Ends the SSH sessions from that address, like the Disconnect button. It
 doesn't block it: add `hermian block` for that.
 
-Each prints one line per address, marked `done`, `already`, `refused` or
-`failed`, and exits 1 if anything was refused or failed.
+Each prints one line per address, marked ✓ done, · already, ⊘ refused or
+✗ failed, and exits 1 if anything was refused or failed.
 
 ## Remove
 

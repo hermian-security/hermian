@@ -2,11 +2,11 @@
 //! exactly what happened.
 //!
 //! Every result is one line per target, each marked:
-//!   done     the change was made
-//!   already  the state was already as asked, and since when and by whom
-//!   refused  a safety rule stopped it, named
-//!   failed   the cause in a sentence and the next step as a command
-//! Never a raw error. The ledger remembers who did what, so a second press,
+//!   ✓  done: the change was made
+//!   ·  already: it was that way, since when and by whom
+//!   ⊘  refused: a safety rule stopped it, named
+//!   ✗  failed: the cause in a sentence and the next step as a command
+//! Short, plain sentences; never a raw error. The ledger remembers who did what, so a second press,
 //! an undo after a CLI unblock, or a block that's already in place can say
 //! so. See dist/RESPONSE-ACTIONS.md.
 
@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use hermian_core::Config;
+use hermian_core::{Config, ResponseAction};
 use serde::{Deserialize, Serialize};
 
 use crate::blocklist::{self, Blocked, NftError};
@@ -34,13 +34,14 @@ pub enum Mark {
 }
 
 impl Mark {
-    pub fn word(self) -> &'static str {
+    /// The sign a result line starts with (none for a note).
+    pub fn sign(self) -> &'static str {
         match self {
-            Mark::Done => "done",
-            Mark::Already => "already",
-            Mark::Refused => "refused",
-            Mark::Failed => "failed",
-            Mark::Note => "note",
+            Mark::Done => "✓",
+            Mark::Already => "·",
+            Mark::Refused => "⊘",
+            Mark::Failed => "✗",
+            Mark::Note => "",
         }
     }
 }
@@ -227,35 +228,30 @@ pub fn short(by: &str) -> &str {
 
 /// A failure as a sentence and a next step. Known causes get their own
 /// wording; anything else gets its first line and where the details are.
-pub fn explain(e: &anyhow::Error, doing: &str) -> String {
+/// `verb` is what was tried: "block", "unblock", "disconnect".
+pub fn explain(e: &anyhow::Error, verb: &str) -> String {
+    const DETAILS: &str = "Details: sudo journalctl -u hermian -n 50";
     if let Some(n) = e.downcast_ref::<NftError>() {
         return match n {
             NftError::Missing => format!(
-                "{} needs nftables, and nft isn't installed. Install it: sudo apt install nftables",
-                doing
+                "Couldn't {}: nftables isn't installed. Run: sudo apt install nftables",
+                verb
             ),
             NftError::Timeout(t) => format!(
-                "{} didn't finish within {}s. Check: sudo hermian blocked",
-                doing,
+                "Couldn't {}: nft didn't answer within {}s. Check: sudo hermian blocked",
+                verb,
                 t.as_secs()
             ),
-            NftError::Failed(m) => format!(
-                "{} failed, nft said: {}. Details: sudo journalctl -u hermian -n 50",
-                doing, m
-            ),
+            NftError::Failed(m) => format!("Couldn't {}: nft said \"{}\". {}", verb, m, DETAILS),
         };
     }
     let first = e.to_string();
     let first = first.lines().next().unwrap_or("").trim();
-    format!(
-        "{} failed: {}. Details: sudo journalctl -u hermian -n 50",
-        doing,
-        if first.is_empty() {
-            "no reason given"
-        } else {
-            first
-        }
-    )
+    if first.is_empty() {
+        format!("Couldn't {}. {}", verb, DETAILS)
+    } else {
+        format!("Couldn't {}: {}. {}", verb, first, DETAILS)
+    }
 }
 
 fn is_blocked(list: &[Blocked], key: &str) -> Option<String> {
@@ -268,12 +264,12 @@ fn is_blocked(list: &[Blocked], key: &str) -> Option<String> {
 /// the expiry alone (a second press is a duplicate, not a decision).
 pub fn block(ctx: &Ctx, ip: IpAddr) -> Line {
     if let Some(why) = blocklist::refusal(ip, ctx.cfg) {
-        return Line::new(Mark::Refused, format!("{}. Not blocked.", why));
+        return Line::new(Mark::Refused, format!("Not blocked: {}", why));
     }
     let (_, key) = blocklist::block_key(ip);
     let list = match ctx.host.blocked() {
         Ok(l) => l,
-        Err(e) => return Line::new(Mark::Failed, explain(&e, "Blocking")),
+        Err(e) => return Line::new(Mark::Failed, explain(&e, "block")),
     };
     if let Some(expires) = is_blocked(&list, &key) {
         let prev = ctx
@@ -284,17 +280,16 @@ pub fn block(ctx: &Ctx, ip: IpAddr) -> Line {
             Mark::Already,
             match prev {
                 Some(p) => format!(
-                    "{} was blocked at {} by {}, {}. Nothing changed.",
+                    "{} already blocked by {} at {}, {}",
                     key,
-                    at(ctx.now, p.at),
                     short(&p.by),
+                    at(ctx.now, p.at),
                     until(ctx.now, p.until.unwrap_or(ctx.now))
                 ),
-                None if !expires.is_empty() => format!(
-                    "{} is already blocked (expires in {}). Nothing changed.",
-                    key, expires
-                ),
-                None => format!("{} is already blocked. Nothing changed.", key),
+                None if !expires.is_empty() => {
+                    format!("{} already blocked, {} left", key, expires)
+                }
+                None => format!("{} already blocked", key),
             },
         );
     }
@@ -305,10 +300,10 @@ pub fn block(ctx: &Ctx, ip: IpAddr) -> Line {
             ctx.note("block", &key, Some(end));
             Line::new(
                 Mark::Done,
-                format!("Blocked {} {} ({}h).", key, until(ctx.now, end), hours),
+                format!("Blocked {} {}", key, until(ctx.now, end)),
             )
         }
-        Err(e) => Line::new(Mark::Failed, explain(&e, "Blocking")),
+        Err(e) => Line::new(Mark::Failed, explain(&e, "block")),
     }
 }
 
@@ -317,32 +312,29 @@ pub fn unblock(ctx: &Ctx, ip: IpAddr) -> Line {
     let (_, key) = blocklist::block_key(ip);
     let list = match ctx.host.blocked() {
         Ok(l) => l,
-        Err(e) => return Line::new(Mark::Failed, explain(&e, "Unblocking")),
+        Err(e) => return Line::new(Mark::Failed, explain(&e, "unblock")),
     };
     if is_blocked(&list, &key).is_none() {
         let lifted = ctx.ledger.last("unblock", &key);
         let blocked = ctx.ledger.last("block", &key);
         let why = match (lifted, blocked) {
             (Some(u), b) if b.as_ref().is_none_or(|b| u.at >= b.at) => {
-                format!(" (unblocked at {} by {})", at(ctx.now, u.at), short(&u.by))
+                format!(", lifted by {} at {}", short(&u.by), at(ctx.now, u.at))
             }
             (_, Some(b)) if b.until.is_some_and(|t| t <= ctx.now) => format!(
-                " (the block expired at {})",
+                ", the block expired at {}",
                 at(ctx.now, b.until.unwrap_or(ctx.now))
             ),
             _ => String::new(),
         };
-        return Line::new(
-            Mark::Already,
-            format!("{} isn't blocked{}. Nothing changed.", key, why),
-        );
+        return Line::new(Mark::Already, format!("{} isn't blocked{}", key, why));
     }
     match ctx.host.unblock(ip) {
         Ok(key) => {
             ctx.note("unblock", &key, None);
-            Line::new(Mark::Done, format!("Unblocked {}.", key))
+            Line::new(Mark::Done, format!("Unblocked {}", key))
         }
-        Err(e) => Line::new(Mark::Failed, explain(&e, "Unblocking")),
+        Err(e) => Line::new(Mark::Failed, explain(&e, "unblock")),
     }
 }
 
@@ -351,86 +343,122 @@ pub fn disconnect(ctx: &Ctx, source: IpAddr, port: Option<u16>, user: &str) -> L
     match ctx.host.disconnect(source, port) {
         Ok(d) => {
             ctx.note("disconnect", &source.to_string(), None);
-            Line::new(
-                Mark::Done,
-                format!(
-                    "Disconnected {} from {} ({} connection(s) ended).",
-                    if user.is_empty() { "the session" } else { user },
-                    source,
-                    d.connections
-                ),
-            )
+            let sessions = if d.connections > 1 {
+                format!(" ({} sessions)", d.connections)
+            } else {
+                String::new()
+            };
+            let text = if user.is_empty() {
+                format!("Disconnected {}{}", source, sessions)
+            } else {
+                format!("Disconnected {} from {}{}", user, source, sessions)
+            };
+            Line::new(Mark::Done, text)
         }
         Err(e) => match e.downcast_ref::<DisconnectError>() {
             Some(DisconnectError::NotConnected) => Line::new(
                 Mark::Already,
-                format!("Nobody from {} is connected now. Nothing changed.", source),
+                format!("Nobody from {} is connected", source),
             ),
             Some(DisconnectError::NoSshd) => Line::new(
                 Mark::Failed,
                 format!(
-                    "Couldn't end the session from {}: no sshd process held it. It may have \
+                    "Couldn't disconnect {}: no sshd process held the connection, it may have \
                      just closed. Check: who",
                     source
                 ),
             ),
-            None => Line::new(Mark::Failed, explain(&e, "Disconnecting")),
+            None => Line::new(Mark::Failed, explain(&e, "disconnect")),
         },
     }
 }
 
 /// What still lets them in after a disconnect, so nobody mistakes it for a
 /// lockout.
-pub fn after_disconnect(source: IpAddr, blocked: bool) -> Line {
-    let (_, key) = blocklist::block_key(source);
+pub fn after_disconnect(blocked: bool) -> Line {
     Line::new(
         Mark::Note,
         if blocked {
-            format!(
-                "The block covers {} only: the key or password they used still works from \
-                 another address.",
-                key
-            )
+            "Their key or password still works from other addresses."
         } else {
-            format!("Nothing stops {} from logging in again.", source)
+            "Nothing stops them logging back in."
         },
     )
 }
 
-/// The result message: the host, what was asked and by whom, then one line
-/// per target.
-pub fn render(host: &str, label: &str, by: &str, lines: &[Line]) -> String {
-    let mut out = format!("{} · {}, by {}", host, label, by);
+/// The result message: one line per target, then where, who and when.
+pub fn render(host: &str, by: &str, lines: &[Line], now: DateTime<Utc>) -> String {
+    let mut out = String::new();
     for l in lines {
-        out.push('\n');
-        out.push_str(l.mark.word());
-        out.push_str(": ");
+        if l.mark != Mark::Note {
+            out.push_str(l.mark.sign());
+            out.push(' ');
+        }
         out.push_str(&l.text);
+        out.push('\n');
     }
+    out.push_str(&format!(
+        "{} · {} · {}",
+        host,
+        short(by),
+        now.format("%H:%M UTC")
+    ));
     out
 }
 
-/// The overall outcome, for the label that replaces a used button.
-pub fn verdict(lines: &[Line]) -> &'static str {
+/// What the action did, in the past tense, for the label on the alert.
+fn done_as(a: &ResponseAction) -> String {
+    use ResponseAction as A;
+    match a {
+        A::Block { sources } if sources.len() == 1 => format!("Blocked {}", sources[0]),
+        A::Block { sources } => format!("Blocked {}", sources.len()),
+        A::Unblock { sources } if sources.len() == 1 => format!("Unblocked {}", sources[0]),
+        A::Unblock { .. } => "Unblocked".to_string(),
+        A::Disconnect { block: true, .. } => "Disconnected and blocked".to_string(),
+        A::Disconnect { .. } => "Disconnected".to_string(),
+        A::Ignore { hours, sources } if *hours > 0 && !sources.is_empty() => {
+            format!("Ignored for {}h", hours)
+        }
+        A::Ignore { .. } => "Ignored".to_string(),
+        A::SnoozeRootPasswordWarning { days } => format!("Snoozed {} days", days),
+    }
+}
+
+/// The label a used button becomes: "✓ Blocked 203.0.113.24 · @op 14:02 UTC".
+pub fn summary(a: &ResponseAction, lines: &[Line], by: &str, now: DateTime<Utc>) -> String {
     let marks: Vec<Mark> = lines
         .iter()
         .map(|l| l.mark)
         .filter(|m| *m != Mark::Note)
         .collect();
     let all = |m: Mark| !marks.is_empty() && marks.iter().all(|x| *x == m);
-    if all(Mark::Done) {
-        "done"
+    let head = if all(Mark::Done) {
+        format!("✓ {}", done_as(a))
     } else if all(Mark::Already) {
-        "already"
+        "· Already the case".to_string()
     } else if all(Mark::Refused) {
-        "refused"
+        "⊘ Refused".to_string()
     } else if all(Mark::Failed) {
-        "failed"
+        "✗ Failed".to_string()
     } else if marks.contains(&Mark::Done) {
-        "partly done"
+        "◐ Partly done".to_string()
     } else {
-        "not done"
-    }
+        "✗ Not done".to_string()
+    };
+    format!("{} · {} {}", head, short(by), now.format("%H:%M UTC"))
+}
+
+/// Whether the result is worth its own message under the alert. Choices
+/// that change nothing on the host (Ignore, Snooze) only update the label,
+/// unless something was refused or failed.
+pub fn needs_reply(a: &ResponseAction, lines: &[Line]) -> bool {
+    use ResponseAction as A;
+    matches!(
+        a,
+        A::Block { .. } | A::Unblock { .. } | A::Disconnect { .. }
+    ) || lines
+        .iter()
+        .any(|l| matches!(l.mark, Mark::Refused | Mark::Failed))
 }
 
 /// `hermian block <ip>...`: the CLI twin of the Block button.
@@ -461,7 +489,7 @@ pub fn cmd_disconnect(ip: &str) -> Result<()> {
     let done = line.mark == Mark::Done;
     let mut lines = vec![line];
     if done {
-        lines.push(after_disconnect(ips[0], false));
+        lines.push(after_disconnect(false));
     }
     finish_cli(lines)
 }
@@ -493,7 +521,11 @@ fn parse_ips(raw: &[String]) -> Result<Vec<IpAddr>> {
 fn finish_cli(lines: Vec<Line>) -> Result<()> {
     let st = crate::ui::Style::detect();
     for l in &lines {
-        let text = format!("{}: {}", l.mark.word(), l.text);
+        let text = if l.mark == Mark::Note {
+            format!("  {}", l.text)
+        } else {
+            format!("{} {}", l.mark.sign(), l.text)
+        };
         println!(
             "{}",
             match l.mark {
@@ -599,10 +631,7 @@ mod tests {
             ip("203.0.113.24"),
         );
         assert_eq!(first.mark, Mark::Done);
-        assert_eq!(
-            first.text,
-            "Blocked 203.0.113.24 until 14:02 UTC tomorrow (24h)."
-        );
+        assert_eq!(first.text, "Blocked 203.0.113.24 until 14:02 UTC tomorrow");
         let second = block(
             &ctx(&host, &ledger, &cfg, "@bob (id 7)", t(14, 30)),
             ip("203.0.113.24"),
@@ -610,7 +639,7 @@ mod tests {
         assert_eq!(second.mark, Mark::Already);
         assert_eq!(
             second.text,
-            "203.0.113.24 was blocked at 14:02 UTC by @op, until 14:02 UTC tomorrow. Nothing changed."
+            "203.0.113.24 already blocked by @op at 14:02 UTC, until 14:02 UTC tomorrow"
         );
         assert_eq!(*host.block_calls.borrow(), 1, "the timer wasn't restarted");
     }
@@ -627,7 +656,7 @@ mod tests {
             ip("203.0.113.24"),
         );
         assert_eq!(l.mark, Mark::Already);
-        assert!(l.text.contains("expires in 3h12m"), "{}", l.text);
+        assert_eq!(l.text, "203.0.113.24 already blocked, 3h12m left");
     }
 
     #[test]
@@ -640,7 +669,7 @@ mod tests {
         assert_eq!(l.mark, Mark::Refused);
         assert_eq!(
             l.text,
-            "10.0.0.5 is inside your management network 10.0.0.0/8 (response.management_cidrs). Not blocked."
+            "Not blocked: 10.0.0.5 is inside your management network 10.0.0.0/8 (response.management_cidrs)"
         );
         assert_eq!(*host.block_calls.borrow(), 0);
     }
@@ -658,7 +687,10 @@ mod tests {
             ip("203.0.113.24"),
         );
         assert_eq!(l.mark, Mark::Failed);
-        assert!(l.text.contains("sudo apt install nftables"), "{}", l.text);
+        assert_eq!(
+            l.text,
+            "Couldn't block: nftables isn't installed. Run: sudo apt install nftables"
+        );
         let slow = Fake {
             nft: Some(NftError::Timeout(std::time::Duration::from_secs(10))),
             ..Fake::default()
@@ -669,7 +701,7 @@ mod tests {
         );
         assert!(
             l.text
-                .contains("didn't finish within 10s. Check: sudo hermian blocked"),
+                .contains("nft didn't answer within 10s. Check: sudo hermian blocked"),
             "{}",
             l.text
         );
@@ -694,7 +726,7 @@ mod tests {
         assert_eq!(undo.mark, Mark::Already);
         assert_eq!(
             undo.text,
-            "203.0.113.24 isn't blocked (unblocked at 15:10 UTC by the CLI). Nothing changed."
+            "203.0.113.24 isn't blocked, lifted by the CLI at 15:10 UTC"
         );
     }
 
@@ -713,7 +745,7 @@ mod tests {
         );
         assert_eq!(l.mark, Mark::Already);
         assert!(
-            l.text.contains("(the block expired at 01:00 UTC)"),
+            l.text.ends_with(", the block expired at 01:00 UTC"),
             "{}",
             l.text
         );
@@ -733,10 +765,7 @@ mod tests {
             "root",
         );
         assert_eq!(l.mark, Mark::Already);
-        assert_eq!(
-            l.text,
-            "Nobody from 203.0.113.24 is connected now. Nothing changed."
-        );
+        assert_eq!(l.text, "Nobody from 203.0.113.24 is connected");
         let odd = Fake {
             disconnect: Some(DisconnectError::NoSshd),
             ..Fake::default()
@@ -748,7 +777,11 @@ mod tests {
             "root",
         );
         assert_eq!(l.mark, Mark::Failed);
-        assert!(l.text.contains("It may have just closed. Check: who"));
+        assert!(
+            l.text.contains("it may have just closed. Check: who"),
+            "{}",
+            l.text
+        );
         let ok = Fake::default();
         let l = disconnect(
             &ctx(&ok, &ledger, &cfg, "@op (id 42)", t(9, 0)),
@@ -756,13 +789,10 @@ mod tests {
             Some(4),
             "root",
         );
-        assert_eq!(
-            l.text,
-            "Disconnected root from 203.0.113.24 (1 connection(s) ended)."
-        );
-        assert!(after_disconnect(ip("203.0.113.24"), true)
+        assert_eq!(l.text, "Disconnected root from 203.0.113.24");
+        assert!(after_disconnect(true)
             .text
-            .contains("still works from another address"));
+            .contains("still works from other addresses"));
     }
 
     #[test]
@@ -776,7 +806,7 @@ mod tests {
             anyhow::anyhow!(""),
         ];
         for e in &errors {
-            let s = explain(e, "Blocking");
+            let s = explain(e, "block");
             assert!(!s.starts_with("Error"), "{}", s);
             assert!(
                 !s.contains("Os {") && !s.contains("anyhow") && !s.contains("Kind("),
@@ -789,23 +819,56 @@ mod tests {
     }
 
     #[test]
-    fn the_result_names_the_host_and_one_line_per_target() {
+    fn the_result_is_one_line_per_target_then_where_who_and_when() {
         let lines = vec![
-            Line::new(
-                Mark::Done,
-                "Blocked 203.0.113.24 until 14:02 UTC tomorrow (24h).",
-            ),
-            Line::new(Mark::Failed, "Couldn't end the session."),
+            Line::new(Mark::Done, "Blocked 203.0.113.24 until 14:02 UTC tomorrow"),
+            Line::new(Mark::Failed, "Couldn't disconnect 203.0.113.24: ..."),
+            after_disconnect(true),
         ];
-        let text = render("web-01", "Disconnect and block", "@op (id 42)", &lines);
+        let text = render("web-01", "@op (id 42)", &lines, t(14, 2));
         assert_eq!(
             text,
-            "web-01 · Disconnect and block, by @op (id 42)\n\
-             done: Blocked 203.0.113.24 until 14:02 UTC tomorrow (24h).\n\
-             failed: Couldn't end the session."
+            "✓ Blocked 203.0.113.24 until 14:02 UTC tomorrow\n\
+             ✗ Couldn't disconnect 203.0.113.24: ...\n\
+             Their key or password still works from other addresses.\n\
+             web-01 · @op · 14:02 UTC"
         );
-        assert_eq!(verdict(&lines), "partly done");
-        assert_eq!(verdict(&lines[..1]), "done");
+        let d = ResponseAction::Disconnect {
+            source: ip("203.0.113.24"),
+            port: None,
+            user: "root".into(),
+            block: true,
+        };
+        assert_eq!(
+            summary(&d, &lines, "@op (id 42)", t(14, 2)),
+            "◐ Partly done · @op 14:02 UTC"
+        );
+        assert_eq!(
+            summary(&d, &lines[..1], "@op (id 42)", t(14, 2)),
+            "✓ Disconnected and blocked · @op 14:02 UTC"
+        );
+    }
+
+    #[test]
+    fn ignore_only_updates_the_label_unless_something_went_wrong() {
+        let ignore = ResponseAction::Ignore {
+            sources: vec![],
+            hours: 0,
+        };
+        let block = ResponseAction::Block {
+            sources: vec![ip("203.0.113.24")],
+        };
+        let done = vec![Line::new(Mark::Done, "Ignored")];
+        assert!(!needs_reply(&ignore, &done));
+        assert!(needs_reply(&block, &done));
+        assert!(needs_reply(
+            &ignore,
+            &[Line::new(Mark::Failed, "Couldn't ignore")]
+        ));
+        assert_eq!(
+            summary(&ignore, &done, "@op (id 42)", t(9, 22)),
+            "✓ Ignored · @op 09:22 UTC"
+        );
     }
 
     #[test]

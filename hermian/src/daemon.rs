@@ -709,21 +709,27 @@ fn handle_action(
     let undo_mins = (cfg.response.block_duration_hours.max(1) * 60).min(1440);
     let conclude =
         move |req: tgbot::ActionRequest, lines: Vec<Line>, undo: Vec<std::net::IpAddr>| {
-            let text = actions::render(&host, &req.action.label(), &req.by, &lines);
-            log_daemon(Severity::High, &text.replace('\n', "; "));
+            let now = Utc::now();
+            let text = actions::render(&host, &req.by, &lines, now);
+            log_daemon(
+                Severity::High,
+                &format!("{}: {}", req.action.label(), text.replace('\n', "; ")),
+            );
+            let summary = actions::summary(&req.action, &lines, &req.by, now);
+            let reply = actions::needs_reply(&req.action, &lines);
             let undo = (!undo.is_empty()).then_some((A::Unblock { sources: undo }, undo_mins));
-            tgbot::finish(&tg, &req, &text, actions::verdict(&lines), undo, Utc::now());
+            tgbot::finish(&tg, &req, &text, &summary, reply, undo, now);
         };
     match req.action.clone() {
         A::Ignore { sources, hours } => {
             let line = if sources.is_empty() || hours == 0 {
-                Line::new(Mark::Done, "Ignored. Nothing else changes.")
+                Line::new(Mark::Done, "Ignored")
             } else {
                 engine.ignore_sources(&sources, now + chrono::Duration::hours(i64::from(hours)));
                 Line::new(
                     Mark::Done,
                     format!(
-                        "Not reporting {} source(s) for {}h. Logins from them still alert.",
+                        "Ignoring {} source(s) for {}h; logins from them still alert",
                         sources.len(),
                         hours
                     ),
@@ -736,7 +742,7 @@ fn handle_action(
             save_engine_state(engine);
             let line = Line::new(
                 Mark::Done,
-                format!("The root password warning is snoozed for {} days.", days),
+                format!("Root password warning snoozed for {} days", days),
             );
             tokio::task::spawn_blocking(move || conclude(req, vec![line], Vec::new()));
         }
@@ -795,7 +801,7 @@ fn handle_action(
                 let ended = d.mark == Mark::Done;
                 lines.push(d);
                 if ended {
-                    lines.push(actions::after_disconnect(source, blocked));
+                    lines.push(actions::after_disconnect(blocked));
                 }
                 conclude(req.clone(), lines, undo);
             });

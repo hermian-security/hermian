@@ -59,8 +59,13 @@ pub enum Step {
         at: DateTime<Utc>,
         note: String,
     },
-    /// Shows a result or a hint when pressed; does nothing else.
-    Label { text: String },
+    /// Shows `text` (a result or a hint) when pressed; does nothing else.
+    /// `shown` is what the button itself reads.
+    Label {
+        text: String,
+        #[serde(default)]
+        shown: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +310,7 @@ fn add_label(
             message_id: like.message_id,
             step: Step::Label {
                 text: text.to_string(),
+                shown: shown.to_string(),
             },
         },
     );
@@ -312,15 +318,13 @@ fn add_label(
 }
 
 /// What an expired button says: how long they last, and the command that
-/// does the same thing now.
-fn expired_text(a: &ResponseAction, ttl_mins: u32) -> String {
-    let head = format!(
-        "expired: buttons last {} minutes (action_ttl_mins).",
-        ttl_mins
-    );
-    match a.cli_twin() {
-        Some(cmd) => format!("{} To do it now: {}", head, cmd),
-        None => format!("{} Nothing was done.", head),
+/// does the same thing from the host.
+fn expired_text(hints: &[String], ttl_mins: u32) -> String {
+    let head = format!("Expired (buttons last {} min).", ttl_mins);
+    if hints.is_empty() {
+        format!("{} Nothing was done.", head)
+    } else {
+        format!("{} From the host: {}", head, hints.join("  |  "))
     }
 }
 
@@ -356,15 +360,7 @@ fn expire_alert(
     s.retain(|_, p| {
         !(p.alert_ref == alert_ref && matches!(p.step, Step::Confirm { .. } | Step::Cancel { .. }))
     });
-    let text = if hints.is_empty() {
-        expired_text(&first.action, ttl_mins)
-    } else {
-        format!(
-            "expired: buttons last {} minutes (action_ttl_mins). To do it now: {}",
-            ttl_mins,
-            hints.join("  |  ")
-        )
-    };
+    let text = expired_text(&hints, ttl_mins);
     let mut kb = labels_of(s, alert_ref);
     kb.push(add_label(s, &first, "Buttons expired", &text, now));
     Some((mid, kb))
@@ -376,25 +372,19 @@ fn labels_of(s: &HashMap<String, Pending>, alert_ref: &str) -> Vec<(String, Stri
         .iter()
         .filter(|(_, p)| p.alert_ref == alert_ref)
         .filter_map(|(id, p)| match &p.step {
-            Step::Label { text } if !text.starts_with("expired:") => {
-                Some((p.expires, format!("{}{}", PREFIX, id), label_line(text)))
+            Step::Label { text, shown } if !text.starts_with("Expired") => {
+                let shown = if shown.is_empty() {
+                    text.lines().next().unwrap_or("").to_string()
+                } else {
+                    shown.clone()
+                };
+                Some((p.expires, format!("{}{}", PREFIX, id), shown))
             }
             _ => None,
         })
         .collect();
     v.sort();
     v.into_iter().map(|(_, d, l)| (d, l)).collect()
-}
-
-/// The label a result shows on its button: its first line after the header.
-fn label_line(text: &str) -> String {
-    text.lines()
-        .nth(1)
-        .or_else(|| text.lines().next())
-        .unwrap_or("")
-        .chars()
-        .take(60)
-        .collect()
 }
 
 /// The alert reference in a message's text, for the "details" hint.
@@ -486,15 +476,15 @@ fn decide(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome
         .or_else(|| cq["message"]["message_id"].as_i64());
     let label = p.action.label();
     match &p.step {
-        Step::Used { by, at: when, note } => {
+        Step::Used { by, note, .. } => {
             let text = if *by == who {
-                format!("already: you pressed this at {}. {}", at(now, *when), note)
+                format!("You did this: {}", note)
             } else {
-                format!("already handled: {}. Your press wasn't applied.", note)
+                format!("Already handled: {}. Yours wasn't applied.", note)
             };
             return (text, none());
         }
-        Step::Label { text } => return (text.clone(), none()),
+        Step::Label { text, .. } => return (text.clone(), none()),
         _ => {}
     }
     if p.expires <= now {
@@ -517,7 +507,10 @@ fn decide(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome
         let keyboard = expire_alert(&mut s, &p.alert_ref, cfg.action_ttl_mins, now);
         save(&s);
         return (
-            expired_text(&p.action, cfg.action_ttl_mins),
+            expired_text(
+                &p.action.cli_twin().into_iter().collect::<Vec<_>>(),
+                cfg.action_ttl_mins,
+            ),
             Outcome {
                 request: None,
                 keyboard,
@@ -600,7 +593,7 @@ fn decide(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome
     if let Step::Used { note, .. } = &offer.step {
         save(&s);
         return (
-            format!("already handled: {}. Your press wasn't applied.", note),
+            format!("Already handled: {}. Yours wasn't applied.", note),
             none(),
         );
     }
@@ -610,7 +603,7 @@ fn decide(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome
         note,
     };
     let keep_until = now + chrono::Duration::hours(KEEP_HOURS);
-    let note = format!("{} chose \"{}\" at {}", short(&who), label, at(now, now));
+    let note = format!("{} chose {} at {}", short(&who), label, at(now, now));
     if let Some(o) = s.get_mut(&offer_id) {
         o.step = used(note.clone());
         o.expires = keep_until;
@@ -640,11 +633,7 @@ fn decide(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome
         message_id,
     };
     (
-        format!(
-            "{} on {}: working on it.",
-            label,
-            crate::procsrc::hostname()
-        ),
+        format!("On it: {} on {}", label, crate::procsrc::hostname()),
         Outcome {
             request: Some(req),
             keyboard,
@@ -665,7 +654,7 @@ fn result_keyboard(
 ) -> Vec<(String, String)> {
     // Later presses on the buttons this choice used or retired quote the
     // outcome instead of "chose ...".
-    let chose = format!("{} chose \"{}\"", short(&req.by), req.action.label());
+    let chose = format!("{} chose {}", short(&req.by), req.action.label());
     for o in s.values_mut() {
         if o.alert_ref == req.alert_ref {
             if let Step::Used { note, .. } = &mut o.step {
@@ -710,33 +699,25 @@ fn result_keyboard(
     kb
 }
 
-/// "Block 203.0.113.24: done · @op 14:02 UTC", the label a result leaves.
-fn summary_of(req: &ActionRequest, verdict: &str, now: DateTime<Utc>) -> String {
-    format!(
-        "{}: {} · {} {}",
-        req.action.label(),
-        verdict,
-        short(&req.by),
-        now.format("%H:%M UTC")
-    )
-}
-
-/// After the daemon carried out a press: the result is posted as a reply to
-/// the alert, and the alert's keyboard shows it (see `result_keyboard`).
+/// After the daemon carried out a press: the alert's keyboard shows the
+/// outcome (see `result_keyboard`), and with `reply` the full result is
+/// also posted under the alert.
 pub fn finish(
     cfg: &TelegramCfg,
     req: &ActionRequest,
     text: &str,
-    verdict: &str,
+    summary: &str,
+    reply: bool,
     undo: Option<(ResponseAction, u32)>,
     now: DateTime<Utc>,
 ) {
-    let summary = summary_of(req, verdict, now);
     let kb = match store().lock() {
-        Ok(mut s) => result_keyboard(&mut s, req, text, &summary, undo, now),
+        Ok(mut s) => result_keyboard(&mut s, req, text, summary, undo, now),
         Err(_) => Vec::new(),
     };
-    report(cfg, req.message_id, text);
+    if reply {
+        report(cfg, req.message_id, text);
+    }
     if let Some(mid) = req.message_id {
         edit_keyboard(cfg, mid, &kb);
     }
@@ -1085,7 +1066,7 @@ mod tests {
         // One-time, and a second press says so.
         let (msg, out) = handle_callback(&press(data, 42, -1001), &cfg(), now);
         assert!(out.request.is_none(), "{}", msg);
-        assert!(msg.starts_with("already: you pressed this at"), "{}", msg);
+        assert!(msg.starts_with("You did this: @op chose Block"), "{}", msg);
     }
 
     #[test]
@@ -1204,7 +1185,7 @@ mod tests {
             "the other button went with the choice"
         );
         assert!(
-            msg.starts_with("already handled: @op chose \"Disconnect and block\""),
+            msg.starts_with("Already handled: @op chose Disconnect and block"),
             "{}",
             msg
         );
@@ -1220,7 +1201,8 @@ mod tests {
         );
         let later = now + chrono::Duration::minutes(2);
         let (msg, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), later);
-        assert!(out.request.is_none() && msg.contains("expired"), "{}", msg);
+        assert!(out.request.is_none(), "{}", msg);
+        assert_eq!(msg, "Expired (buttons last 15 min). Nothing was done.");
     }
 
     #[test]
@@ -1488,7 +1470,7 @@ mod tests {
         assert!(out.request.is_none());
         assert_eq!(
             msg,
-            "expired: buttons last 15 minutes (action_ttl_mins). To do it now: sudo hermian block 198.51.100.7"
+            "Expired (buttons last 15 min). From the host: sudo hermian block 198.51.100.7"
         );
         let (mid, kb) = out.keyboard.expect("keyboard tidied");
         assert_eq!(mid, 70);
@@ -1535,15 +1517,15 @@ mod tests {
         );
         attach_message(&b, 72);
         let req = req_for(&b[0].0, now);
-        let text = "web-01 · Block 198.51.100.7, by @op (id 42)\ndone: Blocked 198.51.100.7 until 14:02 UTC tomorrow (24h).";
-        let summary = summary_of(&req, "done", now);
+        let text = "✓ Blocked 198.51.100.7 until 14:02 UTC tomorrow\nweb-01 · @op · 14:02 UTC";
+        let summary = "✓ Blocked 198.51.100.7 · @op 14:02 UTC";
         let kb = {
             let mut s = store().lock().unwrap();
             result_keyboard(
                 &mut s,
                 &req,
                 text,
-                &summary,
+                summary,
                 Some((
                     ResponseAction::Unblock {
                         sources: vec![ip("198.51.100.7")],
@@ -1554,18 +1536,14 @@ mod tests {
             )
         };
         assert_eq!(kb.len(), 2, "{:?}", kb);
-        assert!(
-            kb[0].1.starts_with("Block 198.51.100.7: done · @op "),
-            "{}",
-            kb[0].1
-        );
+        assert_eq!(kb[0].1, summary);
         assert_eq!(kb[1].1, "Undo: unblock 198.51.100.7");
         // The label shows the whole result.
         let (msg, _) = handle_callback(&press(&kb[0].0, 42, -1001), &cfg(), now);
-        assert!(msg.contains("done: Blocked 198.51.100.7"), "{}", msg);
+        assert!(msg.starts_with("✓ Blocked 198.51.100.7"), "{}", msg);
         // The used button now quotes the outcome.
         let (msg, _) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
-        assert!(msg.contains(": done · @op"), "{}", msg);
+        assert_eq!(msg, format!("You did this: {}", summary));
         // Undo needs no confirmation.
         let (_, out) = handle_callback(&press(&kb[1].0, 42, -1001), &cfg(), now);
         assert!(matches!(
@@ -1638,7 +1616,10 @@ mod tests {
                 at: now,
                 note: "x".into(),
             },
-            Step::Label { text: "y".into() },
+            Step::Label {
+                text: "y".into(),
+                shown: "z".into(),
+            },
         ]
         .into_iter()
         .enumerate()
