@@ -17,7 +17,8 @@ library injected into a privileged process, a debugger attached to one.
 
 **Fires when** a setuid or setgid executable appears in a user-writable tree:
 `/tmp`, `/dev/shm`, `/var/tmp`, `/home`, `/root`, `/var/www`, `/srv`, `/opt`.
-A sweep looks for them every 20 seconds, four levels deep.
+A sweep looks for them four levels deep: every 20 seconds in `/tmp`, `/dev/shm`
+and `/var/tmp`, every minute in the others.
 
 **Why** A setuid copy of a shell is the oldest way to keep root. Vendor
 software installs setuid helpers under `/opt` (Chrome's `chrome-sandbox`), so

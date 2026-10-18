@@ -18,10 +18,14 @@ use tokio::sync::mpsc;
 
 use crate::procsrc;
 
-/// Directories swept for setuid/setgid/capability executables. Depth-limited
-/// so a large home directory cannot turn the sweep into a filesystem crawl.
-const SUID_SWEEP_ROOTS: &[&str] = &[
-    "/tmp", "/var/tmp", "/dev/shm", "/home", "/root", "/var/www", "/srv", "/opt",
+/// Directories swept for setuid/setgid/capability executables, with how many
+/// sweeps go by between two walks of each. Transient directories, where a
+/// dropped binary usually lands, every sweep; homes and service trees, which
+/// can hold tens of thousands of entries, every third. Depth-limited so a
+/// large home directory cannot turn the sweep into a filesystem crawl.
+const SUID_SWEEP_ROOTS: &[(&[&str], u32)] = &[
+    (&["/tmp", "/var/tmp", "/dev/shm"], 1),
+    (&["/home", "/root", "/var/www", "/srv", "/opt"], 3),
 ];
 const SUID_SWEEP_DEPTH: usize = 4;
 const SUID_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
@@ -41,14 +45,15 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, u64, u64)>) {
         return;
     };
     for e in rd.flatten() {
-        let Ok(md) = e.metadata() else {
+        // The entry's type comes with the directory listing: only regular
+        // files need a stat for their mode.
+        let Ok(ft) = e.file_type() else {
             continue;
         };
-        let p = e.path();
-        if md.file_type().is_symlink() {
+        if ft.is_symlink() {
             continue;
         }
-        if md.is_dir() {
+        if ft.is_dir() {
             // Skip huge/noisy trees that never legitimately hold setuid files.
             let name = e.file_name();
             let name = name.to_string_lossy();
@@ -65,60 +70,89 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, u64, u64)>) {
             ) {
                 continue;
             }
-            walk(&p, depth - 1, out);
-        } else if md.is_file() && md.permissions().mode() & (libc::S_ISUID | libc::S_ISGID) != 0 {
-            out.push((p.to_string_lossy().into_owned(), md.dev(), md.ino()));
+            walk(&e.path(), depth - 1, out);
+        } else if ft.is_file() {
+            let Ok(md) = e.metadata() else {
+                continue;
+            };
+            if md.permissions().mode() & (libc::S_ISUID | libc::S_ISGID) != 0 {
+                out.push((e.path().to_string_lossy().into_owned(), md.dev(), md.ino()));
+            }
         }
     }
 }
 
+fn scan_roots(roots: &[&str]) -> Vec<(String, u64, u64)> {
+    let mut out = Vec::new();
+    for root in roots {
+        walk(Path::new(root), SUID_SWEEP_DEPTH, &mut out);
+    }
+    out
+}
+
+/// Setuid files in `current` that `known` hasn't seen; `known` becomes `current`.
+fn newly_privileged(
+    known: &mut HashSet<(u64, u64)>,
+    current: Vec<(String, u64, u64)>,
+) -> Vec<(String, u64, u64)> {
+    let now_known: HashSet<(u64, u64)> = current.iter().map(|(_, d, i)| (*d, *i)).collect();
+    let new = current
+        .into_iter()
+        .filter(|(_, d, i)| !known.contains(&(*d, *i)))
+        .collect();
+    *known = now_known;
+    new
+}
+
 fn suid_sweep_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
-    let scan = || {
-        let mut out = Vec::new();
-        for root in SUID_SWEEP_ROOTS {
-            walk(Path::new(root), SUID_SWEEP_DEPTH, &mut out);
-        }
-        out
-    };
     // Whatever exists at start is pre-existing; only new appearances alert.
-    let mut known: HashSet<(u64, u64)> = scan().into_iter().map(|(_, d, i)| (d, i)).collect();
+    // Each group keeps its own: a group not walked this round keeps what it knew.
+    let mut known: Vec<HashSet<(u64, u64)>> = SUID_SWEEP_ROOTS
+        .iter()
+        .map(|(roots, _)| {
+            scan_roots(roots)
+                .into_iter()
+                .map(|(_, d, i)| (d, i))
+                .collect()
+        })
+        .collect();
+    let mut round: u32 = 0;
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(SUID_SWEEP_INTERVAL);
-        let current = scan();
-        let mut now_known = HashSet::with_capacity(current.len());
-        for (path, dev, ino) in current {
-            now_known.insert((dev, ino));
-            if known.contains(&(dev, ino)) {
+        round = round.wrapping_add(1);
+        for (g, (roots, every)) in SUID_SWEEP_ROOTS.iter().enumerate() {
+            if !round.is_multiple_of(*every) {
                 continue;
             }
-            let writer = procsrc::pid_for_path(&path).map(|(pid, comm, exe, uid, tty_nr)| {
-                hermian_core::WriterInfo {
-                    pid,
-                    uid,
-                    comm,
-                    exe,
-                    tty_nr,
+            for (path, dev, ino) in newly_privileged(&mut known[g], scan_roots(roots)) {
+                let writer = procsrc::pid_for_path(&path).map(|(pid, comm, exe, uid, tty_nr)| {
+                    hermian_core::WriterInfo {
+                        pid,
+                        uid,
+                        comm,
+                        exe,
+                        tty_nr,
+                    }
+                });
+                let ev = FileEvent {
+                    ts: chrono::Utc::now(),
+                    kind: FileKind::Created,
+                    dev,
+                    ino,
+                    writer,
+                    session_present: false,
+                    is_suid: true,
+                    has_file_caps: procsrc::has_file_capabilities(&path),
+                    content: None,
+                    container: false,
+                    managed_by_package: None,
+                    path,
+                };
+                if tx.blocking_send(Event::File(ev)).is_err() {
+                    return;
                 }
-            });
-            let ev = FileEvent {
-                ts: chrono::Utc::now(),
-                kind: FileKind::Created,
-                dev,
-                ino,
-                writer,
-                session_present: false,
-                is_suid: true,
-                has_file_caps: procsrc::has_file_capabilities(&path),
-                content: None,
-                container: false,
-                managed_by_package: None,
-                path,
-            };
-            if tx.blocking_send(Event::File(ev)).is_err() {
-                return;
             }
         }
-        known = now_known;
     }
 }
 
@@ -241,5 +275,63 @@ fn listener_poller_loop(
             let _ = closed_tx.blocking_send(gone.clone());
         }
         known = current;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_finds_setuid_files_and_skips_symlinks_and_caches() {
+        let d = std::env::temp_dir().join(format!("hermian-suid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::create_dir_all(d.join("node_modules")).unwrap();
+        let set_uid = |p: &Path| {
+            std::fs::write(p, b"x").unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        };
+        set_uid(&d.join("a/b/sh"));
+        set_uid(&d.join("node_modules/sh"));
+        std::fs::write(d.join("plain"), b"x").unwrap();
+        std::os::unix::fs::symlink(d.join("a"), d.join("link")).unwrap();
+
+        let found = scan_roots(&[d.to_str().unwrap()]);
+        let paths: Vec<&str> = found.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(paths, vec![d.join("a/b/sh").to_str().unwrap()]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_new_setuid_files_are_reported() {
+        let f = |n: u64| (format!("/tmp/{}", n), 1, n);
+        let mut known: HashSet<(u64, u64)> = [(1, 1)].into_iter().collect();
+        let new = newly_privileged(&mut known, vec![f(1), f(2)]);
+        assert_eq!(new, vec![f(2)]);
+        assert!(newly_privileged(&mut known, vec![f(1), f(2)]).is_empty());
+        // Removed, then back: reported again.
+        assert!(newly_privileged(&mut known, vec![f(1)]).is_empty());
+        assert_eq!(newly_privileged(&mut known, vec![f(1), f(2)]), vec![f(2)]);
+    }
+
+    #[test]
+    fn transient_directories_are_swept_every_round() {
+        let tmp = SUID_SWEEP_ROOTS
+            .iter()
+            .find(|(roots, _)| roots.contains(&"/tmp"))
+            .unwrap();
+        assert_eq!(tmp.1, 1);
+        for root in ["/dev/shm", "/var/tmp", "/home", "/root"] {
+            assert!(
+                SUID_SWEEP_ROOTS.iter().any(|(r, _)| r.contains(&root)),
+                "{}",
+                root
+            );
+        }
+        // Homes at least once a minute.
+        assert!(SUID_SWEEP_ROOTS
+            .iter()
+            .all(|(_, every)| SUID_SWEEP_INTERVAL * *every <= Duration::from_secs(60)));
     }
 }

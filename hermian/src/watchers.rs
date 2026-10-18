@@ -209,7 +209,7 @@ impl Watches {
     }
 
     fn refresh(&mut self) {
-        for p in WATCH_FILES.iter().chain(WATCH_DIRS.iter()) {
+        for p in direct_watch_files().chain(WATCH_DIRS.iter().copied()) {
             self.add(Path::new(p));
         }
         // Vendor units on hosts where /lib isn't a symlink to /usr/lib (on
@@ -235,6 +235,18 @@ impl Watches {
         }
         self.add(&config_path);
     }
+}
+
+/// Files watched directly, besides their directory. Not the ones hidden from
+/// the daemon: in its namespace /etc/ld.so.preload is /dev/null, so a watch
+/// on it fired on every write to /dev/null on the host, each one costing a
+/// scan of every process's fds. Their directory's watch still sees the
+/// host's file change.
+fn direct_watch_files() -> impl Iterator<Item = &'static str> {
+    WATCH_FILES
+        .iter()
+        .copied()
+        .filter(|p| !procsrc::HIDDEN_FROM_DAEMON.contains(p))
 }
 
 /// Enough of a file's metadata to tell that it changed: inode, mtime, size.
@@ -389,6 +401,15 @@ struct Pending {
     kind: FileKind,
     writer: Option<WriterInfo>,
     is_config: bool,
+    /// The writer was looked up again after first sight.
+    retried: bool,
+}
+
+/// Look for the writer once more if first sight found none. Only once: each
+/// lookup reads every fd of every process (hundreds of ms on a host with a
+/// JVM or a database), and a burst can carry hundreds of events.
+fn retry_writer_lookup(p: &Pending, kind: FileKind) -> bool {
+    p.writer.is_none() && !p.retried && !matches!(kind, FileKind::Removed | FileKind::MovedFrom)
 }
 
 fn watcher_loop(
@@ -483,12 +504,12 @@ fn watcher_loop(
                         // Attribute at first sight while the fd is likely open.
                         writer: lookup_writer(&full_s),
                         is_config,
+                        retried: false,
                     });
                     entry.last = now;
                     entry.kind = merge_kind(entry.kind, kind);
-                    if entry.writer.is_none()
-                        && !matches!(kind, FileKind::Removed | FileKind::MovedFrom)
-                    {
+                    if retry_writer_lookup(entry, kind) {
+                        entry.retried = true;
                         entry.writer = lookup_writer(&full_s);
                     }
                 }
@@ -518,6 +539,7 @@ fn watcher_loop(
                     kind: *kind,
                     writer,
                     is_config,
+                    retried: false,
                 });
             }
             known = fresh;
@@ -629,6 +651,7 @@ fn adopt_new_dir(
             kind: FileKind::Created,
             writer: lookup_writer(&path_s),
             is_config,
+            retried: false,
         });
     }
 }
@@ -861,5 +884,39 @@ mod tests {
         assert_eq!(merge_kind(Modified, MovedTo), MovedTo);
         assert_eq!(merge_kind(Created, Removed), Removed);
         assert_eq!(merge_kind(Removed, Created), Created);
+    }
+
+    #[test]
+    fn files_hidden_from_the_daemon_are_watched_through_their_directory() {
+        // In the daemon's namespace these are /dev/null: a direct watch fires
+        // on every write to /dev/null on the host.
+        for p in procsrc::HIDDEN_FROM_DAEMON {
+            assert!(
+                !direct_watch_files().any(|f| f == *p),
+                "{} watched directly",
+                p
+            );
+            let dir = p.rsplit_once('/').unwrap().0;
+            assert!(WATCH_DIRS.contains(&dir), "{} not watched", dir);
+            assert!(is_interesting(p), "{} ignored by its directory's watch", p);
+        }
+        assert!(direct_watch_files().any(|f| f == "/etc/sudoers"));
+    }
+
+    #[test]
+    fn the_writer_is_looked_up_again_once_per_burst() {
+        let now = Instant::now();
+        let mut p = Pending {
+            first: now,
+            last: now,
+            kind: FileKind::Modified,
+            writer: None,
+            is_config: false,
+            retried: false,
+        };
+        assert!(retry_writer_lookup(&p, FileKind::Modified));
+        assert!(!retry_writer_lookup(&p, FileKind::Removed));
+        p.retried = true;
+        assert!(!retry_writer_lookup(&p, FileKind::Modified));
     }
 }
