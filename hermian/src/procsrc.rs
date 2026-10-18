@@ -489,16 +489,50 @@ pub fn pid_for_path(path: &str) -> Option<(u32, String, String, u32, i64)> {
             let target = link.to_string_lossy();
             let target = target.strip_suffix(" (deleted)").unwrap_or(&target);
             if target == path {
-                let comm = comm_of(pid).unwrap_or_default();
-                let (exe, _) = exe_of(pid).unwrap_or_default();
-                let exe = judged_exe(pid, &comm, &exe);
-                let uid = uid_of(pid).unwrap_or(0);
-                let (_ppid, tty_nr, _start) = stat_of(pid).unwrap_or((0, 0, 0));
-                return Some((pid, comm, exe, uid, tty_nr));
+                return writer_info(pid);
             }
         }
     }
     None
+}
+
+/// `(pid, comm, exe, uid, tty_nr)` of a process that changed a file.
+pub fn writer_info(pid: u32) -> Option<(u32, String, String, u32, i64)> {
+    let comm = comm_of(pid).unwrap_or_default();
+    let (exe, _) = exe_of(pid).unwrap_or_default();
+    let exe = judged_exe(pid, &comm, &exe);
+    let uid = uid_of(pid).unwrap_or(0);
+    let (_ppid, tty_nr, _start) = stat_of(pid).unwrap_or((0, 0, 0));
+    Some((pid, comm, exe, uid, tty_nr))
+}
+
+/// The file a syscall of `pid` named: `path` relative to the directory open
+/// on `fd` (`AT_FDCWD`: its working directory), or the file open on `fd`
+/// itself when `path` is empty.
+pub fn path_at(pid: u32, fd: i32, path: &str) -> Option<String> {
+    if path.starts_with('/') {
+        return Some(path.to_string());
+    }
+    let base = if fd == libc::AT_FDCWD {
+        fs::read_link(format!("/proc/{}/cwd", pid)).ok()?
+    } else if fd >= 0 {
+        fs::read_link(format!("/proc/{}/fd/{}", pid, fd)).ok()?
+    } else {
+        return None;
+    };
+    join_at(&base.to_string_lossy(), path)
+}
+
+/// `path` under `base`; `base` alone when `path` is empty. A base that isn't
+/// a path (a socket, a deleted file) resolves to nothing.
+pub fn join_at(base: &str, path: &str) -> Option<String> {
+    if !base.starts_with('/') || base.ends_with(" (deleted)") {
+        return None;
+    }
+    if path.is_empty() {
+        return Some(base.to_string());
+    }
+    Some(format!("{}/{}", base.trim_end_matches('/'), path))
 }
 
 #[derive(Debug, Clone)]
@@ -764,6 +798,23 @@ pub fn current_exe_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn syscall_paths_resolve_against_their_directory() {
+        assert_eq!(join_at("/root", "x").as_deref(), Some("/root/x"));
+        assert_eq!(join_at("/", "tmp/x").as_deref(), Some("/tmp/x"));
+        assert_eq!(join_at("/tmp/sh", "").as_deref(), Some("/tmp/sh"));
+        assert_eq!(join_at("socket:[1234]", "x"), None);
+        assert_eq!(join_at("/tmp/gone (deleted)", ""), None);
+        // Absolute paths ignore the directory.
+        assert_eq!(path_at(1, 99_999, "/tmp/x").as_deref(), Some("/tmp/x"));
+        assert_eq!(path_at(1, -5, "x"), None);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            path_at(std::process::id(), libc::AT_FDCWD, "f").as_deref(),
+            Some(cwd.join("f").to_str().unwrap())
+        );
+    }
 
     #[test]
     fn system_tools_run_by_absolute_path_with_a_clean_environment() {

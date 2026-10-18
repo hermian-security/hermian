@@ -21,6 +21,27 @@ static TASK_REAL_PARENT_OFF: u32 = 0;
 #[no_mangle]
 static TASK_TGID_OFF: u32 = 0;
 
+/// Offsets for finding the inode behind an fd or the working directory,
+/// from BTF at load time (indexes below). Only used when FILE_OFFS_SET is 1:
+/// some of them (fdtable.max_fds) are legitimately 0.
+#[no_mangle]
+static FILE_OFFS: [u32; 12] = [0; 12];
+#[no_mangle]
+static FILE_OFFS_SET: u32 = 0;
+
+const OFF_TASK_FILES: usize = 0;
+const OFF_FILES_FDT: usize = 1;
+const OFF_FDT_MAX_FDS: usize = 2;
+const OFF_FDT_FD: usize = 3;
+const OFF_FILE_INODE: usize = 4;
+const OFF_INODE_INO: usize = 5;
+const OFF_INODE_SB: usize = 6;
+const OFF_SB_DEV: usize = 7;
+const OFF_TASK_FS: usize = 8;
+const OFF_FS_PWD: usize = 9;
+const OFF_PATH_DENTRY: usize = 10;
+const OFF_DENTRY_INODE: usize = 11;
+
 #[map]
 static EXEC_EVENTS: PerfEventArray<ExecEvent> = PerfEventArray::new(0);
 
@@ -85,6 +106,40 @@ pub struct ConnectEvent {
     pub daddr6: [u8; 16],
 }
 
+#[map]
+static PRIV_EVENTS: PerfEventArray<PrivEvent> = PerfEventArray::new(0);
+
+/// Scratch for the privilege event: with its path it's too big for comfort
+/// on the 512-byte BPF stack.
+#[map]
+static PRIV_SCRATCH: PerCpuArray<PrivEvent> = PerCpuArray::with_max_entries(1, 0);
+
+/// A file was given the setuid/setgid bits or file capabilities.
+/// Layout must match `hermian::ebpf::RawPriv` exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PrivEvent {
+    pub pid: u32,
+    pub uid: u32,
+    /// The directory `path` is relative to (AT_FDCWD for the cwd), or the
+    /// file itself when `path` is empty (fchmod, fsetxattr).
+    pub fd: i32,
+    pub mode: u32,
+    /// PRIV_SETID or PRIV_CAPS.
+    pub kind: u8,
+    pub _pad: [u8; 3],
+    /// The kernel's dev_t and inode number of what `fd` stands for (the
+    /// file, its directory, or the working directory), 0 if unknown. The
+    /// caller is usually gone before userspace can read /proc/<pid>/fd.
+    pub dev: u32,
+    pub ino: u64,
+    pub comm: [u8; 16],
+    pub path: [u8; 256],
+}
+
+pub const PRIV_SETID: u8 = 1;
+pub const PRIV_CAPS: u8 = 2;
+
 /// Layout must match `hermian::ebpf::RawPtrace` exactly.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -110,6 +165,14 @@ const SCHED_EXEC_PID: usize = 12;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+
+const PTRACE_ATTACH: u64 = 16;
+const PTRACE_SEIZE: u64 = 0x4206;
+
+/// S_ISUID | S_ISGID.
+const SETID_BITS: u64 = 0o6000;
+const AT_FDCWD: i32 = -100;
+const XATTR_CAPS: &[u8; 20] = b"security.capability\0";
 
 /// How many envp entries to inspect for LD_PRELOAD / LD_AUDIT. Each probe
 /// costs verifier budget; 12 was trivially bypassed by exporting a dozen
@@ -363,6 +426,12 @@ pub fn hermian_ptrace(ctx: TracePointContext) -> u32 {
         (Ok(r), Ok(t)) => (r, t),
         _ => return 0,
     };
+    // Attach and seize are all userspace acts on. A tracer issues a ptrace
+    // call for every step of its tracee (strace: one per syscall), and
+    // passing those up overflowed the ring and cost a /proc walk each.
+    if request != PTRACE_ATTACH && request != PTRACE_SEIZE {
+        return 0;
+    }
     if target == 0 || target > u32::MAX as u64 {
         return 0;
     }
@@ -374,6 +443,203 @@ pub fn hermian_ptrace(ctx: TracePointContext) -> u32 {
         request,
     };
     PTRACE_EVENTS.output(&ctx, &ev, 0);
+    0
+}
+
+#[inline(always)]
+fn file_off(i: usize) -> usize {
+    // SAFETY: reading our own global; volatile so it stays patchable.
+    unsafe { core::ptr::read_volatile(&FILE_OFFS[i]) as usize }
+}
+
+#[inline(always)]
+fn read_kptr(base: u64, off: usize) -> Option<u64> {
+    if base == 0 {
+        return None;
+    }
+    // SAFETY: a bounds-checked kernel probe read.
+    match unsafe { bpf_probe_read_kernel((base as *const u8).add(off) as *const u64) } {
+        Ok(0) | Err(_) => None,
+        Ok(p) => Some(p),
+    }
+}
+
+/// (s_dev, i_ino) of an inode.
+fn inode_id(inode: u64) -> Option<(u32, u64)> {
+    // SAFETY: bounds-checked kernel probe reads at BTF offsets.
+    let ino = unsafe {
+        bpf_probe_read_kernel((inode as *const u8).add(file_off(OFF_INODE_INO)) as *const u64)
+    }
+    .ok()?;
+    let sb = read_kptr(inode, file_off(OFF_INODE_SB))?;
+    // SAFETY: as above.
+    let dev =
+        unsafe { bpf_probe_read_kernel((sb as *const u8).add(file_off(OFF_SB_DEV)) as *const u32) }
+            .ok()?;
+    Some((dev, ino))
+}
+
+/// The inode behind `fd` (AT_FDCWD: the working directory) in the current task.
+fn fd_inode(fd: i32) -> Option<(u32, u64)> {
+    // SAFETY: reading our own global.
+    if unsafe { core::ptr::read_volatile(&FILE_OFFS_SET) } != 1 {
+        return None;
+    }
+    // SAFETY: returns the current task_struct pointer; only probe-read.
+    let task = unsafe { bpf_get_current_task() };
+    if fd == AT_FDCWD {
+        let fs = read_kptr(task, file_off(OFF_TASK_FS))?;
+        let dentry = read_kptr(fs, file_off(OFF_FS_PWD) + file_off(OFF_PATH_DENTRY))?;
+        return inode_id(read_kptr(dentry, file_off(OFF_DENTRY_INODE))?);
+    }
+    if fd < 0 {
+        return None;
+    }
+    let files = read_kptr(task, file_off(OFF_TASK_FILES))?;
+    let fdt = read_kptr(files, file_off(OFF_FILES_FDT))?;
+    // SAFETY: bounds-checked kernel probe read.
+    let max = unsafe {
+        bpf_probe_read_kernel((fdt as *const u8).add(file_off(OFF_FDT_MAX_FDS)) as *const u32)
+    }
+    .ok()?;
+    if fd as u32 >= max {
+        return None;
+    }
+    let arr = read_kptr(fdt, file_off(OFF_FDT_FD))?;
+    let file = read_kptr(arr, (fd as usize) * 8)?;
+    inode_id(read_kptr(file, file_off(OFF_FILE_INODE))?)
+}
+
+/// Pass up a file being given setuid/setgid bits or capabilities. Userspace
+/// resolves the path, checks the call took effect and judges the location.
+fn emit_priv(ctx: &TracePointContext, fd: i32, path: u64, mode: u64, kind: u8) {
+    let Some(ev) = PRIV_SCRATCH.get_ptr_mut(0) else {
+        return;
+    };
+    // SAFETY: per-CPU scratch slot.
+    let ev = unsafe { &mut *ev };
+    let (pid, uid, _gid) = current_pid_uid();
+    ev.pid = pid;
+    ev.uid = uid;
+    ev.fd = fd;
+    ev.mode = mode as u32;
+    ev.kind = kind;
+    ev._pad = [0u8; 3];
+    ev.comm = bpf_get_current_comm().unwrap_or([0u8; 16]);
+    let (dev, ino) = fd_inode(fd).unwrap_or((0, 0));
+    ev.dev = dev;
+    ev.ino = ino;
+    ev.path[0] = 0;
+    if path != 0 {
+        // SAFETY: a user pointer from the syscall's arguments; the helper
+        // checks it and bounds the copy.
+        if unsafe { bpf_probe_read_user_str_bytes(path as *const u8, &mut ev.path) }.is_err() {
+            return;
+        }
+    }
+    PRIV_EVENTS.output(ctx, ev, 0);
+}
+
+/// Shared by fchmodat(int dfd, const char *filename, umode_t mode) and
+/// fchmodat2(..., int flags).
+fn on_fchmodat(ctx: &TracePointContext) {
+    // SAFETY: offsets are inside the tracepoint argument block.
+    let (dfd, path, mode) = match unsafe {
+        (
+            ctx.read_at::<u64>(ARG0),
+            ctx.read_at::<u64>(ARG1),
+            ctx.read_at::<u64>(ARG2),
+        )
+    } {
+        (Ok(d), Ok(p), Ok(m)) => (d, p, m),
+        _ => return,
+    };
+    if mode & SETID_BITS != 0 && path != 0 {
+        emit_priv(ctx, dfd as i32, path, mode, PRIV_SETID);
+    }
+}
+
+#[tracepoint(name = "hermian_fchmodat", category = "syscalls")]
+pub fn hermian_fchmodat(ctx: TracePointContext) -> u32 {
+    on_fchmodat(&ctx);
+    0
+}
+
+#[tracepoint(name = "hermian_fchmodat2", category = "syscalls")]
+pub fn hermian_fchmodat2(ctx: TracePointContext) -> u32 {
+    on_fchmodat(&ctx);
+    0
+}
+
+/// chmod(const char *filename, umode_t mode); x86_64 only, arm64 has fchmodat.
+#[tracepoint(name = "hermian_chmod", category = "syscalls")]
+pub fn hermian_chmod(ctx: TracePointContext) -> u32 {
+    // SAFETY: offsets are inside the tracepoint argument block.
+    if let (Ok(path), Ok(mode)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
+        if mode & SETID_BITS != 0 && path != 0 {
+            emit_priv(&ctx, AT_FDCWD, path, mode, PRIV_SETID);
+        }
+    }
+    0
+}
+
+/// fchmod(unsigned int fd, umode_t mode): `cp -p`, `install`, tar and rsync.
+#[tracepoint(name = "hermian_fchmod", category = "syscalls")]
+pub fn hermian_fchmod(ctx: TracePointContext) -> u32 {
+    // SAFETY: offsets are inside the tracepoint argument block.
+    if let (Ok(fd), Ok(mode)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
+        if mode & SETID_BITS != 0 {
+            emit_priv(&ctx, fd as i32, 0, mode, PRIV_SETID);
+        }
+    }
+    0
+}
+
+/// Whether the xattr name at `name` is security.capability.
+fn is_caps_xattr(name: u64) -> bool {
+    if name == 0 {
+        return false;
+    }
+    let mut buf = [0u8; 20];
+    // SAFETY: user pointer from the syscall's arguments; bounded copy.
+    if unsafe { bpf_probe_read_user_str_bytes(name as *const u8, &mut buf) }.is_err() {
+        return false;
+    }
+    buf == *XATTR_CAPS
+}
+
+/// Shared by setxattr and lsetxattr(const char *pathname, const char *name, ...).
+fn on_setxattr(ctx: &TracePointContext) {
+    // SAFETY: offsets are inside the tracepoint argument block.
+    if let (Ok(path), Ok(name)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
+        if path != 0 && is_caps_xattr(name) {
+            emit_priv(ctx, AT_FDCWD, path, 0, PRIV_CAPS);
+        }
+    }
+}
+
+/// setcap.
+#[tracepoint(name = "hermian_setxattr", category = "syscalls")]
+pub fn hermian_setxattr(ctx: TracePointContext) -> u32 {
+    on_setxattr(&ctx);
+    0
+}
+
+#[tracepoint(name = "hermian_lsetxattr", category = "syscalls")]
+pub fn hermian_lsetxattr(ctx: TracePointContext) -> u32 {
+    on_setxattr(&ctx);
+    0
+}
+
+/// fsetxattr(int fd, const char *name, ...).
+#[tracepoint(name = "hermian_fsetxattr", category = "syscalls")]
+pub fn hermian_fsetxattr(ctx: TracePointContext) -> u32 {
+    // SAFETY: offsets are inside the tracepoint argument block.
+    if let (Ok(fd), Ok(name)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
+        if is_caps_xattr(name) {
+            emit_priv(&ctx, fd as i32, 0, 0, PRIV_CAPS);
+        }
+    }
     0
 }
 

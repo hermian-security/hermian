@@ -8,6 +8,13 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Added
 
+- setuid/setgid bits and file capabilities are reported as they're set,
+  not at the next sweep: eBPF hooks on the chmod family (`chmod`, `fchmod`,
+  `fchmodat`, `fchmodat2`) and the setxattr family for
+  `security.capability`. A call that fails reports nothing. The setuid sweep
+  stays as the safety net for files created with the bits already set, now
+  every minute in /tmp, /var/tmp and /dev/shm and every 5 minutes in homes
+  and service trees (20 seconds and 1 minute without eBPF).
 - `notifications.content = "minimal"`: Telegram, email and webhooks get
   only "HIGH alert 025 on web-01" and the command to read it on the host,
   with no addresses, users, paths or commands, and no buttons. journald and
@@ -60,6 +67,13 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- A tracer no longer floods Hermian. The eBPF ptrace hook passes up only
+  attach and seize, the only requests Hermian acts on. strace on any process
+  used to send one event per traced syscall: 474,000 lost to a full ring in
+  a few minutes on a test host, each delivered one costing a walk of /proc.
+- Capabilities given to a file in a user-writable tree (`setcap
+  cap_setuid+ep ~/python3`) are detected. The rule existed, but nothing
+  looked for capabilities on a file without a setuid bit.
 - Hermian no longer burns CPU on busy hosts. Self-protection makes
   /etc/ld.so.preload read as /dev/null inside the daemon, and the file was
   still watched directly, so every write to /dev/null on the host (Docker
