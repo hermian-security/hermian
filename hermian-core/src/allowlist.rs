@@ -19,6 +19,10 @@ pub struct Allowlist {
     pub destinations: Vec<DestinationRule>,
     #[serde(alias = "debugger")]
     pub debuggers: Vec<DebuggerRule>,
+    /// Keys whose logins are never "from a new source": CI runners and
+    /// other automation that log in from a different address every time.
+    #[serde(alias = "ssh_key")]
+    pub ssh_keys: Vec<KeyRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +60,17 @@ pub struct DestinationRule {
 #[serde(deny_unknown_fields)]
 pub struct DebuggerRule {
     pub comm: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRule {
+    /// As sshd logs it: "SHA256:..." (ssh-keygen -lf key.pub).
+    pub fingerprint: String,
+    /// Only for this account; any account when unset.
+    #[serde(default)]
+    pub user: Option<String>,
     pub reason: String,
 }
 
@@ -138,6 +153,14 @@ impl Allowlist {
         if self.debuggers.iter().any(|r| r.reason.trim().is_empty()) {
             return Err(ConfigError::EmptyReason("debuggers"));
         }
+        if self.ssh_keys.iter().any(|r| r.reason.trim().is_empty()) {
+            return Err(ConfigError::EmptyReason("ssh_keys"));
+        }
+        for r in &self.ssh_keys {
+            if !r.fingerprint.starts_with("SHA256:") || r.fingerprint.len() < 20 {
+                return Err(ConfigError::BadFingerprint(r.fingerprint.clone()));
+            }
+        }
         for r in &self.ssh_sources {
             if parse_cidr(&r.source).is_none() {
                 return Err(ConfigError::BadCidr(r.source.clone()));
@@ -158,6 +181,7 @@ impl Allowlist {
             && self.binaries.is_empty()
             && self.destinations.is_empty()
             && self.debuggers.is_empty()
+            && self.ssh_keys.is_empty()
     }
 
     pub fn chain_allowed(
@@ -193,6 +217,13 @@ impl Allowlist {
     pub fn binary_allowed(&self, path: &str) -> bool {
         let clean = path.trim_end_matches(" (deleted)");
         self.binaries.iter().any(|r| path_matches(clean, &r.path))
+    }
+
+    /// A login with this key, as this user, is allowlisted.
+    pub fn key_allowed(&self, user: &str, fingerprint: &str) -> bool {
+        self.ssh_keys
+            .iter()
+            .any(|r| r.fingerprint == fingerprint && r.user.as_deref().is_none_or(|u| u == user))
     }
 
     pub fn source_allowed(&self, ip: IpAddr) -> bool {
@@ -252,7 +283,36 @@ mod tests {
                 comm: "my-profiler".into(),
                 reason: "In-house profiler".into(),
             }],
+            ssh_keys: vec![KeyRule {
+                fingerprint: "SHA256:qQ4bSkAnJmXpNJ6Hd4kFr2Y9pCbAuGN4a3H6zfD0Y1o".into(),
+                user: Some("deploy".into()),
+                reason: "GitLab CI deploy key".into(),
+            }],
         }
+    }
+
+    #[test]
+    fn key_matching_and_validation() {
+        let a = sample();
+        let fp = "SHA256:qQ4bSkAnJmXpNJ6Hd4kFr2Y9pCbAuGN4a3H6zfD0Y1o";
+        assert!(a.key_allowed("deploy", fp));
+        assert!(!a.key_allowed("root", fp), "scoped to its user");
+        assert!(!a.key_allowed("deploy", "SHA256:other"));
+        let mut any = sample();
+        any.ssh_keys[0].user = None;
+        assert!(any.key_allowed("root", fp));
+        let mut bad = sample();
+        bad.ssh_keys[0].fingerprint = "qQ4bSkAnJmXpNJ6Hd4kFr2Y9pCbAuGN4a3H6zfD0Y1o".into();
+        assert!(matches!(
+            bad.validate(),
+            Err(ConfigError::BadFingerprint(_))
+        ));
+        let mut empty = sample();
+        empty.ssh_keys[0].reason = " ".into();
+        assert!(matches!(
+            empty.validate(),
+            Err(ConfigError::EmptyReason("ssh_keys"))
+        ));
     }
 
     #[test]

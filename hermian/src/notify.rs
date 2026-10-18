@@ -43,6 +43,10 @@ pub struct NotifyState {
     /// Alerts a channel gave up on: queue overflow or a permanent rejection.
     #[serde(default)]
     pub dropped_by_channel: BTreeMap<String, u64>,
+    /// Channels that just passed 15 minutes of failures, with their last
+    /// error, for the daemon to page about (see `take_failing`).
+    #[serde(skip)]
+    pub newly_failing: Vec<(String, String)>,
 }
 
 pub struct Notifier {
@@ -130,6 +134,14 @@ impl Notifier {
                 let _ = tx.send(m).await;
             });
         }
+    }
+
+    /// Channels that started failing for good since the last call.
+    pub fn take_failing(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .map(|mut s| std::mem::take(&mut s.newly_failing))
+            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> NotifyState {
@@ -417,6 +429,7 @@ impl ChannelQueue {
             self.alarm_sent = true;
             if let Ok(mut s) = state.lock() {
                 s.failures += 1;
+                s.newly_failing.push((self.name.to_string(), e.msg.clone()));
             }
             syslog_msg(
                 Severity::Critical,

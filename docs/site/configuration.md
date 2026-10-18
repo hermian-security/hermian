@@ -49,6 +49,7 @@ See [Learning and novelty](baseline).
 | `failed_burst_window_secs` | `60` | 1 to 86400 | Window for a burst, and for "login after a burst" |
 | `brute_digest_hours` | `2` | 1 to 24 | How often the brute-force digest is computed |
 | `brute_min_attempts` | `10` | 1 to 10000 | Attempts a source needs in that period to be listed |
+| `known_key_new_network` | `"alert"` | `alert`, `log` | A key the account has used before, from a network it hasn't: `log` records it without sending. Passwords and new keys always page |
 
 ## `[detections]`
 
@@ -142,6 +143,7 @@ use it.
 | `[[allowlist.binaries]]` | `path`, `reason` | Executions of it aren't reported as transient-directory or `LD_PRELOAD` findings |
 | `[[allowlist.destinations]]` | `destination` (IP or CIDR), `reason` | Connections to it are never reported |
 | `[[allowlist.debuggers]]` | `comm`, `reason` | That process name may ptrace without an alert |
+| `[[allowlist.ssh_keys]]` | `fingerprint` (`SHA256:…`), optional `user`, `reason` | Logins with that key never count as coming from a new source (CI runners) |
 
 Paths match exactly, as a directory (`/opt/app` covers everything under it),
 or as a prefix ending in `*` (`/tmp/app-update-*`).

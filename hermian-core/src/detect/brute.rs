@@ -89,6 +89,7 @@ pub fn digest_finding(
     min_attempts: u32,
     period_hours: u32,
     root_password_login: bool,
+    password_guessable: Option<(bool, bool)>,
 ) -> Option<Finding> {
     let listed: Vec<(IpAddr, SourceStats)> = sources
         .into_iter()
@@ -103,6 +104,13 @@ pub fn digest_finding(
         accounts.extend(s.users.iter().map(String::as_str));
     }
     let root_targeted = accounts.contains("root");
+    // Attempts that can't succeed: no listed account accepts a password
+    // (sshd -T says so; `Match` blocks and an unanswered sshd count as maybe).
+    let hopeless = password_guessable.is_some_and(|(root, others)| {
+        accounts
+            .iter()
+            .all(|a| if *a == "root" { !root } else { !others })
+    });
     let top: Vec<String> = listed
         .iter()
         .take(TOP_LISTED)
@@ -111,11 +119,14 @@ pub fn digest_finding(
             format!("{} ({} tries: {})", ip, s.failures, users.join(", "))
         })
         .collect();
-    let mut why = String::from(
+    let mut why = String::from(if hopeless {
+        "None of the accounts tried accepts a password here (sshd only takes keys for them), \
+         so these attempts can't succeed. Recorded for the volume and the sources, not sent."
+    } else {
         "These attempts named accounts that exist on this host and can log in, which is \
          different from the constant scanning for 'admin' or 'test'. A strong password or \
-         key-only login stops them; blocking the sources stops the noise.",
-    );
+         key-only login stops them; blocking the sources stops the noise."
+    });
     // Only worth saying while someone is actually trying.
     let warn_root = root_password_login;
     if warn_root {
@@ -126,7 +137,11 @@ pub fn digest_finding(
     }
     let mut f = Finding::new(
         DetectionId::D2,
-        Severity::High,
+        if hopeless {
+            Severity::Low
+        } else {
+            Severity::High
+        },
         "SSH brute force against existing accounts",
         &format!("d2|brute-digest|{}", started.timestamp()),
     )
@@ -164,10 +179,14 @@ pub fn digest_finding(
              sshd_config (keys still work), then reload sshd.",
         );
     }
-    f = f.actions([
-        "Check that the accounts listed use keys or strong passwords.",
-        "Block the sources if they keep coming back.",
-    ]);
+    f = if hopeless {
+        f.action("Nothing to do. Block the sources if the noise bothers you.")
+    } else {
+        f.actions([
+            "Check that the accounts listed use keys or strong passwords.",
+            "Block the sources if they keep coming back.",
+        ])
+    };
     for (ip, _) in listed.iter().take(TOP_LISTED) {
         f = f.offer(ResponseAction::Block { sources: vec![*ip] });
     }
@@ -273,7 +292,7 @@ mod tests {
         #[test]
         fn no_attacks_no_digest_and_root_warning_rides_along() {
             let mut e = engine();
-            e.set_root_password_login(true);
+            e.set_sshd_auth(true, true, false);
             let t = Utc::now();
             assert!(digest(&e.tick(t + Duration::hours(3))).is_none());
             hammer(&mut e, t, "root", "198.51.100.7", 15);
@@ -364,7 +383,7 @@ mod tests {
         let (s, rows) = d
             .take_if_due(t + Duration::hours(2), Duration::hours(2))
             .unwrap();
-        assert!(digest_finding(s, rows, 10, 2, true).is_none());
+        assert!(digest_finding(s, rows, 10, 2, true, None).is_none());
     }
 
     #[test]
@@ -380,7 +399,7 @@ mod tests {
         let (s, rows) = d
             .take_if_due(t + Duration::hours(2), Duration::hours(2))
             .unwrap();
-        let f = digest_finding(s, rows, 10, 2, true).unwrap();
+        let f = digest_finding(s, rows, 10, 2, true, Some((true, true))).unwrap();
         assert_eq!(f.severity, Severity::High);
         let top = &f
             .facts
@@ -409,11 +428,52 @@ mod tests {
         let (s, rows) = d
             .take_if_due(t + Duration::hours(2), Duration::hours(2))
             .unwrap();
-        let f = digest_finding(s, rows, 10, 2, false).unwrap();
+        let f = digest_finding(s, rows, 10, 2, false, None).unwrap();
         assert!(!f.why.contains("Root can log in"));
         assert!(!f
             .offers
             .iter()
             .any(|o| matches!(o, ResponseAction::SnoozeRootPasswordWarning { .. })));
+    }
+
+    /// On a key-only host the same attempts are recorded, not sent: they
+    /// can't succeed. Unknown, or a Match block, keeps today's page.
+    #[test]
+    fn attempts_that_cant_succeed_are_not_sent() {
+        let rows = |users: &[&str]| {
+            let t = Utc::now();
+            let mut d = BruteDigest::default();
+            for u in users {
+                for _ in 0..12 {
+                    d.record(ip("198.51.100.7"), u, t);
+                }
+            }
+            d.take_if_due(t + Duration::hours(3), Duration::hours(2))
+                .unwrap()
+        };
+        let sev = |users: &[&str], guessable: Option<(bool, bool)>| {
+            let (s, r) = rows(users);
+            digest_finding(s, r, 10, 2, false, guessable)
+                .unwrap()
+                .severity
+        };
+        // Passwords off everywhere.
+        assert_eq!(
+            sev(&["root", "deploy"], Some((false, false))),
+            Severity::Low
+        );
+        // Root is keys-only, and only root was tried.
+        assert_eq!(sev(&["root"], Some((false, true))), Severity::Low);
+        // ...but deploy accepts a password.
+        assert_eq!(
+            sev(&["root", "deploy"], Some((false, true))),
+            Severity::High
+        );
+        // sshd never answered: no guessing, page as before.
+        assert_eq!(sev(&["root"], None), Severity::High);
+        let (s, r) = rows(&["deploy"]);
+        let f = digest_finding(s, r, 10, 2, false, Some((false, false))).unwrap();
+        assert!(f.why.contains("can't succeed"), "{}", f.why);
+        assert!(!f.actions.iter().any(|a| a.contains("strong passwords")));
     }
 }

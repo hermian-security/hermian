@@ -38,10 +38,15 @@ once you've checked the binary and config are yours.
 
 ### Hermian configuration changed and reloaded
 
-`CRITICAL`
+`CRITICAL` · `LOW` when nothing is loosened
 
-A valid change that alters detections or the allowlist was loaded. Paging is
-the point: someone who silences a rule tells you.
+A valid change was loaded. If it loosens anything (a rule off, a wider
+exception, a higher `min_severity`, `permit_root` on, more people who can
+press buttons, fewer channels), it pages CRITICAL: someone who silences a rule
+tells you. Changes that only tune or tighten (a timeout, a retention period, a
+new channel, an exception removed) are recorded as LOW, so editing your own
+config doesn't page you. Anything Hermian doesn't know to be harmless counts
+as loosening.
 
 ### Hermian alert destinations changed and reloaded
 
@@ -89,6 +94,24 @@ seconds for delivery).
 `INFO`
 
 A planned restart by `hermian enable`, so upgrades don't page.
+
+### Hermian is restarting
+
+`INFO`
+
+`systemctl restart hermian`: systemd had a restart queued for the daemon as it
+stopped, so it's back in seconds. A plain stop still pages "Hermian is
+stopping".
+
+### Alerts aren't reaching one of the channels
+
+`HIGH`
+
+A channel has failed for more than 15 minutes: a revoked bot token, a full
+mailbox, a dead webhook, or the host cut off from it. The alert goes to every
+channel, so the working ones carry it; the failing channel's alerts stay
+queued on the host until it works again. With a single channel, it's in the
+journal and `hermian status`.
 
 ### Hermian restarted after an unclean shutdown
 

@@ -83,6 +83,27 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- Fewer pages about your own activity, the same pages for an intruder's:
+  - A key the account has used before, logging in from a new network, says
+    so ("Root login with a known key from a new network"), and logins with
+    one key from several new networks in a row are one alert: a GitLab
+    pipeline used to page once per job, from each new cloud address.
+  - `[[allowlist.ssh_keys]]`: a CI or automation key whose logins never
+    count as new, optionally for one account.
+  - `ssh.known_key_new_network = "log"` records known keys from new networks
+    without sending them. Passwords and new keys always page.
+  - The brute-force digest is LOW, not sent, when none of the accounts
+    tried accepts a password (`sshd -T`). `Match` blocks keep it HIGH.
+  - Editing the config pages CRITICAL only when the change loosens
+    something (a rule off, a wider exception, fewer channels, a higher
+    `min_severity`...); tuning and tightening are LOW.
+  - `systemctl restart hermian` is INFO ("Hermian is restarting"); a stop is
+    still HIGH.
+  - The start-up audit pages once a day for the same findings, not at every
+    restart: installing on an infected host paged it three times.
+- A channel failing for 15 minutes (a revoked bot token, a dead webhook, the
+  host cut off) now pages through the other channels. It used to be logged
+  on the host only.
 - The config file can't be broken by removing a `#` any more. Explanations
   now start with `##` and settings that are switched off with a single `#`
   (`#message_thread_id = 12345`): removing one `#` turns a setting on or

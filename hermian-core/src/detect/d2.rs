@@ -104,14 +104,32 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 .key
                 .as_ref()
                 .is_some_and(|k| ctx.baseline.key_is_known(&ev.user, &k.fingerprint));
+            // An allowlisted key (CI runners, automation) is never "new",
+            // wherever it logs in from.
+            let key_allowed = ev
+                .key
+                .as_ref()
+                .is_some_and(|k| ctx.allowlist.key_allowed(&ev.user, &k.fingerprint));
+            let fingerprint = ev
+                .key
+                .as_ref()
+                .map(|k| k.fingerprint.as_str())
+                .unwrap_or("");
+            // A known key from a new network is usually its owner on another
+            // connection (travel, mobile, VPN, a CI runner); with "log" it's
+            // recorded, not sent.
+            let quiet_known_key = ctx.cfg.ssh.known_key_new_network == "log";
             if ev.user == "root" && !ctx.cfg.ssh.permit_root && !after_burst {
                 // A root login is a policy concern, not per se an anomaly. It is
                 // HIGH the first time a source is seen; the same operator logging
                 // in again from the same place is context, not a new incident.
-                let seen_before = ctx.baseline.root_source_is_known(rhost);
+                let seen_before = ctx.baseline.root_source_is_known(rhost) || key_allowed;
                 let nearby = !seen_before && key_known && ctx.baseline.root_net_is_known(rhost);
+                let new_network = !seen_before && !nearby && key_known;
                 let severity = if seen_before || nearby {
                     Severity::Info
+                } else if new_network && quiet_known_key {
+                    Severity::Low
                 } else {
                     Severity::High
                 };
@@ -123,19 +141,31 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                             "Root login over SSH"
                         } else if nearby {
                             "Root login with a known key from a nearby address"
+                        } else if new_network {
+                            "Root login with a known key from a new network"
                         } else {
                             "Root login over SSH from a new source"
                         },
-                        &format!("d2|root-login|{}", rhost),
+                        // One key logging in from several new networks (a CI
+                        // runner) is one incident, not one per address.
+                        &if new_network {
+                            format!("d2|root-login-key|{}", fingerprint)
+                        } else {
+                            format!("d2|root-login|{}", rhost)
+                        },
                     )
                     .what(format!(
                         "root authenticated over SSH{} from {}{}.",
                         how(ev),
                         rhost,
-                        if seen_before {
+                        if key_allowed {
+                            ", with an allowlisted key"
+                        } else if seen_before {
                             ", a source that has logged in as root before"
                         } else if nearby {
                             ", a new address on a network root already logs in from"
+                        } else if new_network {
+                            ", a network root hasn't logged in from, with a key it has used before"
                         } else {
                             " for the first time"
                         }
@@ -155,12 +185,13 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 );
             }
             if !after_burst
+                && !key_allowed
                 && ctx.baseline.can_judge_novelty()
                 && !ctx.baseline.ssh_source_is_known(rhost)
                 && !(key_known && ctx.baseline.ssh_net_is_known(rhost))
             {
                 let elevated = ev.user == "root";
-                let severity = if elevated {
+                let severity = if elevated && !(key_known && quiet_known_key) {
                     Severity::High
                 } else {
                     Severity::Low
@@ -169,19 +200,34 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     Finding::new(
                         DetectionId::D2,
                         severity,
-                        if elevated {
-                            "Root login from a new source"
-                        } else {
-                            "SSH login from a new source"
+                        match (elevated, key_known) {
+                            (true, true) => "Root login with a known key from a new network",
+                            (false, true) => "SSH login with a known key from a new network",
+                            (true, false) => "Root login from a new source",
+                            (false, false) => "SSH login from a new source",
                         },
-                        &format!("d2|new-source|{}|{}", rhost, ev.user),
+                        &if key_known {
+                            format!("d2|new-source-key|{}|{}", ev.user, fingerprint)
+                        } else {
+                            format!("d2|new-source|{}|{}", rhost, ev.user)
+                        },
                     )
-                    .what(format!(
-                        "User '{}' authenticated{} from {}, a source never seen before.",
-                        ev.user,
-                        how(ev),
-                        rhost
-                    ))
+                    .what(if key_known {
+                        format!(
+                            "User '{}' authenticated{} from {}, a network this account hasn't \
+                             used, with a key it has used before.",
+                            ev.user,
+                            how(ev),
+                            rhost
+                        )
+                    } else {
+                        format!(
+                            "User '{}' authenticated{} from {}, a source never seen before.",
+                            ev.user,
+                            how(ev),
+                            rhost
+                        )
+                    })
                     .fact("Source", rhost.to_string())
                     .fact("User", &ev.user)
                     .facts_from(key_facts(ev))

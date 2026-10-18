@@ -214,4 +214,6 @@ are red flags too.
 
 The [start-up audit](self-protection#the-start-up-audit) found persistence,
 running implants or a preloaded library that were there before the daemon
-started. It's filed under D3 because that's mostly what it finds.
+started. It's filed under D3 because that's mostly what it finds. The same
+findings at the next start (an install restarts more than once) are recorded
+as INFO instead of paging again, for a day.

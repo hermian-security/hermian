@@ -3,6 +3,12 @@
 //! Every field is compared, not a hand-picked list: a reload that only
 //! repoints the webhook or Telegram chat is exactly what an attacker would do
 //! to take over the alert path, so it mustn't read as "no functional change".
+//!
+//! Each change is also judged: does it loosen protection (fewer or other
+//! destinations, a rule off, a wider exception)? Those page CRITICAL. Changes
+//! that only tune or tighten (a timeout, a new channel, an exception removed)
+//! are recorded without paging, so editing your own config doesn't page you.
+//! Anything not known to be harmless counts as loosening.
 
 use hermian_core::Config;
 use serde_json::Value;
@@ -43,6 +49,8 @@ pub struct ConfigDiff {
     pub summary: String,
     /// Alerts may now go somewhere else (or nowhere).
     pub destinations_changed: bool,
+    /// Something now protects less (see the module doc).
+    pub weakens: bool,
 }
 
 impl ConfigDiff {
@@ -58,30 +66,98 @@ pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
             changed: vec!["(unknown)".into()],
             summary: "configuration changed (could not compare)".into(),
             destinations_changed: true,
+            weakens: true,
         };
     };
     let mut changes = Vec::new();
     walk("", &a, &b, &mut changes);
     let destinations_changed = changes
         .iter()
-        .any(|(path, _)| DESTINATION_FIELDS.contains(&path.as_str()));
+        .any(|(path, _, _)| DESTINATION_FIELDS.contains(&path.as_str()));
+    let weakens = changes.iter().any(|(_, _, weak)| *weak);
     let summary = if changes.is_empty() {
         "no functional change".to_string()
     } else {
         changes
             .iter()
-            .map(|(_, line)| line.as_str())
+            .map(|(_, line, _)| line.as_str())
             .collect::<Vec<_>>()
             .join("; ")
     };
     ConfigDiff {
-        changed: changes.into_iter().map(|(p, _)| p).collect(),
+        changed: changes.into_iter().map(|(p, _, _)| p).collect(),
         summary,
         destinations_changed,
+        weakens,
     }
 }
 
-fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<(String, String)>) {
+/// Fields that only tune how Hermian behaves, never what it protects.
+const HARMLESS_FIELDS: &[&str] = &[
+    "general.alert_retention_days",
+    "general.hostname",
+    "baseline.duration_hours",
+    "ssh.brute_digest_hours",
+    "notifications.dedup_window_secs",
+    "notifications.content",
+    "notifications.telegram.silent_below_critical",
+    "notifications.telegram.timeout_secs",
+    "notifications.telegram.action_ttl_mins",
+    "notifications.email.subject_prefix",
+    "notifications.email.from",
+    "notifications.email.timeout_secs",
+    "notifications.webhook.format",
+    "notifications.webhook.timeout_secs",
+    "response.block_duration_hours",
+    "response.auto_isolate_revert_mins",
+];
+
+fn severity_rank(v: &Value) -> u8 {
+    match v.as_str().map(str::to_ascii_uppercase).as_deref() {
+        Some("INFO") => 0,
+        Some("LOW") => 1,
+        Some("HIGH") => 2,
+        Some("CRITICAL") => 3,
+        _ => 4,
+    }
+}
+
+/// Entries in `b` that weren't in `a`.
+fn added(a: &Value, b: &Value) -> bool {
+    let old = a.as_array().cloned().unwrap_or_default();
+    b.as_array()
+        .is_some_and(|new| new.iter().any(|x| !old.contains(x)))
+}
+
+/// Whether changing `path` from `a` to `b` loosens protection.
+fn loosens(path: &str, a: &Value, b: &Value) -> bool {
+    if HARMLESS_FIELDS.contains(&path) {
+        return false;
+    }
+    let num = |v: &Value| v.as_f64().unwrap_or(0.0);
+    match path {
+        // Fewer channels: alerts reach fewer places. A new one is fine.
+        "notifications.channels" => added(b, a),
+        "notifications.min_severity" => severity_rank(b) > severity_rank(a),
+        "ssh.permit_root" | "notifications.telegram.actions" => b == &Value::Bool(true),
+        "baseline.enabled" | "response.auto_isolate" => b == &Value::Bool(false),
+        "ssh.known_key_new_network" => b.as_str() == Some("log"),
+        // More failures needed before anything shows: quieter.
+        "ssh.failed_burst_count" | "ssh.brute_min_attempts" | "ssh.failed_burst_window_secs" => {
+            num(b) > num(a)
+        }
+        // More people who can press buttons, more addresses that are never
+        // blocked, more exceptions: wider. Removing entries tightens.
+        "notifications.telegram.allowed_user_ids" | "response.management_cidrs" => added(a, b),
+        p if p.starts_with("allowlist.") => added(a, b),
+        p if p.starts_with("detections.") => b == &Value::Bool(false),
+        // Repointing where alerts go (a token, a chat, a URL, recipients...)
+        // and anything unknown: assume the worst.
+        _ => true,
+    }
+}
+
+fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<(String, String, bool)>) {
     if a == b {
         return;
     }
@@ -113,7 +189,7 @@ fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<(String, String)>) {
     } else {
         format!("{}: {} -> {}", path, short(a), short(b))
     };
-    out.push((path.to_string(), line));
+    out.push((path.to_string(), line, loosens(path, a, b)));
 }
 
 fn len(v: &Value) -> usize {
@@ -214,5 +290,57 @@ mod tests {
             });
         let d = diff(&old, &new);
         assert!(d.is_functional(), "{:?}", d);
+    }
+
+    #[test]
+    fn tuning_or_tightening_doesnt_loosen() {
+        let old = cfg();
+        let mut new = cfg();
+        new.notifications.telegram.timeout_secs = 30;
+        new.response.block_duration_hours = 48;
+        new.notifications.min_severity = "LOW".into();
+        new.notifications.channels.push("stdout".into());
+        let d = diff(&old, &new);
+        assert!(d.is_functional() && !d.weakens, "{:?}", d);
+    }
+
+    #[test]
+    fn loosening_is_caught() {
+        let loosened = |f: &dyn Fn(&mut Config)| {
+            let mut new = cfg();
+            f(&mut new);
+            diff(&cfg(), &new).weakens
+        };
+        assert!(loosened(
+            &|c| c.notifications.min_severity = "CRITICAL".into()
+        ));
+        assert!(loosened(&|c| c.detections.d1_process_chains = false));
+        assert!(loosened(&|c| c.ssh.permit_root = true));
+        assert!(loosened(&|c| c
+            .notifications
+            .channels
+            .retain(|x| x != "file")));
+        assert!(loosened(
+            &|c| c.notifications.telegram.chat_id = "-100999".into()
+        ));
+        assert!(loosened(
+            &|c| c.response.management_cidrs = vec!["0.0.0.0/1".into()]
+        ));
+        assert!(loosened(&|c| c.ssh.known_key_new_network = "log".into()));
+        assert!(loosened(&|c| c.allowlist.ssh_sources.push(
+            hermian_core::allowlist::SourceRule {
+                source: "0.0.0.0/0".into(),
+                reason: "x".into(),
+            }
+        )));
+        // Removing an exception tightens.
+        let mut with = cfg();
+        with.allowlist
+            .ssh_sources
+            .push(hermian_core::allowlist::SourceRule {
+                source: "10.0.0.0/8".into(),
+                reason: "VPN".into(),
+            });
+        assert!(!diff(&with, &cfg()).weakens);
     }
 }

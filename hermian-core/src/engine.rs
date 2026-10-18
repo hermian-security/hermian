@@ -86,6 +86,9 @@ pub struct Engine {
     /// Whether sshd lets root log in with a password (set by the daemon from
     /// `sshd -T`).
     pub root_password_login: bool,
+    /// Whether a password could log in as (root, any other account), from
+    /// `sshd -T`; `Match` blocks count as "maybe". `None` until sshd answered.
+    pub password_guessable: Option<(bool, bool)>,
     /// The root-password warning is left out of digests until then.
     pub root_warning_snoozed_until: Option<DateTime<Utc>>,
     /// The daemon's own pid (0 when not running as the daemon): anything
@@ -125,6 +128,7 @@ impl Engine {
             brute: detect::brute::BruteDigest::default(),
             ignored_sources: HashMap::new(),
             root_password_login: false,
+            password_guessable: None,
             root_warning_snoozed_until: None,
             self_pid: 0,
         }
@@ -145,9 +149,11 @@ impl Engine {
             .is_some_and(|until| now < *until)
     }
 
-    /// From `sshd -T`: root may log in with a password.
-    pub fn set_root_password_login(&mut self, enabled: bool) {
-        self.root_password_login = enabled;
+    /// From `sshd -T`: whether root and other accounts may log in with a
+    /// password, and whether `Match` blocks make that uncertain.
+    pub fn set_sshd_auth(&mut self, root_password: bool, password: bool, per_match: bool) {
+        self.root_password_login = root_password;
+        self.password_guessable = Some((root_password || per_match, password || per_match));
     }
 
     /// Leave the root-password warning out of digests until `until`.
@@ -398,6 +404,7 @@ impl Engine {
             self.cfg.ssh.brute_min_attempts,
             hours,
             self.root_warning_due(now),
+            self.password_guessable,
         )
     }
 
@@ -1095,6 +1102,12 @@ mod tests {
         // Same key from another network: pages.
         let far = login(&mut eng, "102.16.1.1", Some(key("SHA256:aaaa"))).unwrap();
         assert_eq!(far.severity, Severity::High);
+        assert_eq!(far.title, "Root login with a known key from a new network");
+        assert!(
+            far.what.contains("with a key it has used before"),
+            "{}",
+            far.what
+        );
         // A password from the known /16: pages.
         let pw = login(&mut eng, "41.82.77.7", None).unwrap();
         assert_eq!(pw.severity, Severity::High);
@@ -1102,6 +1115,105 @@ mod tests {
         // A key never seen before from the known /16: pages.
         let new_key = login(&mut eng, "41.82.88.8", Some(key("SHA256:bbbb"))).unwrap();
         assert_eq!(new_key.severity, Severity::High);
+    }
+
+    fn root_key_login(eng: &mut Engine, t: DateTime<Utc>, ip: &str, fp: &str) -> Option<Alert> {
+        use crate::events::SshKey;
+        eng.process(Event::Auth(AuthEvent {
+            ts: t,
+            result: AuthResult::Success,
+            user: "root".into(),
+            rhost: Some(ip.parse().unwrap()),
+            service: "sshd".into(),
+            tty: "ssh".into(),
+            method: AuthMethod::PublicKey,
+            port: None,
+            key: Some(SshKey {
+                kind: "ED25519".into(),
+                fingerprint: fp.into(),
+                file: Some("/root/.ssh/authorized_keys".into()),
+                line: Some(1),
+                comment: Some("gitlab-ci".into()),
+            }),
+        }))
+        .into_iter()
+        .filter(|a| a.detection == DetectionId::D2)
+        .max_by_key(|a| a.severity)
+    }
+
+    fn judging_engine(cfg: Config, allowlist: Allowlist) -> Engine {
+        let mut baseline = Baseline::new(true, 24, Utc::now());
+        baseline.complete = true;
+        Engine::new(cfg, allowlist, baseline, "h".into())
+    }
+
+    /// A CI runner: the same key from a new cloud address every job. One
+    /// page for the burst, not one per address.
+    #[test]
+    fn one_key_from_several_new_networks_is_one_incident() {
+        let mut eng = judging_engine(Config::default(), Allowlist::default());
+        let t = Utc::now();
+        // The key's first login, from the operator's place.
+        assert!(root_key_login(&mut eng, t, "41.82.10.5", "SHA256:ci").is_some());
+        let later = t + Duration::hours(2);
+        let first = root_key_login(&mut eng, later, "35.229.89.226", "SHA256:ci").unwrap();
+        assert_eq!(first.severity, Severity::High);
+        for (i, ip) in ["34.26.136.116", "34.73.244.68", "35.196.205.129"]
+            .iter()
+            .enumerate()
+        {
+            let at = later + Duration::seconds(60 * (i as i64 + 1));
+            let a = root_key_login(&mut eng, at, ip, "SHA256:ci");
+            assert!(
+                a.as_ref().is_none_or(|a| a.severity < Severity::High),
+                "{} paged again: {:?}",
+                ip,
+                a
+            );
+        }
+    }
+
+    #[test]
+    fn an_allowlisted_key_is_never_from_a_new_source() {
+        let mut allow = Allowlist::default();
+        allow.ssh_keys.push(crate::allowlist::KeyRule {
+            fingerprint: "SHA256:ci".into(),
+            user: Some("root".into()),
+            reason: "GitLab CI".into(),
+        });
+        let mut eng = judging_engine(Config::default(), allow);
+        let t = Utc::now();
+        let a = root_key_login(&mut eng, t, "35.229.89.226", "SHA256:ci").unwrap();
+        assert_eq!(a.severity, Severity::Info, "{:?}", a);
+        assert!(a.what.contains("allowlisted key"), "{}", a.what);
+        // Another key from the same place still pages.
+        let other = root_key_login(
+            &mut eng,
+            t + Duration::hours(1),
+            "35.229.89.227",
+            "SHA256:x",
+        );
+        assert_eq!(other.map(|a| a.severity), Some(Severity::High));
+    }
+
+    #[test]
+    fn known_key_new_network_can_be_logged_instead_of_sent() {
+        let mut cfg = Config::default();
+        cfg.ssh.known_key_new_network = "log".into();
+        let mut eng = judging_engine(cfg, Allowlist::default());
+        let t = Utc::now();
+        assert_eq!(
+            root_key_login(&mut eng, t, "41.82.10.5", "SHA256:me").map(|a| a.severity),
+            Some(Severity::High),
+            "a key's first login still pages"
+        );
+        let roaming =
+            root_key_login(&mut eng, t + Duration::hours(2), "102.16.1.1", "SHA256:me").unwrap();
+        assert_eq!(roaming.severity, Severity::Low, "{:?}", roaming);
+        // A key never seen before is never quieted.
+        let stranger =
+            root_key_login(&mut eng, t + Duration::hours(4), "102.16.1.2", "SHA256:new").unwrap();
+        assert_eq!(stranger.severity, Severity::High);
     }
 
     /// A hidden key source in sshd's config pages once; the next audit (and
