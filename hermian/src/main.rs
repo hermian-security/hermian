@@ -1,3 +1,4 @@
+mod actions;
 mod alerts;
 mod audit;
 mod auditnetlink;
@@ -51,8 +52,10 @@ fn main() {
         cli::Cmd::Collect(args) => collect::run(&args),
         cli::Cmd::Isolate(args) => isolate::cmd_isolate(&args),
         cli::Cmd::Unisolate => isolate::cmd_unisolate(),
+        cli::Cmd::Block(args) => actions::cmd_block(&args.ips),
         cli::Cmd::Blocked => blocklist::cmd_blocked(),
-        cli::Cmd::Unblock(args) => blocklist::cmd_unblock(&args.ip),
+        cli::Cmd::Unblock(args) => actions::cmd_unblock(&args.ip),
+        cli::Cmd::Disconnect(args) => actions::cmd_disconnect(&args.ip),
         cli::Cmd::Uninstall(args) => uninstall::run(&args),
         cli::Cmd::Watchdog => watchdog::run(),
     };

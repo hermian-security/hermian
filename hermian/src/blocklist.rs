@@ -8,6 +8,7 @@
 //! else sees it (prerouting, so containers and forwarded ports are covered).
 
 use std::net::{IpAddr, Ipv6Addr};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use hermian_core::Config;
@@ -34,42 +35,113 @@ fn table_script() -> String {
     )
 }
 
-fn nft(args: &[&str]) -> Result<String> {
-    let out = crate::procsrc::system_command("nft")
-        .args(args)
-        .output()
-        .context("failed to run nft (install nftables)")?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        anyhow::bail!(
-            "nft {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )
+/// How long one nft call may take before it's given up on.
+const NFT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why an nft call didn't work, so the person who pressed a button can be
+/// told in a sentence (see `actions::explain`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NftError {
+    /// nft isn't installed.
+    Missing,
+    /// It didn't finish in time and was killed.
+    Timeout(Duration),
+    /// It ran and refused; its first line of output.
+    Failed(String),
+}
+
+impl std::fmt::Display for NftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NftError::Missing => write!(f, "nft isn't installed"),
+            NftError::Timeout(t) => write!(f, "nft didn't finish within {}s", t.as_secs()),
+            NftError::Failed(m) => write!(f, "nft said: {}", m),
+        }
     }
 }
 
-fn nft_script(script: &str) -> Result<()> {
-    use std::io::Write;
-    let mut child = crate::procsrc::system_command("nft")
-        .args(["-f", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to run nft")?;
-    child
-        .stdin
-        .take()
-        .context("nft stdin")?
-        .write_all(script.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        anyhow::bail!(
-            "nft rejected the block table: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+impl std::error::Error for NftError {}
+
+/// Run a command with a time limit, feeding it `stdin`. Its output is read
+/// on threads, so a long listing can't fill a pipe and stall it.
+fn run_limited(
+    mut cmd: std::process::Command,
+    stdin: Option<&[u8]>,
+    limit: Duration,
+) -> std::result::Result<String, NftError> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => NftError::Missing,
+        _ => NftError::Failed(e.to_string()),
+    })?;
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = pipe.write_all(input);
     }
+    let reader = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = reader(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = reader(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(NftError::Timeout(limit));
+            }
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).into_owned())
+    } else {
+        let msg = String::from_utf8_lossy(&stderr);
+        let first = msg.lines().map(str::trim).find(|l| !l.is_empty());
+        Err(NftError::Failed(
+            first.unwrap_or("it exited with an error").to_string(),
+        ))
+    }
+}
+
+fn nft(args: &[&str]) -> Result<String> {
+    let mut cmd = crate::procsrc::system_command("nft");
+    cmd.args(args);
+    Ok(run_limited(cmd, None, NFT_TIMEOUT)?)
+}
+
+fn nft_script(script: &str) -> Result<()> {
+    let mut cmd = crate::procsrc::system_command("nft");
+    cmd.args(["-f", "-"]);
+    run_limited(cmd, Some(script.as_bytes()), NFT_TIMEOUT)?;
     Ok(())
 }
 
@@ -131,17 +203,26 @@ pub fn refusal(ip: IpAddr, cfg: &Config) -> Option<String> {
         }
     };
     if special {
-        return Some(format!("{} is a loopback/link-local/special address", ip));
+        return Some(format!(
+            "{} is a loopback, link-local or other special address",
+            ip
+        ));
     }
     for c in &cfg.response.management_cidrs {
         if let Some(net) = hermian_core::allowlist::parse_cidr(c) {
             if cidr_contains(net, ip) || overlaps_v6_block(net, ip) {
-                return Some(format!("{} is inside management CIDR {}", ip, c));
+                return Some(format!(
+                    "{} is inside your management network {} (response.management_cidrs)",
+                    ip, c
+                ));
             }
         }
     }
     if cfg.allowlist.source_allowed(ip) {
-        return Some(format!("{} is an allowlisted SSH source", ip));
+        return Some(format!(
+            "{} is an allowlisted SSH source (allowlist.ssh_sources)",
+            ip
+        ));
     }
     None
 }
@@ -290,21 +371,6 @@ pub fn cmd_blocked() -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_unblock(ip: &str) -> Result<()> {
-    crate::config::require_root()?;
-    let st = crate::ui::Style::detect();
-    let ip: IpAddr = ip
-        .trim()
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .parse()
-        .with_context(|| format!("'{}' is not an IP address", ip))?;
-    let key = unblock(ip)?;
-    println!("{}", st.ok(&format!("Unblocked {}.", key)));
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +493,43 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn nft_problems_come_back_typed() {
+        use std::process::Command;
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        assert_eq!(
+            run_limited(Command::new("/nonexistent/nft"), None, NFT_TIMEOUT),
+            Err(NftError::Missing)
+        );
+        assert_eq!(
+            run_limited(sh("sleep 5"), None, Duration::from_millis(200)),
+            Err(NftError::Timeout(Duration::from_millis(200)))
+        );
+        // Only the first non-empty line of what it said.
+        assert_eq!(
+            run_limited(
+                sh("printf '\nError: no such set\nmore\n' >&2; exit 1"),
+                None,
+                NFT_TIMEOUT
+            ),
+            Err(NftError::Failed("Error: no such set".into()))
+        );
+        assert_eq!(
+            run_limited(sh("cat"), Some(b"fed in"), NFT_TIMEOUT).as_deref(),
+            Ok("fed in")
+        );
+        // A big listing doesn't stall on a full pipe.
+        let big = run_limited(
+            sh("head -c 300000 /dev/zero | tr '\\0' x"),
+            None,
+            NFT_TIMEOUT,
+        );
+        assert_eq!(big.map(|o| o.len()), Ok(300_000));
     }
 }

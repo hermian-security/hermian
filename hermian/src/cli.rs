@@ -52,8 +52,10 @@ const COMMAND_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (
         "Response",
         &[
-            ("blocked", "Addresses blocked from Telegram buttons"),
+            ("block <ip>...", "Block addresses, like the Telegram button"),
+            ("blocked", "Addresses blocked, and for how long"),
             ("unblock <ip>", "Lift a block before it expires"),
+            ("disconnect <ip>", "End the SSH sessions from an address"),
             ("isolate", "Cut the network, keep your management access"),
             ("unisolate", "Lift isolation"),
         ],
@@ -138,10 +140,14 @@ pub enum Cmd {
     Isolate(IsolateArgs),
     /// Remove network isolation
     Unisolate,
-    /// List addresses blocked with the Telegram "Block" buttons
+    /// Block addresses in the firewall, like the Telegram "Block" button
+    Block(BlockArgs),
+    /// List addresses blocked with the Telegram "Block" buttons or `hermian block`
     Blocked,
     /// Lift a block before it expires
     Unblock(UnblockArgs),
+    /// End the SSH sessions from an address, like the "Disconnect" button
+    Disconnect(DisconnectArgs),
     /// Completely remove Hermian from this host
     Uninstall(UninstallArgs),
     /// Run the daemon (used by the systemd unit)
@@ -255,6 +261,19 @@ pub struct IsolateArgs {
     /// timer, so it works even if you can't get back in)
     #[arg(long = "for", value_name = "MINUTES", value_parser = clap::value_parser!(u32).range(1..=10080))]
     pub for_mins: Option<u32>,
+}
+
+#[derive(clap::Args)]
+pub struct BlockArgs {
+    /// Addresses to block for response.block_duration_hours (IPv6: their /64)
+    #[arg(required = true, value_name = "IP")]
+    pub ips: Vec<String>,
+}
+
+#[derive(clap::Args)]
+pub struct DisconnectArgs {
+    /// The address the SSH sessions come from
+    pub ip: String,
 }
 
 #[derive(clap::Args)]

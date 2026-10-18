@@ -14,7 +14,7 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    audit, auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
+    actions, audit, auditnetlink, authlog, config, configdiff, ebpf, fallback, health, heartbeat,
     isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, sshkeys, status,
     tgbot, watchers,
 };
@@ -543,6 +543,10 @@ async fn async_main(
                     report_dropped_events(&mut engine, &notifier, &grown, &dropped_now);
                 }
                 dropped_seen = dropped_now;
+                let conflicts = tgbot::take_conflicts();
+                if conflicts >= 2 {
+                    report_bot_conflict(&mut engine, &notifier, conflicts);
+                }
                 let unmonitored = ebpf::unmonitored_cpus();
                 if !unmonitored.is_empty() && unmonitored != hotplug_reported {
                     report_unmonitored_cpus(&mut engine, &notifier, &unmonitored);
@@ -662,6 +666,33 @@ fn report_dropped_events(
     }
 }
 
+/// Page when something else keeps reading this bot's button presses: each
+/// press then reaches only one of the readers, and the other answers that
+/// it doesn't know the button. The dedup window keeps it to one page.
+fn report_bot_conflict(engine: &mut Engine, notifier: &notify::Notifier, conflicts: u32) {
+    let n = conflicts.to_string();
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::High,
+            "Another host is reading this bot's button presses",
+            "Telegram refused to hand this host its button presses because something else is \
+             polling the same bot. Each press now reaches only one of them, at random.",
+            "A press that lands on the wrong host does nothing there, so a Block or Disconnect \
+             can silently not happen.",
+            &[
+                "Give each host with buttons its own bot (see docs/FLEET.md), or turn buttons off \
+                 on the others (notifications.telegram.actions = false).",
+                "If no other host should use this bot, someone else has its token: revoke it with \
+                 @BotFather.",
+            ],
+            &[("Conflicts", n.as_str())],
+            "selfprotect|tg-conflict",
+        ),
+    );
+}
+
 fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>, cfg: &Config) {
     if let Ok(mut c) = shared.lock() {
         *c = cfg.notifications.telegram.clone();
@@ -671,14 +702,17 @@ fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>
 /// Carry out a Telegram button press that passed every check (see tgbot).
 ///
 /// Quick engine-side choices (ignore, snooze) happen here; firewall and
-/// process work runs on a blocking thread, which then posts the outcome as
-/// a reply to the alert. Every press is also recorded as a local alert.
+/// process work runs on a blocking thread. Either way the outcome is posted
+/// as a reply to the alert, one line per target (see `actions`), and the
+/// alert's buttons are updated to show it. Every press is also recorded as
+/// a local alert.
 fn handle_action(
     engine: &mut Engine,
     notifier: &notify::Notifier,
     cfg: &Config,
     req: tgbot::ActionRequest,
 ) {
+    use actions::{Line, Mark};
     use hermian_core::ResponseAction as A;
     let now = Utc::now();
     let label = req.action.label();
@@ -700,50 +734,77 @@ fn handle_action(
         ),
     );
     let tg = cfg.notifications.telegram.clone();
-    let settled = req.action.settles();
-    let mid = req.message_id;
-    let by = req.by.clone();
-    match req.action {
+    let host = engine.host.clone();
+    let cfg = cfg.clone();
+    // An Undo lasts as long as the block, up to a day.
+    let undo_mins = (cfg.response.block_duration_hours.max(1) * 60).min(1440);
+    let conclude =
+        move |req: tgbot::ActionRequest, lines: Vec<Line>, undo: Vec<std::net::IpAddr>| {
+            let now = Utc::now();
+            let text = actions::render(&host, &req.by, &lines, now);
+            log_daemon(
+                Severity::High,
+                &format!("{}: {}", req.action.label(), text.replace('\n', "; ")),
+            );
+            let summary = actions::summary(&req.action, &lines, &req.by, now);
+            let reply = actions::needs_reply(&req.action, &lines);
+            let undo = (!undo.is_empty()).then_some((A::Unblock { sources: undo }, undo_mins));
+            tgbot::finish(&tg, &req, &text, &summary, reply, undo, now);
+        };
+    match req.action.clone() {
         A::Ignore { sources, hours } => {
-            let text = if sources.is_empty() || hours == 0 {
-                format!("Ignored by {}.", by)
+            let line = if sources.is_empty() || hours == 0 {
+                Line::new(Mark::Done, "Ignored")
             } else {
                 engine.ignore_sources(&sources, now + chrono::Duration::hours(i64::from(hours)));
-                format!(
-                    "Ignoring {} source(s) for {}h (by {}). Logins from them still alert.",
-                    sources.len(),
-                    hours,
-                    by
+                Line::new(
+                    Mark::Done,
+                    format!(
+                        "Ignoring {} source(s) for {}h; logins from them still alert",
+                        sources.len(),
+                        hours
+                    ),
                 )
             };
-            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+            tokio::task::spawn_blocking(move || conclude(req, vec![line], Vec::new()));
         }
         A::SnoozeRootPasswordWarning { days } => {
             engine.snooze_root_warning(now + chrono::Duration::days(i64::from(days)));
             save_engine_state(engine);
-            let text = format!(
-                "Root password warning snoozed for {} days (by {}).",
-                days, by
+            let line = Line::new(
+                Mark::Done,
+                format!("Root password warning snoozed for {} days", days),
             );
-            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+            tokio::task::spawn_blocking(move || conclude(req, vec![line], Vec::new()));
         }
         A::Block { sources } => {
             for ip in &sources {
                 engine.brute.forget(ip);
             }
-            let cfg = cfg.clone();
             tokio::task::spawn_blocking(move || {
-                let hours = cfg.response.block_duration_hours;
-                let lines: Vec<String> = sources
+                let ctx = action_ctx(&cfg, &req);
+                let mut undo = Vec::new();
+                let lines = sources
                     .iter()
-                    .map(|ip| match blocklist::block(*ip, hours, &cfg) {
-                        Ok(key) => format!("Blocked {} for {}h", key, hours),
-                        Err(e) => format!("{}: {:#}", ip, e),
+                    .map(|ip| {
+                        let l = actions::block(&ctx, *ip);
+                        if l.mark == Mark::Done {
+                            undo.push(*ip);
+                        }
+                        l
                     })
                     .collect();
-                let text = format!("{} (by {})", lines.join("\n"), by);
-                log_daemon(Severity::High, &text.replace('\n', "; "));
-                tgbot::report(&tg, mid, &text, settled);
+                conclude(req.clone(), lines, undo);
+            });
+        }
+        A::Unblock { sources } => {
+            tokio::task::spawn_blocking(move || {
+                let ctx = action_ctx(&cfg, &req);
+                let lines = sources
+                    .iter()
+                    .map(|ip| actions::unblock(&ctx, *ip))
+                    .collect();
+                conclude(req.clone(), lines, Vec::new());
             });
         }
         A::Disconnect {
@@ -752,32 +813,42 @@ fn handle_action(
             user,
             block,
         } => {
-            let cfg = cfg.clone();
             tokio::task::spawn_blocking(move || {
+                let ctx = action_ctx(&cfg, &req);
                 let mut lines = Vec::new();
+                let mut undo = Vec::new();
                 // Block first: otherwise the session can come right back.
                 if block {
-                    let hours = cfg.response.block_duration_hours;
-                    lines.push(match blocklist::block(source, hours, &cfg) {
-                        Ok(key) => format!("Blocked {} for {}h", key, hours),
-                        Err(e) => format!("Block failed: {:#}", e),
-                    });
+                    let l = actions::block(&ctx, source);
+                    if l.mark == Mark::Done {
+                        undo.push(source);
+                    }
+                    lines.push(l);
                 }
-                lines.push(match sessions::disconnect(source, port) {
-                    Ok(d) => format!(
-                        "Disconnected {} from {} ({} connection(s), {} sshd process(es) stopped)",
-                        user,
-                        source,
-                        d.connections,
-                        d.processes.len()
-                    ),
-                    Err(e) => format!("Disconnect: {:#}", e),
-                });
-                let text = format!("{} (by {})", lines.join("\n"), by);
-                log_daemon(Severity::High, &text.replace('\n', "; "));
-                tgbot::report(&tg, mid, &text, settled);
+                let blocked = lines
+                    .iter()
+                    .any(|l| l.mark != Mark::Failed && l.mark != Mark::Refused);
+                let d = actions::disconnect(&ctx, source, port, &user);
+                let ended = d.mark == Mark::Done;
+                lines.push(d);
+                if ended {
+                    lines.push(actions::after_disconnect(blocked));
+                }
+                conclude(req.clone(), lines, undo);
             });
         }
+    }
+}
+
+/// What the action decisions need for a button press.
+fn action_ctx<'a>(cfg: &'a Config, req: &'a tgbot::ActionRequest) -> actions::Ctx<'a> {
+    actions::Ctx {
+        host: &actions::RealHost,
+        ledger: actions::ledger(),
+        cfg,
+        by: &req.by,
+        alert_ref: &req.alert_ref,
+        now: Utc::now(),
     }
 }
 

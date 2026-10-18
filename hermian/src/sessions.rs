@@ -13,6 +13,27 @@ pub struct Disconnected {
     pub processes: Vec<u32>,
 }
 
+/// Why `disconnect` didn't end anything, so a button press can be answered
+/// with what that means (see `actions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectError {
+    /// No established connection from that source: nothing to end.
+    NotConnected,
+    /// The connection is there, but no sshd process holds it.
+    NoSshd,
+}
+
+impl std::fmt::Display for DisconnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DisconnectError::NotConnected => "no open SSH connection from that address",
+            DisconnectError::NoSshd => "found the connection but no sshd process to stop",
+        })
+    }
+}
+
+impl std::error::Error for DisconnectError {}
+
 /// Names sshd's per-connection processes go by.
 fn is_sshd(comm: &str) -> bool {
     comm == "sshd" || comm == "sshd-session" || comm.starts_with("sshd:")
@@ -51,11 +72,7 @@ pub fn disconnect(source: IpAddr, port: Option<u16>) -> Result<Disconnected> {
     let rows = procsrc::read_tcp_tables();
     let inodes = session_inodes(&rows, source, port);
     if inodes.is_empty() {
-        anyhow::bail!(
-            "no open SSH connection from {}{}",
-            source,
-            port.map(|p| format!(" port {}", p)).unwrap_or_default()
-        );
+        return Err(DisconnectError::NotConnected.into());
     }
     let mut killed = Vec::new();
     for pid in procsrc::all_pids_for_inodes(&inodes) {
@@ -69,7 +86,7 @@ pub fn disconnect(source: IpAddr, port: Option<u16>) -> Result<Disconnected> {
         }
     }
     if killed.is_empty() {
-        anyhow::bail!("found the connection but no sshd process to stop");
+        return Err(DisconnectError::NoSshd.into());
     }
     Ok(Disconnected {
         connections: inodes.len(),

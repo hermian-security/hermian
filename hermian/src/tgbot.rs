@@ -1,15 +1,21 @@
 //! Telegram response buttons.
 //!
 //! Alerts that offer responses get an inline keyboard. Each button carries a
-//! random one-time id that points at an action kept here, in memory, until
-//! it expires. Button presses are fetched by long-polling `getUpdates`
-//! (outbound only, so Hermian still listens on no port, and it keeps working
-//! during isolation since Telegram stays reachable). A press is only acted
-//! on if it comes from the configured chat *and* from one of
-//! `allowed_user_ids`; anything else is refused and logged.
+//! random one-time id that points at an action kept here until it expires,
+//! and saved in the state directory so a restart doesn't kill it. Button
+//! presses are fetched by long-polling `getUpdates` (outbound only, so
+//! Hermian still listens on no port, and it keeps working during isolation
+//! since Telegram stays reachable). A press is only acted on if it comes
+//! from the configured chat *and* from one of `allowed_user_ids`; anything
+//! else is refused and logged.
 //!
 //! Destructive actions (Block, Disconnect) take two presses: the first swaps
 //! the keyboard for "Confirm" and "Cancel", which expire after two minutes.
+//!
+//! Every press gets an answer that says what happened (see `actions`): a
+//! used button turns into a label with the outcome, pressing a button again
+//! or after someone else's choice says who did what and when, and an
+//! expired button gives the command that does the same thing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +25,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use hermian_core::config::TelegramCfg;
 use hermian_core::ResponseAction;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+
+use crate::actions::{at, short};
 
 /// Prefix of our callback data, so stray buttons from elsewhere are ignored.
 const PREFIX: &str = "hm:";
@@ -30,19 +39,36 @@ const MAX_PENDING: usize = 2000;
 const POLL_SECS: u64 = 25;
 /// How long a "Confirm" button stays valid.
 const CONFIRM_SECS: i64 = 120;
+/// How long used buttons and result labels keep answering.
+const KEEP_HOURS: i64 = 24;
+/// Telegram's limit for a callback answer.
+const ANSWER_MAX: usize = 200;
 
-/// Where a button sits in the two-step flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a button sits in the flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Step {
-    /// One of the alert's own buttons, at this position.
+    /// One of the alert's own buttons (or an Undo), at this position.
     Offer(usize),
-    /// "Confirm: ..." for a destructive offer.
-    Confirm,
+    /// "Confirm: ..." for the destructive offer with this id.
+    Confirm { offer: String },
     /// "Cancel": put the alert's buttons back.
-    Cancel,
+    Cancel { offer: String },
+    /// Pressed, or retired by someone's choice on the same alert.
+    Used {
+        by: String,
+        at: DateTime<Utc>,
+        note: String,
+    },
+    /// Shows `text` (a result or a hint) when pressed; does nothing else.
+    /// `shown` is what the button itself reads.
+    Label {
+        text: String,
+        #[serde(default)]
+        shown: String,
+    },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pending {
     pub action: ResponseAction,
     pub alert_ref: String,
@@ -83,6 +109,77 @@ fn store() -> &'static Mutex<HashMap<String, Pending>> {
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Results that couldn't be posted, sent with the next message that can.
+fn undelivered() -> &'static Mutex<Vec<String>> {
+    static U: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    U.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Buttons are saved to disk only by the running poller, not in tests.
+static PERSIST: AtomicBool = AtomicBool::new(false);
+static STARTED: OnceLock<DateTime<Utc>> = OnceLock::new();
+/// HTTP 409s from getUpdates since the daemon last asked: something else
+/// is polling this bot.
+static CONFLICTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Poll conflicts since the last call (see `daemon::report_bot_conflict`).
+pub fn take_conflicts() -> u32 {
+    CONFLICTS.swap(0, Ordering::Relaxed)
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Saved {
+    buttons: HashMap<String, Pending>,
+    #[serde(default)]
+    undelivered: Vec<String>,
+}
+
+fn saved_path() -> std::path::PathBuf {
+    crate::paths::state_dir().join("buttons.json")
+}
+
+/// Write the buttons (and undelivered results) out. Call with the store
+/// lock held, so writes don't interleave.
+fn save(s: &HashMap<String, Pending>) {
+    if !PERSIST.load(Ordering::Relaxed) {
+        return;
+    }
+    let saved = Saved {
+        buttons: s.clone(),
+        undelivered: undelivered().lock().map(|u| u.clone()).unwrap_or_default(),
+    };
+    if let Ok(text) = serde_json::to_string(&saved) {
+        let _ = crate::config::write_secure(&saved_path(), &text);
+    }
+}
+
+/// Load what a previous run saved; expired offers are tidied by the sweep.
+fn load_saved(now: DateTime<Utc>) {
+    let saved: Saved = std::fs::read_to_string(saved_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    if let Ok(mut s) = store().lock() {
+        for (id, p) in saved.buttons {
+            if keep(&p, now) {
+                s.entry(id).or_insert(p);
+            }
+        }
+    }
+    if let Ok(mut u) = undelivered().lock() {
+        u.extend(saved.undelivered);
+    }
+}
+
+/// Still worth keeping: live, or an expired offer whose keyboard the sweep
+/// hasn't tidied yet.
+fn keep(p: &Pending, now: DateTime<Utc>) -> bool {
+    match p.step {
+        Step::Offer(_) => p.expires > now - chrono::Duration::hours(KEEP_HOURS),
+        _ => p.expires > now,
+    }
+}
+
 /// Last poll problem, for `hermian status` (empty when fine).
 fn poll_error() -> &'static Mutex<String> {
     static E: OnceLock<Mutex<String>> = OnceLock::new();
@@ -116,6 +213,22 @@ fn random_id() -> String {
     hex::encode(b)
 }
 
+/// Drop the oldest entries past the cap.
+fn trim(s: &mut HashMap<String, Pending>) {
+    while s.len() > MAX_PENDING {
+        let oldest = s
+            .iter()
+            .min_by_key(|(_, p)| p.expires)
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                s.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Keep actions for these buttons; returns `(callback_data, label)` pairs.
 pub fn register(
     alert_ref: &str,
@@ -127,7 +240,7 @@ pub fn register(
     let Ok(mut s) = store().lock() else {
         return Vec::new();
     };
-    s.retain(|_, p| p.expires > now);
+    s.retain(|_, p| keep(p, now));
     let mut out = Vec::new();
     for (i, a) in actions.iter().enumerate() {
         let id = random_id();
@@ -143,18 +256,8 @@ pub fn register(
         );
         out.push((format!("{}{}", PREFIX, id), a.label()));
     }
-    while s.len() > MAX_PENDING {
-        let oldest = s
-            .iter()
-            .min_by_key(|(_, p)| p.expires)
-            .map(|(k, _)| k.clone());
-        match oldest {
-            Some(k) => {
-                s.remove(&k);
-            }
-            None => break,
-        }
-    }
+    trim(&mut s);
+    save(&s);
     out
 }
 
@@ -166,6 +269,7 @@ pub fn attach_message(buttons: &[(String, String)], message_id: i64) {
                 p.message_id = Some(message_id);
             }
         }
+        save(&s);
     }
 }
 
@@ -178,7 +282,7 @@ pub fn keyboard(buttons: &[(String, String)]) -> Value {
     json!({ "inline_keyboard": rows })
 }
 
-/// The alert's own buttons still pending, in their original order.
+/// The alert's own buttons still live, in their original order.
 fn offers_of(
     s: &HashMap<String, Pending>,
     alert_ref: &str,
@@ -196,9 +300,175 @@ fn offers_of(
     v.into_iter().map(|(_, d, l)| (d, l)).collect()
 }
 
+/// A label button: shows `text` when pressed. Returns its keyboard entry.
+fn add_label(
+    s: &mut HashMap<String, Pending>,
+    like: &Pending,
+    shown: &str,
+    text: &str,
+    now: DateTime<Utc>,
+) -> (String, String) {
+    let id = random_id();
+    s.insert(
+        id.clone(),
+        Pending {
+            action: like.action.clone(),
+            alert_ref: like.alert_ref.clone(),
+            expires: now + chrono::Duration::hours(KEEP_HOURS),
+            message_id: like.message_id,
+            step: Step::Label {
+                text: text.to_string(),
+                shown: shown.to_string(),
+            },
+        },
+    );
+    (format!("{}{}", PREFIX, id), shown.to_string())
+}
+
+/// What an expired button says: how long they last, and the command that
+/// does the same thing from the host.
+fn expired_text(hints: &[String], ttl_mins: u32) -> String {
+    let head = format!("Expired (buttons last {} min).", ttl_mins);
+    if hints.is_empty() {
+        format!("{} Nothing was done.", head)
+    } else {
+        format!("{} From the host: {}", head, hints.join("  |  "))
+    }
+}
+
+/// Swap an alert's expired buttons for one "Buttons expired" label, keeping
+/// any result labels. Returns the message's new keyboard.
+fn expire_alert(
+    s: &mut HashMap<String, Pending>,
+    alert_ref: &str,
+    ttl_mins: u32,
+    now: DateTime<Utc>,
+) -> Option<(i64, Vec<(String, String)>)> {
+    let offers: Vec<(String, Pending)> = s
+        .iter()
+        .filter(|(_, p)| p.alert_ref == alert_ref && matches!(p.step, Step::Offer(_)))
+        .map(|(k, p)| (k.clone(), p.clone()))
+        .collect();
+    let first = offers
+        .iter()
+        .min_by_key(|(_, p)| match p.step {
+            Step::Offer(i) => i,
+            _ => usize::MAX,
+        })?
+        .1
+        .clone();
+    let mid = first.message_id?;
+    let hints: Vec<String> = offers
+        .iter()
+        .filter_map(|(_, p)| p.action.cli_twin())
+        .collect();
+    for (k, _) in &offers {
+        s.remove(k);
+    }
+    s.retain(|_, p| {
+        !(p.alert_ref == alert_ref && matches!(p.step, Step::Confirm { .. } | Step::Cancel { .. }))
+    });
+    let text = expired_text(&hints, ttl_mins);
+    let mut kb = labels_of(s, alert_ref);
+    kb.push(add_label(s, &first, "Buttons expired", &text, now));
+    Some((mid, kb))
+}
+
+/// Result labels already on an alert's message, oldest first.
+fn labels_of(s: &HashMap<String, Pending>, alert_ref: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(DateTime<Utc>, String, String)> = s
+        .iter()
+        .filter(|(_, p)| p.alert_ref == alert_ref)
+        .filter_map(|(id, p)| match &p.step {
+            Step::Label { text, shown } if !text.starts_with("Expired") => {
+                let shown = if shown.is_empty() {
+                    text.lines().next().unwrap_or("").to_string()
+                } else {
+                    shown.clone()
+                };
+                Some((p.expires, format!("{}{}", PREFIX, id), shown))
+            }
+            _ => None,
+        })
+        .collect();
+    v.sort();
+    v.into_iter().map(|(_, d, l)| (d, l)).collect()
+}
+
+/// The host an alert's text names: its "host" line, or "... on <host>" in
+/// the minimal format.
+fn host_in(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("host ") {
+            let h = rest.trim();
+            if !h.is_empty() {
+                return Some(h.to_string());
+            }
+        }
+    }
+    let first = text.lines().next()?;
+    let (_, after) = first.rsplit_once(" alert ")?;
+    let (_, host) = after.split_once(" on ")?;
+    let host = host.trim();
+    (!host.is_empty() && !host.contains(' ')).then(|| host.to_string())
+}
+
+/// The alert reference in a message's text, for the "details" hint.
+fn alert_ref_in(text: &str) -> Option<String> {
+    let i = text.find("HER-")?;
+    let r: String = text[i..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    (r.len() > 8).then_some(r)
+}
+
+/// A button we know nothing about: say why, and where the alert is.
+fn unknown_button(cq: &Value, now: DateTime<Utc>) -> String {
+    let text = cq["message"]["text"].as_str().unwrap_or("");
+    // Another host's alert: two hosts are polling this bot, and this one
+    // got a press meant for the other.
+    let me = crate::procsrc::hostname();
+    if let Some(host) = host_in(text).filter(|h| *h != me) {
+        return format!(
+            "This is {}'s alert, but {} answered: both read this bot's presses. Give each host              with buttons its own bot. Nothing was done.",
+            host, me
+        );
+    }
+    let hint = alert_ref_in(text)
+        .map(|r| format!(" Details: sudo hermian show {}", r))
+        .unwrap_or_default();
+    let sent = cq["message"]["date"]
+        .as_i64()
+        .and_then(|t| DateTime::from_timestamp(t, 0));
+    match (sent, STARTED.get()) {
+        (Some(sent), Some(start)) if sent < *start => format!(
+            "Hermian restarted at {}, after this alert, and this button was lost. Nothing was \
+             done.{}",
+            at(now, *start),
+            hint
+        ),
+        _ => format!("This button is no longer valid. Nothing was done.{}", hint),
+    }
+}
+
+fn clip(s: String) -> String {
+    if s.chars().count() <= ANSWER_MAX {
+        return s;
+    }
+    let mut t: String = s.chars().take(ANSWER_MAX - 1).collect();
+    t.push('…');
+    t
+}
+
 /// Decide what to do with one callback query. Returns the text to show the
 /// presser and what to do next.
 pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome) {
+    let (text, out) = decide(cq, cfg, now);
+    (clip(text), out)
+}
+
+fn decide(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (String, Outcome) {
     let none = Outcome::default;
     let from_id = cq["from"]["id"].as_i64();
     let who = describe_user(&cq["from"]);
@@ -232,46 +502,58 @@ pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (St
     let Ok(mut s) = store().lock() else {
         return ("Try again.".into(), none());
     };
-    let Some(p) = s.remove(id) else {
-        return (
-            "This button has expired or was already used.".into(),
-            none(),
-        );
+    let Some(p) = s.get(id).cloned() else {
+        return (unknown_button(cq, now), none());
     };
     let message_id = p
         .message_id
         .or_else(|| cq["message"]["message_id"].as_i64());
-    let restore =
-        |s: &HashMap<String, Pending>| message_id.map(|m| (m, offers_of(s, &p.alert_ref, now)));
+    let label = p.action.label();
+    match &p.step {
+        Step::Used { by, note, .. } => {
+            let text = if *by == who {
+                format!("You did this: {}", note)
+            } else {
+                format!("Already handled: {}. Yours wasn't applied.", note)
+            };
+            return (text, none());
+        }
+        Step::Label { text, .. } => return (text.clone(), none()),
+        _ => {}
+    }
     if p.expires <= now {
-        let text = if p.step == Step::Confirm {
-            "The confirmation expired; press the button again."
-        } else {
-            "This button has expired."
-        };
-        // A stale confirmation shouldn't leave the alert without buttons.
-        let keyboard = if p.step == Step::Confirm {
-            restore(&s)
-        } else {
-            None
-        };
-        s.retain(|_, o| {
-            !(o.alert_ref == p.alert_ref && matches!(o.step, Step::Confirm | Step::Cancel))
-        });
+        if let Step::Confirm { .. } | Step::Cancel { .. } = p.step {
+            // A stale confirmation shouldn't leave the alert without buttons.
+            s.retain(|_, o| {
+                !(o.alert_ref == p.alert_ref
+                    && matches!(o.step, Step::Confirm { .. } | Step::Cancel { .. }))
+            });
+            let keyboard = message_id.map(|m| (m, offers_of(&s, &p.alert_ref, now)));
+            save(&s);
+            return (
+                "The confirmation expired; press the button again.".into(),
+                Outcome {
+                    request: None,
+                    keyboard,
+                },
+            );
+        }
+        let keyboard = expire_alert(&mut s, &p.alert_ref, cfg.action_ttl_mins, now);
+        save(&s);
         return (
-            text.into(),
+            expired_text(
+                &p.action.cli_twin().into_iter().collect::<Vec<_>>(),
+                cfg.action_ttl_mins,
+            ),
             Outcome {
                 request: None,
                 keyboard,
             },
         );
     }
-    match p.step {
+    let offer_id = match &p.step {
         Step::Offer(_) if needs_confirmation(&p.action) => {
             // Keep the offer for Cancel, and ask.
-            let label = p.action.label();
-            let alert_ref = p.alert_ref.clone();
-            s.insert(id.to_string(), p.clone());
             let until = now + chrono::Duration::seconds(CONFIRM_SECS);
             let mut step = |st: Step| {
                 let nid = random_id();
@@ -279,7 +561,7 @@ pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (St
                     nid.clone(),
                     Pending {
                         action: p.action.clone(),
-                        alert_ref: alert_ref.clone(),
+                        alert_ref: p.alert_ref.clone(),
                         expires: until,
                         message_id,
                         step: st,
@@ -287,8 +569,13 @@ pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (St
                 );
                 format!("{}{}", PREFIX, nid)
             };
-            let confirm = step(Step::Confirm);
-            let cancel = step(Step::Cancel);
+            let confirm = step(Step::Confirm {
+                offer: id.to_string(),
+            });
+            let cancel = step(Step::Cancel {
+                offer: id.to_string(),
+            });
+            save(&s);
             let keyboard = message_id.map(|m| {
                 (
                     m,
@@ -306,35 +593,73 @@ pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (St
                 },
             );
         }
-        Step::Cancel => {
+        Step::Cancel { .. } => {
             s.retain(|_, o| {
-                !(o.alert_ref == p.alert_ref && matches!(o.step, Step::Confirm | Step::Cancel))
+                !(o.alert_ref == p.alert_ref
+                    && matches!(o.step, Step::Confirm { .. } | Step::Cancel { .. }))
             });
+            let keyboard = message_id.map(|m| {
+                let mut kb = labels_of(&s, &p.alert_ref);
+                kb.extend(offers_of(&s, &p.alert_ref, now));
+                (m, kb)
+            });
+            save(&s);
             return (
                 "Cancelled. Nothing was changed.".into(),
                 Outcome {
                     request: None,
-                    keyboard: restore(&s),
+                    keyboard,
                 },
             );
         }
-        _ => {}
+        Step::Confirm { offer } => offer.clone(),
+        _ => id.to_string(),
+    };
+    // An offer that needs no confirmation, or a confirmed one: it's used.
+    s.retain(|_, o| {
+        !(o.alert_ref == p.alert_ref
+            && matches!(o.step, Step::Confirm { .. } | Step::Cancel { .. }))
+    });
+    let Some(offer) = s.get(&offer_id).cloned() else {
+        return (unknown_button(cq, now), none());
+    };
+    // Someone else chose while this Confirm was up.
+    if let Step::Used { note, .. } = &offer.step {
+        save(&s);
+        return (
+            format!("Already handled: {}. Yours wasn't applied.", note),
+            none(),
+        );
     }
-    // An offer that needs no confirmation, or a confirmed one.
-    let mut keyboard = None;
+    let used = |note: String| Step::Used {
+        by: who.clone(),
+        at: now,
+        note,
+    };
+    let keep_until = now + chrono::Duration::hours(KEEP_HOURS);
+    let note = format!("{} chose {} at {}", short(&who), label, at(now, now));
+    if let Some(o) = s.get_mut(&offer_id) {
+        o.step = used(note.clone());
+        o.expires = keep_until;
+    }
     if p.action.settles() {
-        // One choice per alert: its other buttons stop working.
-        s.retain(|_, other| other.alert_ref != p.alert_ref);
-    } else if p.step == Step::Confirm {
-        // Not settling (one source of a digest): retire the confirmation and
-        // the offer it confirmed, and give the rest of the buttons back.
-        let action = p.action.clone();
-        s.retain(|_, o| {
-            !(o.alert_ref == p.alert_ref
-                && (matches!(o.step, Step::Confirm | Step::Cancel) || o.action == action))
-        });
-        keyboard = restore(&s);
+        // One choice per alert: its other buttons say who chose what.
+        for o in s.values_mut() {
+            if o.alert_ref == p.alert_ref && matches!(o.step, Step::Offer(_)) {
+                o.step = used(note.clone());
+                o.expires = keep_until;
+            }
+        }
     }
+    // Until the result is in, the message shows what's left to press.
+    let keyboard = message_id.map(|m| {
+        let mut kb = labels_of(&s, &p.alert_ref);
+        if !p.action.settles() {
+            kb.extend(offers_of(&s, &p.alert_ref, now));
+        }
+        (m, kb)
+    });
+    save(&s);
     let req = ActionRequest {
         action: p.action.clone(),
         alert_ref: p.alert_ref.clone(),
@@ -342,12 +667,133 @@ pub fn handle_callback(cq: &Value, cfg: &TelegramCfg, now: DateTime<Utc>) -> (St
         message_id,
     };
     (
-        format!("{}: on it.", p.action.label()),
+        format!("On it: {} on {}", label, crate::procsrc::hostname()),
         Outcome {
             request: Some(req),
             keyboard,
         },
     )
+}
+
+/// The keyboard an alert gets once a press has its result: earlier result
+/// labels, this result's label, the Undo where there is one, and the alert's
+/// remaining buttons if the choice didn't settle it.
+fn result_keyboard(
+    s: &mut HashMap<String, Pending>,
+    req: &ActionRequest,
+    text: &str,
+    summary: &str,
+    undo: Option<(ResponseAction, u32)>,
+    now: DateTime<Utc>,
+) -> Vec<(String, String)> {
+    // Later presses on the buttons this choice used or retired quote the
+    // outcome instead of "chose ...".
+    let chose = format!("{} chose {}", short(&req.by), req.action.label());
+    for o in s.values_mut() {
+        if o.alert_ref == req.alert_ref {
+            if let Step::Used { note, .. } = &mut o.step {
+                if note.starts_with(&chose) {
+                    *note = summary.to_string();
+                }
+            }
+        }
+    }
+    let like = Pending {
+        action: req.action.clone(),
+        alert_ref: req.alert_ref.clone(),
+        expires: now,
+        message_id: req.message_id,
+        step: Step::Offer(0),
+    };
+    let mut kb = labels_of(s, &req.alert_ref);
+    kb.push(add_label(s, &like, summary, text, now));
+    if let Some((action, ttl_mins)) = undo {
+        let id = random_id();
+        kb.push((format!("{}{}", PREFIX, id), action.label()));
+        s.insert(
+            id,
+            Pending {
+                action,
+                alert_ref: req.alert_ref.clone(),
+                expires: now + chrono::Duration::minutes(i64::from(ttl_mins.max(1))),
+                message_id: req.message_id,
+                step: Step::Offer(1000),
+            },
+        );
+    }
+    if !req.action.settles() {
+        for b in offers_of(s, &req.alert_ref, now) {
+            if !kb.iter().any(|(k, _)| *k == b.0) {
+                kb.push(b);
+            }
+        }
+    }
+    trim(s);
+    save(s);
+    kb
+}
+
+/// After the daemon carried out a press: the alert's keyboard shows the
+/// outcome (see `result_keyboard`), and with `reply` the full result is
+/// also posted under the alert.
+pub fn finish(
+    cfg: &TelegramCfg,
+    req: &ActionRequest,
+    text: &str,
+    summary: &str,
+    reply: bool,
+    undo: Option<(ResponseAction, u32)>,
+    now: DateTime<Utc>,
+) {
+    let kb = match store().lock() {
+        Ok(mut s) => result_keyboard(&mut s, req, text, summary, undo, now),
+        Err(_) => Vec::new(),
+    };
+    if reply {
+        report(cfg, req.message_id, text);
+    }
+    if let Some(mid) = req.message_id {
+        edit_keyboard(cfg, mid, &kb);
+    }
+}
+
+fn keyboard_value(buttons: &[(String, String)]) -> Value {
+    if buttons.is_empty() {
+        json!({ "inline_keyboard": [] })
+    } else {
+        keyboard(buttons)
+    }
+}
+
+/// Tidy messages whose buttons all expired: they get one "Buttons expired"
+/// label. Returns the keyboards to apply.
+fn sweep(ttl_mins: u32, now: DateTime<Utc>) -> Vec<(i64, Vec<(String, String)>)> {
+    let Ok(mut s) = store().lock() else {
+        return Vec::new();
+    };
+    let mut alerts: Vec<String> = s
+        .values()
+        .filter(|p| matches!(p.step, Step::Offer(_)) && p.message_id.is_some())
+        .map(|p| p.alert_ref.clone())
+        .collect();
+    alerts.sort();
+    alerts.dedup();
+    let mut out = Vec::new();
+    for a in alerts {
+        let all_expired = s
+            .values()
+            .filter(|p| p.alert_ref == a && matches!(p.step, Step::Offer(_)))
+            .all(|p| p.expires <= now);
+        if all_expired {
+            out.extend(expire_alert(&mut s, &a, ttl_mins, now));
+        }
+    }
+    let before = s.len();
+    s.retain(|_, p| keep(p, now));
+    if !out.is_empty() || s.len() != before {
+        save(&s);
+    }
+    out
 }
 
 fn describe_user(from: &Value) -> String {
@@ -399,6 +845,10 @@ pub fn spawn_poller(
     tx: mpsc::Sender<ActionRequest>,
     shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    let now = Utc::now();
+    let _ = STARTED.set(now);
+    PERSIST.store(true, Ordering::Relaxed);
+    load_saved(now);
     std::thread::Builder::new()
         .name("hermian-tgbot".to_string())
         .spawn(move || poll_loop(cfg, tx, shutdown))?;
@@ -451,16 +901,7 @@ fn poll_loop(
                         );
                     }
                     if let Some((mid, buttons)) = &outcome.keyboard {
-                        let _ = call(
-                            &current,
-                            "editMessageReplyMarkup",
-                            json!({
-                                "chat_id": current.chat_id,
-                                "message_id": mid,
-                                "reply_markup": keyboard(buttons),
-                            }),
-                            Duration::from_secs(10),
-                        );
+                        edit_keyboard(&current, *mid, buttons);
                     }
                     if let Some(req) = outcome.request {
                         if tx.blocking_send(req).is_err() {
@@ -468,12 +909,22 @@ fn poll_loop(
                         }
                     }
                 }
+                // Telegram is reachable: tidy expired keyboards and post
+                // any result that couldn't be delivered before.
+                for (mid, buttons) in sweep(current.action_ttl_mins, Utc::now()) {
+                    edit_keyboard(&current, mid, &buttons);
+                }
+                flush_undelivered(&current);
             }
             Err(e) => {
                 // 409: something else is reading this bot's updates. Either
                 // another host with actions on shares the bot (each press
                 // reaches only one of them), or a webhook is set.
-                let hint = if e.starts_with("HTTP 409") {
+                let conflict = e.starts_with("HTTP 409");
+                if conflict {
+                    CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                }
+                let hint = if conflict {
                     " (another host with Telegram actions on may be using this bot: give each \
                      host with buttons its own bot, see docs/FLEET.md; or a webhook is set: \
                      call deleteWebhook)"
@@ -488,9 +939,27 @@ fn poll_loop(
     }
 }
 
-/// Post the outcome as a reply to the alert, and drop its buttons if the
-/// choice settled it. Best effort: failures are logged, not retried.
-pub fn report(cfg: &TelegramCfg, message_id: Option<i64>, text: &str, settled: bool) {
+fn edit_keyboard(cfg: &TelegramCfg, mid: i64, buttons: &[(String, String)]) {
+    let _ = call(
+        cfg,
+        "editMessageReplyMarkup",
+        json!({
+            "chat_id": cfg.chat_id,
+            "message_id": mid,
+            "reply_markup": keyboard_value(buttons),
+        }),
+        Duration::from_secs(10),
+    );
+}
+
+/// Delays before each try of a result message.
+const REPORT_TRIES: [Duration; 3] = [
+    Duration::from_secs(0),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+
+fn send_text(cfg: &TelegramCfg, message_id: Option<i64>, text: &str) -> Result<(), String> {
     let mut body = json!({
         "chat_id": cfg.chat_id,
         "text": text,
@@ -503,23 +972,74 @@ pub fn report(cfg: &TelegramCfg, message_id: Option<i64>, text: &str, settled: b
     if let Some(t) = cfg.message_thread_id {
         body["message_thread_id"] = json!(t);
     }
-    if let Err(e) = call(cfg, "sendMessage", body, Duration::from_secs(15)) {
-        crate::daemon::log_daemon(
-            hermian_core::Severity::Low,
-            &format!("could not post the Telegram action result: {}", e),
-        );
+    call(cfg, "sendMessage", body, Duration::from_secs(15)).map(|_| ())
+}
+
+/// "N earlier action result(s) couldn't be delivered:" and their text.
+fn undelivered_preface(old: &[String]) -> String {
+    format!(
+        "{} earlier action result(s) couldn't be delivered:\n\n{}",
+        old.len(),
+        old.join("\n\n")
+    )
+}
+
+/// Post the result as a reply to the alert, with retries. If it still
+/// doesn't go through, it's kept and posted with the next message that does.
+pub fn report(cfg: &TelegramCfg, message_id: Option<i64>, text: &str) {
+    let old: Vec<String> = undelivered()
+        .lock()
+        .map(|mut u| std::mem::take(&mut *u))
+        .unwrap_or_default();
+    let full = if old.is_empty() {
+        text.to_string()
+    } else {
+        format!("{}\n\n{}", undelivered_preface(&old), text)
+    };
+    let mut last = String::new();
+    for wait in REPORT_TRIES {
+        std::thread::sleep(wait);
+        match send_text(cfg, message_id, &full) {
+            Ok(()) => return,
+            Err(e) => last = e,
+        }
     }
-    if let (true, Some(mid)) = (settled, message_id) {
-        let _ = call(
-            cfg,
-            "editMessageReplyMarkup",
-            json!({
-                "chat_id": cfg.chat_id,
-                "message_id": mid,
-                "reply_markup": { "inline_keyboard": [] },
-            }),
-            Duration::from_secs(15),
-        );
+    crate::daemon::log_daemon(
+        hermian_core::Severity::Low,
+        &format!(
+            "could not post the Telegram action result ({}); it goes with the next message",
+            last
+        ),
+    );
+    if let Ok(mut u) = undelivered().lock() {
+        u.extend(old);
+        u.push(text.to_string());
+        let skip = u.len().saturating_sub(20);
+        u.drain(..skip);
+    }
+    if let Ok(s) = store().lock() {
+        save(&s);
+    }
+}
+
+/// Post results that couldn't be delivered earlier, once Telegram answers.
+fn flush_undelivered(cfg: &TelegramCfg) {
+    let old: Vec<String> = undelivered()
+        .lock()
+        .map(|mut u| std::mem::take(&mut *u))
+        .unwrap_or_default();
+    if old.is_empty() {
+        return;
+    }
+    if send_text(cfg, None, &undelivered_preface(&old)).is_err() {
+        if let Ok(mut u) = undelivered().lock() {
+            let mut back = old;
+            back.append(&mut u);
+            *u = back;
+        }
+    }
+    if let Ok(s) = store().lock() {
+        save(&s);
     }
 }
 
@@ -581,9 +1101,10 @@ mod tests {
         let req = out.request.expect("allowed user in the right chat");
         assert_eq!(req.by, "@op (id 42)");
         assert_eq!(req.message_id, Some(7));
-        // One-time.
+        // One-time, and a second press says so.
         let (msg, out) = handle_callback(&press(data, 42, -1001), &cfg(), now);
-        assert!(out.request.is_none() && msg.contains("expired or was already used"));
+        assert!(out.request.is_none(), "{}", msg);
+        assert!(msg.starts_with("You did this: @op chose Block"), "{}", msg);
     }
 
     #[test]
@@ -668,7 +1189,9 @@ mod tests {
             now,
         );
         let (_, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
-        assert!(out.request.is_some() && out.keyboard.is_none());
+        assert!(out.request.is_some());
+        // Settled: nothing left to press while the result comes in.
+        assert_eq!(out.keyboard.map(|(_, kb)| kb.len()), Some(0));
     }
 
     #[test]
@@ -692,10 +1215,17 @@ mod tests {
             now,
         );
         assert!(press_confirmed(&b[1].0, now).request.is_some());
-        let (_, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
+        let mut other = press(&b[0].0, 42, -1001);
+        other["from"] = json!({ "id": 42, "username": "ann" });
+        let (msg, out) = handle_callback(&other, &cfg(), now);
         assert!(
             out.request.is_none(),
             "the other button went with the choice"
+        );
+        assert!(
+            msg.starts_with("Already handled: @op chose Disconnect and block"),
+            "{}",
+            msg
         );
 
         let b = register(
@@ -709,7 +1239,8 @@ mod tests {
         );
         let later = now + chrono::Duration::minutes(2);
         let (msg, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), later);
-        assert!(out.request.is_none() && msg.contains("expired"), "{}", msg);
+        assert!(out.request.is_none(), "{}", msg);
+        assert_eq!(msg, "Expired (buttons last 15 min). Nothing was done.");
     }
 
     #[test]
@@ -954,5 +1485,243 @@ mod tests {
             Utc::now(),
         );
         assert!(b[0].0.len() <= 64);
+    }
+
+    fn req_for(data: &str, now: DateTime<Utc>) -> ActionRequest {
+        press_confirmed(data, now).request.expect("acted")
+    }
+
+    #[test]
+    fn an_expired_button_says_how_to_do_it_now() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-10",
+            &[ResponseAction::Block {
+                sources: vec![ip("198.51.100.7")],
+            }],
+            30,
+            now,
+        );
+        attach_message(&b, 70);
+        let later = now + chrono::Duration::minutes(31);
+        let (msg, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), later);
+        assert!(out.request.is_none());
+        assert_eq!(
+            msg,
+            "Expired (buttons last 15 min). From the host: sudo hermian block 198.51.100.7"
+        );
+        let (mid, kb) = out.keyboard.expect("keyboard tidied");
+        assert_eq!(mid, 70);
+        assert_eq!(kb.len(), 1);
+        assert_eq!(kb[0].1, "Buttons expired");
+        // The label repeats the command when pressed.
+        let (msg, _) = handle_callback(&press(&kb[0].0, 42, -1001), &cfg(), later);
+        assert!(msg.contains("sudo hermian block 198.51.100.7"), "{}", msg);
+    }
+
+    #[test]
+    fn the_sweep_tidies_keyboards_nobody_pressed() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-11",
+            &[ResponseAction::Ignore {
+                sources: vec![],
+                hours: 0,
+            }],
+            1,
+            now,
+        );
+        attach_message(&b, 71);
+        assert!(sweep(15, now).iter().all(|(m, _)| *m != 71), "still live");
+        let tidied = sweep(15, now + chrono::Duration::minutes(2));
+        let (_, kb) = tidied.iter().find(|(m, _)| *m == 71).expect("tidied");
+        assert_eq!(kb[0].1, "Buttons expired");
+        // Only once.
+        assert!(sweep(15, now + chrono::Duration::minutes(3))
+            .iter()
+            .all(|(m, _)| *m != 71));
+    }
+
+    #[test]
+    fn a_result_becomes_a_label_with_an_undo() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-12",
+            &[ResponseAction::Block {
+                sources: vec![ip("198.51.100.7")],
+            }],
+            30,
+            now,
+        );
+        attach_message(&b, 72);
+        let req = req_for(&b[0].0, now);
+        let text = "✓ Blocked 198.51.100.7 until 14:02 UTC tomorrow\nweb-01 · @op · 14:02 UTC";
+        let summary = "✓ Blocked 198.51.100.7 · @op 14:02 UTC";
+        let kb = {
+            let mut s = store().lock().unwrap();
+            result_keyboard(
+                &mut s,
+                &req,
+                text,
+                summary,
+                Some((
+                    ResponseAction::Unblock {
+                        sources: vec![ip("198.51.100.7")],
+                    },
+                    60,
+                )),
+                now,
+            )
+        };
+        assert_eq!(kb.len(), 2, "{:?}", kb);
+        assert_eq!(kb[0].1, summary);
+        assert_eq!(kb[1].1, "Undo: unblock 198.51.100.7");
+        // The label shows the whole result.
+        let (msg, _) = handle_callback(&press(&kb[0].0, 42, -1001), &cfg(), now);
+        assert!(msg.starts_with("✓ Blocked 198.51.100.7"), "{}", msg);
+        // The used button now quotes the outcome.
+        let (msg, _) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), now);
+        assert_eq!(msg, format!("You did this: {}", summary));
+        // Undo needs no confirmation.
+        let (_, out) = handle_callback(&press(&kb[1].0, 42, -1001), &cfg(), now);
+        assert!(matches!(
+            out.request.map(|r| r.action),
+            Some(ResponseAction::Unblock { .. })
+        ));
+    }
+
+    #[test]
+    fn a_choice_made_while_a_confirm_was_up_wins() {
+        let now = Utc::now();
+        let b = register(
+            "HER-T-13",
+            &[
+                ResponseAction::Ignore {
+                    sources: vec![],
+                    hours: 0,
+                },
+                ResponseAction::Disconnect {
+                    source: ip("198.51.100.7"),
+                    port: None,
+                    user: "root".into(),
+                    block: false,
+                },
+            ],
+            30,
+            now,
+        );
+        // @op asks to disconnect; @ann presses Ignore before @op confirms.
+        let (_, out) = handle_callback(&press(&b[1].0, 42, -1001), &cfg(), now);
+        let (_, ask) = out.keyboard.unwrap();
+        let mut ann = press(&b[0].0, 42, -1001);
+        ann["from"] = json!({ "id": 42, "username": "ann" });
+        assert!(handle_callback(&ann, &cfg(), now).1.request.is_some());
+        let (msg, out) = handle_callback(&press(&ask[0].0, 42, -1001), &cfg(), now);
+        assert!(out.request.is_none(), "{}", msg);
+    }
+
+    #[test]
+    fn a_lost_button_says_why_and_where_the_alert_is() {
+        let cq = json!({
+            "id": "q", "from": { "id": 42, "username": "op" },
+            "message": { "message_id": 9, "chat": { "id": -1001 },
+                         "text": "HIGH · SSH\nhermian show HER-2026-1018-009" },
+            "data": "hm:000000000000000000000000",
+        });
+        let (msg, out) = handle_callback(&cq, &cfg(), Utc::now());
+        assert!(out.request.is_none());
+        assert!(
+            msg.ends_with("Details: sudo hermian show HER-2026-1018-009"),
+            "{}",
+            msg
+        );
+        assert!(msg.contains("Nothing was done"), "{}", msg);
+    }
+
+    #[test]
+    fn buttons_survive_a_round_trip_to_disk() {
+        let now = Utc::now();
+        let a = ResponseAction::Block {
+            sources: vec![ip("198.51.100.7")],
+        };
+        let mut buttons = HashMap::new();
+        for (i, step) in [
+            Step::Offer(0),
+            Step::Confirm { offer: "a".into() },
+            Step::Cancel { offer: "a".into() },
+            Step::Used {
+                by: "@op (id 42)".into(),
+                at: now,
+                note: "x".into(),
+            },
+            Step::Label {
+                text: "y".into(),
+                shown: "z".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            buttons.insert(
+                format!("id{}", i),
+                Pending {
+                    action: a.clone(),
+                    alert_ref: "HER-T-14".into(),
+                    expires: now,
+                    message_id: Some(1),
+                    step,
+                },
+            );
+        }
+        let saved = Saved {
+            buttons,
+            undelivered: vec!["r".into()],
+        };
+        let back: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(back.buttons.len(), 5);
+        assert_eq!(back.buttons["id3"].step, saved.buttons["id3"].step);
+        assert_eq!(back.undelivered, vec!["r".to_string()]);
+    }
+
+    #[test]
+    fn answers_fit_telegrams_limit() {
+        let long = "x".repeat(500);
+        assert_eq!(clip(long).chars().count(), ANSWER_MAX);
+        assert_eq!(clip("short".into()), "short");
+    }
+
+    #[test]
+    fn a_press_for_another_hosts_alert_says_so() {
+        let cq = |text: &str| {
+            json!({
+                "id": "q", "from": { "id": 42, "username": "op" },
+                "message": { "message_id": 9, "chat": { "id": -1001 }, "text": text },
+                "data": "hm:111111111111111111111111",
+            })
+        };
+        let full = "◉◉◉○  HIGH · SSH
+Root login
+
+host   db-02-elsewhere
+rule   D2 · SSH";
+        let (msg, out) = handle_callback(&cq(full), &cfg(), Utc::now());
+        assert!(out.request.is_none());
+        assert!(
+            msg.starts_with("This is db-02-elsewhere's alert, but "),
+            "{}",
+            msg
+        );
+        assert!(msg.contains("its own bot"), "{}", msg);
+        assert_eq!(
+            host_in(
+                "HIGH alert 025 on web-01
+sudo hermian show HER-1"
+            ),
+            Some("web-01".into())
+        );
+        // Our own host: the usual answer.
+        let own = format!("host   {}", crate::procsrc::hostname());
+        let (msg, _) = handle_callback(&cq(&own), &cfg(), Utc::now());
+        assert!(msg.starts_with("This button is no longer valid"), "{}", msg);
     }
 }
