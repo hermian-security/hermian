@@ -1,6 +1,6 @@
 ---
 title: Command line
-description: Every hermian command and option - status, alerts, show, collect, report, enable, notify-test, test, audit, isolate, unisolate, blocked, unblock and uninstall.
+description: Every hermian command and option - status, alerts, show, collect, report, enable, notify-test, test, audit, isolate, unisolate, block, blocked, unblock, disconnect and uninstall.
 ---
 
 # Command line
@@ -144,13 +144,29 @@ Cuts the host off the network except management CIDRs and recovery essentials
 
 Removes the isolation ruleset.
 
+### `block <IP>...`
+
+Blocks addresses for `response.block_duration_hours`, like the Telegram Block
+button (IPv6: the /64). Management networks, allowlisted SSH sources and local
+addresses are refused. An address already blocked is left as it is, expiry
+included, and the answer says since when and by whom.
+
 ### `blocked`
 
-Lists addresses blocked with the Telegram Block buttons, with the time left.
+Lists blocked addresses with the time left.
 
 ### `unblock <IP>`
 
 Lifts a block before it expires. For IPv6, any address in the blocked /64.
+Says so if it wasn't blocked, and why (lifted, by whom, or expired).
+
+### `disconnect <IP>`
+
+Ends the SSH sessions from that address, like the Disconnect button. It
+doesn't block it: add `hermian block` for that.
+
+Each prints one line per address, marked `done`, `already`, `refused` or
+`failed`, and exits 1 if anything was refused or failed.
 
 ## Remove
 

@@ -14,7 +14,7 @@ use hermian_core::{Alert, Baseline, Config, DetectionId, Engine, Event, ExecEven
 use tokio::sync::mpsc;
 
 use crate::{
-    audit, auditnetlink, authlog, blocklist, config, configdiff, ebpf, fallback, health, heartbeat,
+    actions, audit, auditnetlink, authlog, config, configdiff, ebpf, fallback, health, heartbeat,
     isolate, notify, pamsock, paths, procsrc, retention, selfprotect, sessions, sshkeys, status,
     tgbot, watchers,
 };
@@ -671,14 +671,17 @@ fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>
 /// Carry out a Telegram button press that passed every check (see tgbot).
 ///
 /// Quick engine-side choices (ignore, snooze) happen here; firewall and
-/// process work runs on a blocking thread, which then posts the outcome as
-/// a reply to the alert. Every press is also recorded as a local alert.
+/// process work runs on a blocking thread. Either way the outcome is posted
+/// as a reply to the alert, one line per target (see `actions`), and the
+/// alert's buttons are updated to show it. Every press is also recorded as
+/// a local alert.
 fn handle_action(
     engine: &mut Engine,
     notifier: &notify::Notifier,
     cfg: &Config,
     req: tgbot::ActionRequest,
 ) {
+    use actions::{Line, Mark};
     use hermian_core::ResponseAction as A;
     let now = Utc::now();
     let label = req.action.label();
@@ -700,50 +703,71 @@ fn handle_action(
         ),
     );
     let tg = cfg.notifications.telegram.clone();
-    let settled = req.action.settles();
-    let mid = req.message_id;
-    let by = req.by.clone();
-    match req.action {
+    let host = engine.host.clone();
+    let cfg = cfg.clone();
+    // An Undo lasts as long as the block, up to a day.
+    let undo_mins = (cfg.response.block_duration_hours.max(1) * 60).min(1440);
+    let conclude =
+        move |req: tgbot::ActionRequest, lines: Vec<Line>, undo: Vec<std::net::IpAddr>| {
+            let text = actions::render(&host, &req.action.label(), &req.by, &lines);
+            log_daemon(Severity::High, &text.replace('\n', "; "));
+            let undo = (!undo.is_empty()).then_some((A::Unblock { sources: undo }, undo_mins));
+            tgbot::finish(&tg, &req, &text, actions::verdict(&lines), undo, Utc::now());
+        };
+    match req.action.clone() {
         A::Ignore { sources, hours } => {
-            let text = if sources.is_empty() || hours == 0 {
-                format!("Ignored by {}.", by)
+            let line = if sources.is_empty() || hours == 0 {
+                Line::new(Mark::Done, "Ignored. Nothing else changes.")
             } else {
                 engine.ignore_sources(&sources, now + chrono::Duration::hours(i64::from(hours)));
-                format!(
-                    "Ignoring {} source(s) for {}h (by {}). Logins from them still alert.",
-                    sources.len(),
-                    hours,
-                    by
+                Line::new(
+                    Mark::Done,
+                    format!(
+                        "Not reporting {} source(s) for {}h. Logins from them still alert.",
+                        sources.len(),
+                        hours
+                    ),
                 )
             };
-            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+            tokio::task::spawn_blocking(move || conclude(req, vec![line], Vec::new()));
         }
         A::SnoozeRootPasswordWarning { days } => {
             engine.snooze_root_warning(now + chrono::Duration::days(i64::from(days)));
             save_engine_state(engine);
-            let text = format!(
-                "Root password warning snoozed for {} days (by {}).",
-                days, by
+            let line = Line::new(
+                Mark::Done,
+                format!("The root password warning is snoozed for {} days.", days),
             );
-            tokio::task::spawn_blocking(move || tgbot::report(&tg, mid, &text, settled));
+            tokio::task::spawn_blocking(move || conclude(req, vec![line], Vec::new()));
         }
         A::Block { sources } => {
             for ip in &sources {
                 engine.brute.forget(ip);
             }
-            let cfg = cfg.clone();
             tokio::task::spawn_blocking(move || {
-                let hours = cfg.response.block_duration_hours;
-                let lines: Vec<String> = sources
+                let ctx = action_ctx(&cfg, &req);
+                let mut undo = Vec::new();
+                let lines = sources
                     .iter()
-                    .map(|ip| match blocklist::block(*ip, hours, &cfg) {
-                        Ok(key) => format!("Blocked {} for {}h", key, hours),
-                        Err(e) => format!("{}: {:#}", ip, e),
+                    .map(|ip| {
+                        let l = actions::block(&ctx, *ip);
+                        if l.mark == Mark::Done {
+                            undo.push(*ip);
+                        }
+                        l
                     })
                     .collect();
-                let text = format!("{} (by {})", lines.join("\n"), by);
-                log_daemon(Severity::High, &text.replace('\n', "; "));
-                tgbot::report(&tg, mid, &text, settled);
+                conclude(req.clone(), lines, undo);
+            });
+        }
+        A::Unblock { sources } => {
+            tokio::task::spawn_blocking(move || {
+                let ctx = action_ctx(&cfg, &req);
+                let lines = sources
+                    .iter()
+                    .map(|ip| actions::unblock(&ctx, *ip))
+                    .collect();
+                conclude(req.clone(), lines, Vec::new());
             });
         }
         A::Disconnect {
@@ -752,32 +776,42 @@ fn handle_action(
             user,
             block,
         } => {
-            let cfg = cfg.clone();
             tokio::task::spawn_blocking(move || {
+                let ctx = action_ctx(&cfg, &req);
                 let mut lines = Vec::new();
+                let mut undo = Vec::new();
                 // Block first: otherwise the session can come right back.
                 if block {
-                    let hours = cfg.response.block_duration_hours;
-                    lines.push(match blocklist::block(source, hours, &cfg) {
-                        Ok(key) => format!("Blocked {} for {}h", key, hours),
-                        Err(e) => format!("Block failed: {:#}", e),
-                    });
+                    let l = actions::block(&ctx, source);
+                    if l.mark == Mark::Done {
+                        undo.push(source);
+                    }
+                    lines.push(l);
                 }
-                lines.push(match sessions::disconnect(source, port) {
-                    Ok(d) => format!(
-                        "Disconnected {} from {} ({} connection(s), {} sshd process(es) stopped)",
-                        user,
-                        source,
-                        d.connections,
-                        d.processes.len()
-                    ),
-                    Err(e) => format!("Disconnect: {:#}", e),
-                });
-                let text = format!("{} (by {})", lines.join("\n"), by);
-                log_daemon(Severity::High, &text.replace('\n', "; "));
-                tgbot::report(&tg, mid, &text, settled);
+                let blocked = lines
+                    .iter()
+                    .any(|l| l.mark != Mark::Failed && l.mark != Mark::Refused);
+                let d = actions::disconnect(&ctx, source, port, &user);
+                let ended = d.mark == Mark::Done;
+                lines.push(d);
+                if ended {
+                    lines.push(actions::after_disconnect(source, blocked));
+                }
+                conclude(req.clone(), lines, undo);
             });
         }
+    }
+}
+
+/// What the action decisions need for a button press.
+fn action_ctx<'a>(cfg: &'a Config, req: &'a tgbot::ActionRequest) -> actions::Ctx<'a> {
+    actions::Ctx {
+        host: &actions::RealHost,
+        ledger: actions::ledger(),
+        cfg,
+        by: &req.by,
+        alert_ref: &req.alert_ref,
+        now: Utc::now(),
     }
 }
 
