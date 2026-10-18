@@ -1,5 +1,4 @@
-Hermian evidence
-================
+# Hermian evidence
 
 What Hermian has been verified to do, where and when, what isn't proven
 yet, and what has to happen before v0.1.0. Numbers in the README, the
@@ -7,7 +6,7 @@ website and release notes come from here. If a number isn't here, treat it
 as unproven.
 
 
-1. Tests
+## 1. Tests
 
 Last run 2026-10-16, on every change in CI:
 
@@ -19,7 +18,7 @@ Last run 2026-10-16, on every change in CI:
 These don't prove live collection works on a host. The field runs below do.
 
 
-2. Field runs
+## 2. Field runs
 
 Host A, the burn-in host (September 2026). Ubuntu 22.04, kernel 6.8,
 2 vCPU.
@@ -65,7 +64,7 @@ The maintainer's VPS (since 2026-09-20). Ubuntu 22.04.5, kernel 5.15.0-170,
   UTC, so don't pair it with events processed.
 
 
-3. Not proven yet
+## 3. Not proven yet
 
 - Any distro but Ubuntu 22.04: Debian, the RHEL family with SELinux, the
   kernel 5.4 fallback path, and arm64 on real hardware.
@@ -77,7 +76,7 @@ The maintainer's VPS (since 2026-09-20). Ubuntu 22.04.5, kernel 5.15.0-170,
 - Release verification on a clean machine with cosign and gh attestation.
 
 
-4. Burn-in plan
+## 4. Burn-in plan
 
 Each host is a disposable machine of one kind:
 
@@ -107,7 +106,7 @@ and memory under 80 MB. Never run the suites on a machine you care about:
 they modify real auth and persistence files.
 
 
-5. Before v0.1.0
+## 5. Before v0.1.0
 
 - Hosts A to H have each run 72 hours with 0 unexplained HIGH alerts.
 - Every attack scenario passes on every host.
@@ -121,7 +120,7 @@ they modify real auth and persistence files.
 - Two hosts the maintainer relies on have run the release for 30 days.
 
 
-6. False positives
+## 6. False positives
 
 Every HIGH or CRITICAL alert that wasn't a real event gets an entry here.
 Find the cause: the rule was wrong, the attribution failed, or it's specific
@@ -134,7 +133,7 @@ None recorded yet. (The web workload alert of 2026-10-16 was a real event
 caused by the test harness, not a false positive; see 2.)
 
 
-7. Things that bit us, now fixed
+## 7. Things that bit us, now fixed
 
 - The eBPF verifier rejected the exec program: a 400-byte struct on the
   512-byte stack. Fixed with a per-CPU scratch map.
