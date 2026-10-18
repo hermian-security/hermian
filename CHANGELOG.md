@@ -60,6 +60,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- ntfy alerts arrive as notifications again, not as raw JSON text. The
+  JSON body now goes to the server root with the topic inside it, which is
+  the only place ntfy reads JSON; `url` stays the topic URL
+  (`https://ntfy.example.org/servers`), sub-path installs included.
 - The baseline no longer learns an intrusion as normal. Connections from a
   chain D1 flagged, or from a program running out of /tmp, /dev/shm or a
   deleted file, aren't learned, and neither is a login through a hidden key

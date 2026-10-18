@@ -935,6 +935,27 @@ pub mod webhook {
             .replace('>', "&gt;")
     }
 
+    /// `https://ntfy.example/alerts` -> (`https://ntfy.example/`, `alerts`).
+    /// The topic is the URL's last path segment; a self-hosted server under a
+    /// sub-path (`https://host/ntfy/alerts`) keeps its prefix in the root.
+    pub fn ntfy_target(url: &str) -> Option<(String, String)> {
+        let (scheme, rest) = url.split_once("://")?;
+        let rest = rest.split(['?', '#']).next().unwrap_or("");
+        let (authority, path) = rest.split_once('/')?;
+        let path = path.trim_end_matches('/');
+        let (prefix, topic) = match path.rsplit_once('/') {
+            Some((prefix, topic)) => (format!("{}/", prefix), topic),
+            None => (String::new(), path),
+        };
+        if authority.is_empty() || topic.is_empty() {
+            return None;
+        }
+        Some((
+            format!("{}://{}/{}", scheme, authority, prefix),
+            topic.to_string(),
+        ))
+    }
+
     /// Matrix sends are a PUT to `<room send endpoint>/<transaction id>`; the
     /// id makes a retried delivery post once.
     pub fn matrix_url(base: &str, alert: &Alert) -> String {
@@ -951,8 +972,19 @@ pub mod webhook {
             .timeout(Duration::from_secs(cfg.timeout_secs.clamp(2, 60)))
             .user_agent(&format!("hermian/{}", hermian_core::VERSION))
             .build();
+        let mut body = body;
         let mut req = if cfg.format == "matrix" {
             agent.put(&matrix_url(&cfg.url, alert))
+        } else if cfg.format == "ntfy" {
+            // ntfy only reads a JSON body at the server root, with the topic
+            // inside it; posted to the topic URL, the JSON is shown as text.
+            match ntfy_target(&cfg.url) {
+                Some((root, topic)) => {
+                    body["topic"] = json!(topic);
+                    agent.post(&root)
+                }
+                None => agent.post(&cfg.url),
+            }
         } else {
             agent.post(&cfg.url)
         }
@@ -1019,6 +1051,15 @@ mod tests {
                 a.ts.timestamp_millis()
             )
         );
+        assert_eq!(
+            webhook::ntfy_target("https://ntfy.sh/hermian-alerts"),
+            Some(("https://ntfy.sh/".into(), "hermian-alerts".into()))
+        );
+        assert_eq!(
+            webhook::ntfy_target("https://host.example:8443/ntfy/servers/?x=1"),
+            Some(("https://host.example:8443/ntfy/".into(), "servers".into()))
+        );
+        assert_eq!(webhook::ntfy_target("https://ntfy.sh/"), None);
         let n = webhook::payload(&a, "ntfy");
         assert_eq!(n["priority"], 4);
     }
