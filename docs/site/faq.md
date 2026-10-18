@@ -82,9 +82,10 @@ commercially included, with the licence and notices kept.
 
 ### Which distros are supported?
 
-Any Linux with systemd and kernel 5.4+, amd64 or arm64. Ubuntu 22.04 is
-verified in the field; Debian, Ubuntu 24.04, the RHEL family and arm64 hardware
-are being verified ([Evidence](evidence)). Reports from other systems are
+Any Linux with systemd and kernel 5.4+, amd64 or arm64. Ubuntu 22.04 has
+passed the full suites and Ubuntu 24.04 has run live on a compromised host;
+Debian, the RHEL family and arm64 hardware are being verified
+([Evidence](evidence)). Reports from other systems are
 welcome.
 
 ### How do I report a false positive?

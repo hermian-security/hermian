@@ -16,8 +16,9 @@ server to run: the daemon, its rules and its alert store all live on the
 machine, and alerts go to the channels you choose.
 
 > [!NOTE]
-> Hermian is in beta. Ubuntu 22.04 hosts have passed the full attack suite;
-> other distros and longer runs are still being verified. See
+> Hermian is in beta. Ubuntu 22.04 hosts have passed the full attack suite
+> and Ubuntu 24.04 has run live; other distros and longer runs are still
+> being verified. See
 > [Evidence](evidence) for what's proven and what isn't yet.
 
 ## Start here

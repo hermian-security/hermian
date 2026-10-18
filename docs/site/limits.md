@@ -59,7 +59,8 @@ tell you on a channel you'll see.
 ## Maturity
 
 Hermian is in beta. Ubuntu 22.04 hosts have passed the full attack and
-false-positive suites; other distributions, the RHEL family with SELinux, the
+false-positive suites, and Ubuntu 24.04 has run live on a compromised host;
+other distributions, the RHEL family with SELinux, the
 older-kernel fallback and arm64 hardware haven't been verified in the field
 yet. What's proven, where and when, is in [Evidence](evidence), along with
 what has to happen before a stable release.
