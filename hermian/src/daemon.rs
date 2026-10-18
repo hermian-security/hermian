@@ -1155,7 +1155,10 @@ fn reload_config(
         return;
     }
     let parsed = Config::parse(&text)
-        .map_err(|e| e.to_string())
+        .map_err(|e| match Config::parse_hint(&text, &e) {
+            Some(hint) => format!("{} ({})", hint, e.to_string().lines().next().unwrap_or("")),
+            None => e.to_string(),
+        })
         .and_then(|c| c.validate().map(|_| c).map_err(|e| e.to_string()));
     match parsed {
         Ok(new_cfg) => {

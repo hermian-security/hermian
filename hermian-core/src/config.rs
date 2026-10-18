@@ -375,6 +375,28 @@ impl Config {
         toml::from_str(toml_text)
     }
 
+    /// A hint for a parse error on a line that reads like an explanation that
+    /// lost its `#`: the commonest way to break this file by hand.
+    pub fn parse_hint(toml_text: &str, err: &toml::de::Error) -> Option<String> {
+        let start = err.span()?.start.min(toml_text.len());
+        let line_no = toml_text.get(..start)?.matches('\n').count() + 1;
+        let line = toml_text.lines().nth(line_no - 1)?.trim();
+        let prose = !line.is_empty()
+            && !line.starts_with('[')
+            && match line.split_once('=') {
+                None => true,
+                Some((k, _)) => k.trim().contains(' '),
+            };
+        let shown: String = line.chars().take(50).collect();
+        prose.then(|| {
+            format!(
+                "line {} (\"{}\") isn't a setting: it looks like an explanation that lost its \
+                 '#'. Put the '#' back.",
+                line_no, shown
+            )
+        })
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Upper bounds too: chrono panics on out-of-range durations, so a
         // typo like duration_hours = 99999999999 used to crash the daemon on
@@ -499,15 +521,17 @@ impl Config {
     }
 }
 
-pub const DEFAULT_CONFIG_TOML: &str = r#"# Hermian configuration
-#
-# This file is monitored while the daemon runs. A real change that validates
-# reloads and pages CRITICAL. Invalid TOML stays on the last good config and
-# is logged, not paged. Every allowlist entry requires a 'reason'.
-#
-# Lines starting with '#' are inactive: remove the '#' to use a setting.
-# 'hermian enable' (run on every upgrade) adds settings new in that version
-# to this file, commented out, without changing anything you've set.
+pub const DEFAULT_CONFIG_TOML: &str = r#"## Hermian configuration
+##
+## Lines starting with ## explain. A line starting with a single # is a
+## setting that's switched off: remove that # to turn it on. Every other
+## setting is written with its default value; change the value to change it.
+##
+## This file is monitored while the daemon runs. A real change that
+## validates reloads and pages CRITICAL. Invalid TOML stays on the last good
+## config and is logged, not paged. Every allowlist entry needs a 'reason'.
+## 'hermian enable' (run on every upgrade) adds settings new in that version,
+## switched off, without changing anything you've set.
 
 [general]
 hostname = ""           # empty = use the system hostname
@@ -532,33 +556,36 @@ d4_priv_esc = true         # setuid files, sudoers/shadow edits, ptrace, LD_PREL
 d5_network = true          # connections from flagged chains, new destinations, listeners
 
 [notifications]
-# journald and file receive every alert. The other channels receive alerts at
-# or above min_severity. Enable a channel by adding it to this list:
-#   "telegram", "email", "webhook", "stdout"
+## journald and file receive every alert. The other channels receive alerts
+## at or above min_severity. To use one, add its name to the list: telegram,
+## email, webhook or stdout, then fill in its section below.
 channels = ["journald", "file"]
 dedup_window_secs = 300
 min_severity = "HIGH"
-# What Telegram, email and webhooks receive. "full": the whole alert.
-# "minimal": "HIGH alert 025 on web-01" and the command to read it here,
-# with no addresses, users, paths or commands (and no buttons). journald and
-# the alert file always get everything.
+## What Telegram, email and webhooks receive. "full": the whole alert.
+## "minimal": "HIGH alert 025 on web-01" and the command to read it here,
+## with no addresses, users, paths or commands (and no buttons). journald and
+## the alert file always get everything.
 content = "full"
 
 [notifications.telegram]
-# 1. Message @BotFather, /newbot, copy the token.
-# 2. Send any message to your new bot (or add it to a group).
-# 3. curl https://api.telegram.org/bot<TOKEN>/getUpdates  -> "chat":{"id":...}
-#    A private chat's id is your own user id; a group's is negative.
-# 4. Add "telegram" to channels above, then: sudo hermian notify-test
+## To set it up:
+##   1. Message @BotFather, send /newbot, copy the token.
+##   2. Send any message to your new bot (or add it to a group).
+##   3. curl https://api.telegram.org/bot<TOKEN>/getUpdates and find
+##      "chat":{"id":...}. A private chat's id is your own user id; a
+##      group's is negative.
+##   4. Add telegram to channels above, then run: sudo hermian notify-test
 bot_token = ""                 # e.g. "123456789:AAH..."
 chat_id = ""                   # in quotes, e.g. "123456789" or "-1001234567890"
 silent_below_critical = true   # only CRITICAL makes a sound
 timeout_secs = 10
-# message_thread_id = 12345    # topic id, for forum-style supergroups
-# Response buttons (Block IP, Disconnect session...) under alerts that offer them.
-# Only the Telegram user ids listed here can press them. Your id: message
-# @userinfobot. Re-run 'hermian enable' after turning this on (it grants the
-# daemon the firewall and kill capabilities these need).
+#message_thread_id = 12345     # topic id, for forum-style supergroups
+## Response buttons (Block IP, Disconnect session...) under alerts that offer
+## them. Only the Telegram user ids listed here can press them; find yours by
+## messaging @userinfobot. Re-run 'hermian enable' after turning this on (it
+## grants the daemon the firewall and kill capabilities these need). Give
+## each host with buttons its own bot.
 actions = false
 allowed_user_ids = []          # numbers, no quotes, e.g. [123456789]
 action_ttl_mins = 15           # buttons expire after this
@@ -577,70 +604,145 @@ timeout_secs = 20
 sendmail_path = "/usr/sbin/sendmail"
 
 [notifications.webhook]
+## For matrix, url is the room's send endpoint on your homeserver,
+## https://matrix.example.org/_matrix/client/v3/rooms/!roomid:example.org/send/m.room.message
+## and token is the bot account's access token.
 url = ""
 format = "generic"      # generic | slack | discord | ntfy | matrix
-# matrix: url is the room's send endpoint on your homeserver,
-#   https://matrix.example.org/_matrix/client/v3/rooms/!roomid:example.org/send/m.room.message
-#   and token the bot account's access token.
 token = ""
 timeout_secs = 10
 
 [response]
-# management_cidrs: the addresses YOU manage this host from (home, office,
-# VPN, bastion). They're never blocked by a button and stay reachable during
-# isolation. Set them before turning on auto_isolate or Telegram actions.
+## management_cidrs: the addresses YOU manage this host from (home, office,
+## VPN, bastion). They're never blocked by a button and stay reachable during
+## isolation. Set them before turning on auto_isolate or Telegram actions.
 auto_isolate = false    # on CRITICAL, drop all traffic except management_cidrs
 management_cidrs = []   # e.g. ["203.0.113.0/24", "198.51.100.7/32"]
 auto_isolate_revert_mins = 0  # >0 lifts an automatic isolation after this long
 block_duration_hours = 24     # how long a "Block IP" button blocks a source
 
 [allowlist]
-# Exceptions. Each needs a reason. Prefer fixing a noisy rule over a broad
-# exception. Uncomment a block (all its lines) and edit it; repeat a block
-# to add more entries.
-#
-# Your own SSH sources, so your logins don't alert:
-# [[allowlist.ssh_sources]]
-# source = "198.51.100.7/32"
-# reason = "My home connection"
-#
-# [[allowlist.process_chains]]
-# parent = "deploy-agent"
-# child  = "bash"
-# user   = "deploy"
-# reason = "CI/CD deployment pipeline"
-#
-# PHP's mail() runs `sh -c sendmail ...`, which looks like a web shell:
-# [[allowlist.process_chains]]
-# parent = "php-fpm8.2"
-# child  = "sh"
-# user   = "www-data"
-# reason = "PHP mail() via sendmail"
-#
-# [[allowlist.persistence]]
-# path   = "/var/spool/cron/crontabs/deploy"
-# reason = "Managed by Ansible"
-#
-# [[allowlist.ssh_sources]]
-# source = "10.0.0.0/8"
-# reason = "Corporate VPN range"
-#
-# [[allowlist.destinations]]
-# destination = "203.0.113.10/32"
-# reason = "Payment provider API"
-#
-# [[allowlist.binaries]]
-# path   = "/opt/app/bin/updater"
-# reason = "Internal auto-updater runs from /tmp staging"
-#
-# [[allowlist.debuggers]]
-# comm   = "my-profiler"
-# reason = "In-house APM agent uses ptrace"
+## Exceptions, each with a reason. Prefer fixing a noisy rule over a broad
+## exception. To use an example, remove the # from each of its lines and edit
+## the values; copy a block to add another entry.
+
+## Your own SSH sources, so your logins don't alert:
+#[[allowlist.ssh_sources]]
+#source = "198.51.100.7/32"
+#reason = "My home connection"
+
+## A whole range, such as a corporate VPN:
+#[[allowlist.ssh_sources]]
+#source = "10.0.0.0/8"
+#reason = "Corporate VPN range"
+
+## A deploy agent that runs shells:
+#[[allowlist.process_chains]]
+#parent = "deploy-agent"
+#child  = "bash"
+#user   = "deploy"
+#reason = "CI/CD deployment pipeline"
+
+## PHP's mail() runs `sh -c sendmail ...`, which looks like a web shell:
+#[[allowlist.process_chains]]
+#parent = "php-fpm8.2"
+#child  = "sh"
+#user   = "www-data"
+#reason = "PHP mail() via sendmail"
+
+## A file your configuration management rewrites:
+#[[allowlist.persistence]]
+#path   = "/var/spool/cron/crontabs/deploy"
+#reason = "Managed by Ansible"
+
+## A destination programs may reach without a novelty alert:
+#[[allowlist.destinations]]
+#destination = "203.0.113.10/32"
+#reason = "Payment provider API"
+
+## A program allowed to run from /tmp:
+#[[allowlist.binaries]]
+#path   = "/opt/app/bin/updater"
+#reason = "Internal auto-updater runs from /tmp staging"
+
+## A process allowed to use ptrace:
+#[[allowlist.debuggers]]
+#comm   = "my-profiler"
+#reason = "In-house APM agent uses ptrace"
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `##` explains, a single `#` switches a setting off: removing one `#`
+    /// from an explanation must leave a comment, and removing it from a
+    /// setting (or from each line of an allowlist block) must give a valid
+    /// config. Nothing in between, so nobody can uncomment their way into a
+    /// broken file.
+    #[test]
+    fn template_comments_are_either_explanations_or_settings() {
+        let lines: Vec<&str> = DEFAULT_CONFIG_TOML.lines().collect();
+        for l in &lines {
+            let t = l.trim_start();
+            if !t.starts_with('#') {
+                continue;
+            }
+            let next = t[1..].chars().next();
+            assert!(
+                t.starts_with("##") || next.is_some_and(|c| c != ' ' && c != '#'),
+                "neither ## nor #setting: {:?}",
+                l
+            );
+        }
+        let mut i = 0;
+        while i < lines.len() {
+            let t = lines[i].trim_start();
+            if !t.starts_with('#') || t.starts_with("##") {
+                i += 1;
+                continue;
+            }
+            // One setting, or a whole allowlist block.
+            let mut end = i + 1;
+            if t.starts_with("#[[") {
+                while end < lines.len()
+                    && lines[end].starts_with('#')
+                    && !lines[end].starts_with("##")
+                    && !lines[end].starts_with("#[[")
+                {
+                    end += 1;
+                }
+            }
+            let mut on = lines.clone();
+            let turned: Vec<String> = on[i..end].iter().map(|l| l[1..].to_string()).collect();
+            for (j, l) in turned.iter().enumerate() {
+                on[i + j] = l;
+            }
+            let text = on.join("\n");
+            let cfg = Config::parse(&text)
+                .unwrap_or_else(|e| panic!("turning on {:?} breaks the file: {}", turned, e));
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("turning on {:?} is invalid: {}", turned, e));
+            i = end;
+        }
+    }
+
+    #[test]
+    fn an_explanation_that_lost_its_hash_gets_a_hint() {
+        let broken = DEFAULT_CONFIG_TOML.replacen(
+            "##   1. Message @BotFather",
+            "  1. Message @BotFather",
+            1,
+        );
+        let err = Config::parse(&broken).unwrap_err();
+        let hint = Config::parse_hint(&broken, &err).expect("a hint");
+        assert!(hint.contains("1. Message @BotFather"), "{}", hint);
+        assert!(hint.contains("Put the '#' back"), "{}", hint);
+        // A real typo in a setting isn't blamed on a lost '#'.
+        let typo = "[ssh]\npermit_root = flase\n";
+        let err = Config::parse(typo).unwrap_err();
+        assert_eq!(Config::parse_hint(typo, &err), None);
+    }
 
     #[test]
     fn telegram_actions_need_the_channel_and_allowed_users() {

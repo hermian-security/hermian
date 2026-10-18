@@ -25,8 +25,16 @@ pub fn load_config() -> Result<Config> {
     }
     let text =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let cfg =
-        Config::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+    let cfg = Config::parse(&text).map_err(|e| match Config::parse_hint(&text, &e) {
+        Some(hint) => anyhow::anyhow!(
+            "failed to parse {}: {}
+{}",
+            path.display(),
+            hint,
+            e
+        ),
+        None => anyhow::anyhow!("failed to parse {}: {}", path.display(), e),
+    })?;
     cfg.validate()
         .with_context(|| format!("invalid configuration in {}", path.display()))?;
     Ok(cfg)
