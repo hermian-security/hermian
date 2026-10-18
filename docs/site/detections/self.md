@@ -127,6 +127,16 @@ The kernel ring buffer overflowed and events were lost, so something may have
 gone unseen in that window. Usually a burst of activity; frequent drops
 deserve an issue.
 
+### Another host is reading this bot's button presses
+
+`HIGH`
+
+Telegram keeps refusing this host its button presses because something else
+polls the same bot. Each press then reaches only one of them, so a Block or
+Disconnect can quietly not happen. Give each host with buttons its own bot
+([Fleet](fleet)), or set `notifications.telegram.actions = false` on the
+others. If no other host should have it, revoke the token with @BotFather.
+
 ### CPUs came online without eBPF monitoring
 
 `HIGH`

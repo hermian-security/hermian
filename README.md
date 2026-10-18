@@ -310,8 +310,11 @@ block_duration_hours = 24
 ```
 
 Run `sudo hermian enable` once afterwards to grant the firewall and kill
-capabilities. Presses from anyone else are refused and logged. See or lift
-blocks with `sudo hermian blocked` and `sudo hermian unblock <ip>`.
+capabilities. Presses from anyone else are refused and logged. Every press
+gets a result naming the host, one line per address: done, already (since
+when, by whom), refused (which rule) or failed (and what to run). A Block
+comes with an Undo. The same from a shell: `sudo hermian block <ip>`,
+`blocked`, `unblock <ip>`, `disconnect <ip>`.
 
 ## Day to day
 

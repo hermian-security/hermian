@@ -27,6 +27,9 @@ pub enum ResponseAction {
     /// Stop adding the "root can log in with a password" warning to digests
     /// for this many days.
     SnoozeRootPasswordWarning { days: u32 },
+    /// Lift blocks made from an alert's buttons (the Undo on a Block result).
+    /// Offered by the daemon after a block, never by the engine.
+    Unblock { sources: Vec<IpAddr> },
 }
 
 impl ResponseAction {
@@ -46,6 +49,47 @@ impl ResponseAction {
             ResponseAction::SnoozeRootPasswordWarning { days } => {
                 format!("Remind me in {} days", days)
             }
+            ResponseAction::Unblock { sources } if sources.len() == 1 => {
+                format!("Undo: unblock {}", sources[0])
+            }
+            ResponseAction::Unblock { sources } => format!("Undo: unblock all ({})", sources.len()),
+        }
+    }
+
+    /// The same thing from a root shell, for when the button can't be used
+    /// any more (expired, or the daemon restarted). None for choices that
+    /// only matter while the alert is fresh.
+    pub fn cli_twin(&self) -> Option<String> {
+        let each = |verb: &str, ips: &[IpAddr]| {
+            ips.iter()
+                .map(|ip| format!("sudo hermian {} {}", verb, ip))
+                .collect::<Vec<_>>()
+                .join(" && ")
+        };
+        match self {
+            ResponseAction::Block { sources } if !sources.is_empty() => Some(format!(
+                "sudo hermian block {}",
+                sources
+                    .iter()
+                    .map(|ip| ip.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )),
+            ResponseAction::Unblock { sources } if !sources.is_empty() => {
+                Some(each("unblock", sources))
+            }
+            ResponseAction::Disconnect {
+                source,
+                block: true,
+                ..
+            } => Some(format!(
+                "sudo hermian block {0} && sudo hermian disconnect {0}",
+                source
+            )),
+            ResponseAction::Disconnect { source, .. } => {
+                Some(format!("sudo hermian disconnect {}", source))
+            }
+            _ => None,
         }
     }
 
@@ -53,7 +97,10 @@ impl ResponseAction {
     /// Blocking one source of a digest leaves the rest open.
     pub fn settles(&self) -> bool {
         !matches!(self, ResponseAction::Block { sources } if sources.len() == 1)
-            && !matches!(self, ResponseAction::SnoozeRootPasswordWarning { .. })
+            && !matches!(
+                self,
+                ResponseAction::SnoozeRootPasswordWarning { .. } | ResponseAction::Unblock { .. }
+            )
     }
 }
 
@@ -88,5 +135,40 @@ mod tests {
         let back: ResponseAction =
             serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back, d);
+        let u = ResponseAction::Unblock { sources: vec![ip] };
+        assert_eq!(u.label(), "Undo: unblock 198.51.100.7");
+        assert!(!u.settles());
+    }
+
+    #[test]
+    fn every_host_changing_action_has_a_cli_twin() {
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        let ip2: IpAddr = "203.0.113.9".parse().unwrap();
+        let twin = |a: ResponseAction| a.cli_twin().unwrap_or_default();
+        assert_eq!(
+            twin(ResponseAction::Block {
+                sources: vec![ip, ip2]
+            }),
+            "sudo hermian block 198.51.100.7 203.0.113.9"
+        );
+        assert_eq!(
+            twin(ResponseAction::Unblock { sources: vec![ip] }),
+            "sudo hermian unblock 198.51.100.7"
+        );
+        assert_eq!(
+            twin(ResponseAction::Disconnect {
+                source: ip,
+                port: None,
+                user: "root".into(),
+                block: true
+            }),
+            "sudo hermian block 198.51.100.7 && sudo hermian disconnect 198.51.100.7"
+        );
+        assert!(ResponseAction::Ignore {
+            sources: vec![],
+            hours: 0
+        }
+        .cli_twin()
+        .is_none());
     }
 }
