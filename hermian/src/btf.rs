@@ -144,6 +144,27 @@ pub fn task_struct_offsets() -> Option<(u32, u32)> {
     Some((parent, tgid))
 }
 
+/// Offsets for reaching the inode behind an fd or the working directory, in
+/// the order the eBPF program's FILE_OFFS expects. None if any is missing.
+pub fn file_offsets() -> Option<[u32; 12]> {
+    let btf = Btf::from_sys_fs().ok()?;
+    let m = |s: &str, f: &str| btf.struct_member_offset(s, f);
+    Some([
+        m("task_struct", "files")?,
+        m("files_struct", "fdt")?,
+        m("fdtable", "max_fds")?,
+        m("fdtable", "fd")?,
+        m("file", "f_inode")?,
+        m("inode", "i_ino")?,
+        m("inode", "i_sb")?,
+        m("super_block", "s_dev")?,
+        m("task_struct", "fs")?,
+        m("fs_struct", "pwd")?,
+        m("path", "dentry")?,
+        m("dentry", "d_inode")?,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

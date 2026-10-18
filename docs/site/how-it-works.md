@@ -9,7 +9,7 @@ Hermian watches one Linux host and turns what happens on it into a short list
 of alerts worth reading. Everything runs on that host.
 
 ```flow
-Collectors | eBPF exec, connect and ptrace hooks · inotify on persistence and account files · sshd's journal · PAM (optional) · /proc polling
+Collectors | eBPF exec, connect, ptrace, chmod and setxattr hooks · inotify on persistence and account files · sshd's journal · PAM (optional) · /proc polling
 Engine | process tree · session attribution · baseline · five rule families · allowlist
 Findings | rule, severity, evidence, process chain, risk, next steps
 Deduplication | one incident, one page; repeats folded into a summary
@@ -34,10 +34,11 @@ and Telegram button presses are fetched by outbound polling.
 |---|---|---|
 | eBPF `sched_process_exec` | Every program start: pid, parent, uid, executable, `argv[0]`, TTY, container flag, `LD_PRELOAD`/`LD_AUDIT` in the environment | Parent pids from kernel BTF offsets, with a `/proc` fallback. The first 64 environment entries are checked. |
 | eBPF syscall entry (`connect`, `ptrace`) | Outbound connection attempts and ptrace attaches | Attempts, not confirmed success. Not seen: 32-bit syscalls on x86_64, io_uring connects, unconnected UDP sends, TCP Fast Open. |
+| eBPF syscall entry (`chmod` family, `setxattr` family) | A file given setuid/setgid bits, or capabilities with `setcap` | As it happens; reported once the call has taken effect, so a failed chmod is silent. |
 | inotify | Changes to persistence, SSH, account and loader files | 400 ms debounce, 2.5 s at most. The writer is found from open file descriptors when possible. |
 | sshd's journal (or `auth.log` / `secure`) | Logins, failures, the key used and where it's stored | sshd's own entries only, so a local program can't forge one. |
 | `/proc/net/tcp` | New listening ports | Every 5 seconds. |
-| setuid sweep | New setuid/setgid files and file capabilities | Four levels deep under user-writable trees: every 20 seconds in /tmp, /var/tmp and /dev/shm, every minute in homes and service trees. |
+| setuid sweep | New setuid/setgid files the hooks can't see (created with the bits set, brought in from another filesystem) | Four levels deep under user-writable trees: every minute in /tmp, /var/tmp and /dev/shm, every 5 minutes in homes and service trees. Without the eBPF hooks, every 20 seconds and every minute. |
 | PAM module | Login results | Optional (`hermian enable --with-pam`); never sees passwords, always returns `PAM_IGNORE`. |
 
 eBPF needs kernel 5.8 or newer with BTF. Without it, execution falls back to

@@ -293,6 +293,13 @@ async fn async_main(
         match ebpf::load_and_attach(raw_tx) {
             Ok(runtime) => {
                 sources.ebpf = Some(runtime.attached.clone());
+                // chmod reported as it happens: the setuid sweep can slow down.
+                if ["sys_enter_fchmodat", "sys_enter_fchmod"]
+                    .iter()
+                    .all(|t| runtime.attached.contains(t))
+                {
+                    fallback::PRIV_HOOKED.store(true, Ordering::Relaxed);
+                }
                 _ebpf_runtime = Some(runtime);
                 // Several /proc reads per event: on a blocking thread, not
                 // one of the runtime's two workers, so an exec storm can't
@@ -1053,11 +1060,63 @@ fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sen
                     request: raw.request,
                 })
             }
+            ebpf::RawEvent::Priv(raw) => match priv_event(&raw) {
+                Some(ev) => Event::File(ev),
+                None => continue,
+            },
         };
         if tx.blocking_send(ev).is_err() {
             return;
         }
     }
+}
+
+/// A chmod or setxattr that gave a file setuid/setgid bits or capabilities.
+/// The hook fires on entry, before the call has done anything: wait a moment
+/// for it to land, and report nothing if it never does (it failed).
+fn priv_event(raw: &ebpf::RawPriv) -> Option<hermian_core::FileEvent> {
+    let rel = ebpf::to_str(&raw.path);
+    // chmod and setcap are usually gone before /proc can say what their fd
+    // or working directory was: then find the inode the kernel gave us.
+    let path = procsrc::path_at(raw.pid, raw.fd, &rel).or_else(|| {
+        let base = fallback::find_inode(fallback::st_dev_of_kernel(raw.dev), raw.ino)?;
+        procsrc::join_at(&base, &rel)
+    })?;
+    // The kernel's comm and uid still say who when the process is gone
+    // (writer_info then has an empty comm and uid 0).
+    let mut writer = procsrc::writer_info(raw.pid)
+        .map(fallback::writer_from)
+        .unwrap_or(hermian_core::WriterInfo {
+            pid: raw.pid,
+            uid: raw.uid,
+            comm: String::new(),
+            exe: String::new(),
+            tty_nr: 0,
+        });
+    if writer.comm.is_empty() {
+        writer.comm = ebpf::to_str(&raw.comm);
+        writer.uid = raw.uid;
+    }
+    let writer = Some(writer);
+    for _ in 0..5 {
+        if let Some(ev) = fallback::privileged_file_event(
+            path.clone(),
+            hermian_core::FileKind::Modified,
+            writer.clone(),
+        ) {
+            let has_it = match raw.kind {
+                ebpf::PRIV_SETID => ev.is_suid,
+                ebpf::PRIV_CAPS => ev.has_file_caps,
+                _ => false,
+            };
+            if has_it {
+                fallback::note_priv_reported(ev.dev, ev.ino);
+                return Some(ev);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    None
 }
 
 /// Re-read, validate and apply the configuration.

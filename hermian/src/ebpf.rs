@@ -51,10 +51,32 @@ pub struct RawPtrace {
     pub request: u64,
 }
 
+/// Must match `hermian_ebpf::PrivEvent`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawPriv {
+    pub pid: u32,
+    pub uid: u32,
+    pub fd: i32,
+    pub mode: u32,
+    pub kind: u8,
+    pub _pad: [u8; 3],
+    /// Kernel dev_t and inode of what `fd` stands for; 0 if unknown.
+    pub dev: u32,
+    pub ino: u64,
+    pub comm: [u8; 16],
+    pub path: [u8; 256],
+}
+
+/// `RawPriv::kind`: setuid/setgid bits, or the security.capability xattr.
+pub const PRIV_SETID: u8 = 1;
+pub const PRIV_CAPS: u8 = 2;
+
 pub enum RawEvent {
     Exec(Box<RawExec>),
     Connect(RawConnect),
     Ptrace(RawPtrace),
+    Priv(Box<RawPriv>),
 }
 
 pub fn to_str(arr: &[u8]) -> String {
@@ -122,6 +144,52 @@ const HOOKS: &[Hook] = &[
         tracepoint: "sys_enter_ptrace",
         required: false,
     },
+    // A file given setuid/setgid bits or capabilities, as it happens. The
+    // setuid sweep stays as the safety net (files created with those bits,
+    // or brought in from another filesystem). chmod doesn't exist on arm64,
+    // fchmodat2 before 6.6.
+    Hook {
+        program: "hermian_fchmodat",
+        category: "syscalls",
+        tracepoint: "sys_enter_fchmodat",
+        required: false,
+    },
+    Hook {
+        program: "hermian_fchmodat2",
+        category: "syscalls",
+        tracepoint: "sys_enter_fchmodat2",
+        required: false,
+    },
+    Hook {
+        program: "hermian_chmod",
+        category: "syscalls",
+        tracepoint: "sys_enter_chmod",
+        required: false,
+    },
+    Hook {
+        program: "hermian_fchmod",
+        category: "syscalls",
+        tracepoint: "sys_enter_fchmod",
+        required: false,
+    },
+    Hook {
+        program: "hermian_setxattr",
+        category: "syscalls",
+        tracepoint: "sys_enter_setxattr",
+        required: false,
+    },
+    Hook {
+        program: "hermian_lsetxattr",
+        category: "syscalls",
+        tracepoint: "sys_enter_lsetxattr",
+        required: false,
+    },
+    Hook {
+        program: "hermian_fsetxattr",
+        category: "syscalls",
+        tracepoint: "sys_enter_fsetxattr",
+        required: false,
+    },
 ];
 
 pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
@@ -134,6 +202,13 @@ pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
     if offsets.is_some() {
         loader.set_global("TASK_REAL_PARENT_OFF", &parent_off, true);
         loader.set_global("TASK_TGID_OFF", &tgid_off, true);
+    }
+    // The inode behind an fd, for chmod/setcap callers gone before /proc
+    // can be read. Without BTF those events fall back to the sweep.
+    let file_offs = crate::btf::file_offsets();
+    if let Some(offs) = &file_offs {
+        loader.set_global("FILE_OFFS", offs, true);
+        loader.set_global("FILE_OFFS_SET", &1u32, true);
     }
     let mut bpf = loader
         .load(include_bytes_aligned!(env!("HERMIAN_EBPF_OBJECT")))
@@ -181,6 +256,7 @@ enum MapKind {
     Exec,
     Connect,
     Ptrace,
+    Priv,
 }
 
 fn decode(kind: MapKind, buf: &BytesMut) -> Option<RawEvent> {
@@ -195,6 +271,9 @@ fn decode(kind: MapKind, buf: &BytesMut) -> Option<RawEvent> {
                 .then(|| RawEvent::Connect((buf.as_ptr() as *const RawConnect).read_unaligned())),
             MapKind::Ptrace => (buf.len() >= std::mem::size_of::<RawPtrace>())
                 .then(|| RawEvent::Ptrace((buf.as_ptr() as *const RawPtrace).read_unaligned())),
+            MapKind::Priv => (buf.len() >= std::mem::size_of::<RawPriv>()).then(|| {
+                RawEvent::Priv(Box::new((buf.as_ptr() as *const RawPriv).read_unaligned()))
+            }),
         }
     }
 }
@@ -248,6 +327,7 @@ fn spawn_readers(bpf: &mut Ebpf, tx: mpsc::Sender<RawEvent>) -> Result<()> {
         ("EXEC_EVENTS", MapKind::Exec, EXEC_PAGES),
         ("CONNECT_EVENTS", MapKind::Connect, OTHER_PAGES),
         ("PTRACE_EVENTS", MapKind::Ptrace, OTHER_PAGES),
+        ("PRIV_EVENTS", MapKind::Priv, OTHER_PAGES),
     ] {
         let map = bpf
             .take_map(map_name)
@@ -460,6 +540,117 @@ mod tests {
                     }
                 }
             }
+            drop(runtime);
+        });
+    }
+
+    /// setuid bits and capabilities come up as they're set; a plain chmod and
+    /// the ptrace requests a tracer makes after attaching don't.
+    #[test]
+    #[ignore]
+    fn ebpf_sees_setuid_and_caps_but_not_trace_steps() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, mut rx) = mpsc::channel(65536);
+            let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
+            for t in [
+                "sys_enter_fchmodat",
+                "sys_enter_fchmod",
+                "sys_enter_setxattr",
+            ] {
+                assert!(runtime.attached.contains(&t), "{} not attached", t);
+            }
+            let dir =
+                std::env::temp_dir().join(format!("hermian-priv-ebpf-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let plain = dir.join("plain");
+            let suid = dir.join("suid");
+            let caps = dir.join("caps");
+            let byfd = dir.join("byfd");
+            for f in [&plain, &suid, &caps, &byfd] {
+                std::fs::write(f, b"x").unwrap();
+            }
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&suid, std::fs::Permissions::from_mode(0o4755)).unwrap();
+            // VFS_CAP_REVISION_2 with cap_net_raw permitted; the hook fires on
+            // entry, so it's reported even if the kernel refused the value.
+            let mut blob = [0u8; 20];
+            blob[..4].copy_from_slice(&0x0200_0000u32.to_le_bytes());
+            blob[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
+            let cpath = std::ffi::CString::new(caps.to_str().unwrap()).unwrap();
+            // SAFETY: valid C strings and a 20-byte buffer.
+            unsafe {
+                libc::setxattr(
+                    cpath.as_ptr(),
+                    c"security.capability".as_ptr(),
+                    blob.as_ptr() as *const libc::c_void,
+                    blob.len(),
+                    0,
+                );
+                // setcap's way: by fd. The path has to come from the inode.
+                let f = std::fs::File::open(&byfd).unwrap();
+                use std::os::fd::AsRawFd;
+                libc::fsetxattr(
+                    f.as_raw_fd(),
+                    c"security.capability".as_ptr(),
+                    blob.as_ptr() as *const libc::c_void,
+                    blob.len(),
+                    0,
+                );
+                // A tracer's step on a pid that doesn't exist (ESRCH), then an
+                // attach to another: only the attach should come up.
+                libc::ptrace(libc::PTRACE_PEEKDATA, 999_999 as libc::pid_t, 0, 0);
+                libc::ptrace(libc::PTRACE_ATTACH, 999_998 as libc::pid_t, 0, 0);
+            }
+            let me = std::process::id();
+            use std::os::unix::fs::MetadataExt;
+            let byfd_md = std::fs::metadata(&byfd).unwrap();
+            let (mut saw_suid, mut saw_caps, mut saw_attach) = (false, false, false);
+            let mut saw_fd = false;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                match ev {
+                    RawEvent::Priv(p) if p.pid == me => {
+                        let path = to_str(&p.path);
+                        assert!(!path.ends_with("/plain"), "plain chmod reported");
+                        if p.kind == PRIV_SETID && path.ends_with("/suid") {
+                            assert_eq!(p.mode & 0o7777, 0o4755);
+                            saw_suid = true;
+                        }
+                        if p.kind == PRIV_CAPS && path.ends_with("/caps") {
+                            saw_caps = true;
+                        }
+                        if p.kind == PRIV_CAPS && path.is_empty() {
+                            assert_eq!(p.ino, byfd_md.ino(), "fd's inode");
+                            assert_eq!(
+                                crate::fallback::st_dev_of_kernel(p.dev),
+                                byfd_md.dev(),
+                                "fd's device"
+                            );
+                            assert!(!to_str(&p.comm).is_empty(), "comm");
+                            saw_fd = true;
+                        }
+                    }
+                    RawEvent::Ptrace(p) if p.pid == me => {
+                        assert_ne!(p.target_pid, 999_999, "a trace step was passed up");
+                        if p.target_pid == 999_998 {
+                            saw_attach = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(saw_suid, "setuid chmod not reported");
+            assert!(saw_caps, "security.capability not reported");
+            assert!(saw_attach, "ptrace attach not reported");
+            assert!(saw_fd, "fsetxattr by fd not reported with its inode");
             drop(runtime);
         });
     }

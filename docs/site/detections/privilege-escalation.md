@@ -17,8 +17,8 @@ library injected into a privileged process, a debugger attached to one.
 
 **Fires when** a setuid or setgid executable appears in a user-writable tree:
 `/tmp`, `/dev/shm`, `/var/tmp`, `/home`, `/root`, `/var/www`, `/srv`, `/opt`.
-A sweep looks for them four levels deep: every 20 seconds in `/tmp`, `/dev/shm`
-and `/var/tmp`, every minute in the others.
+Seen as the `chmod` happens; a sweep four levels deep catches files created
+with the bits already set (see [How it works](how-it-works#collectors)).
 
 **Why** A setuid copy of a shell is the oldest way to keep root. Vendor
 software installs setuid helpers under `/opt` (Chrome's `chrome-sandbox`), so
@@ -33,7 +33,8 @@ account.
 `HIGH`
 
 **Fires when** an executable in those same trees gets filesystem capabilities
-(`cap_setuid`, `cap_net_raw`…).
+(`cap_setuid`, `cap_net_raw`…), seen as `setcap` sets them. Needs eBPF: the
+sweep doesn't read capabilities.
 
 **Do** `getcap <file>`; `setcap -r <file>` if it isn't yours.
 
