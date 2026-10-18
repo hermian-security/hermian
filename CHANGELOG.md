@@ -19,7 +19,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
   admin's choice says who did what, and an expired button gives the command
   that does the same from the host. Buttons survive a restart, and a reply
   that can't be posted is retried, then sent with the next message that gets
-  through.
+  through. Two hosts sharing one bot (each press reaches only one of them)
+  page HIGH, and a press that lands on the wrong host says whose alert it is.
 - `hermian block <ip>...` and `hermian disconnect <ip>`, the command-line
   twins of the Block and Disconnect buttons. `hermian unblock` says why an
   address isn't blocked (lifted, by whom, or expired).

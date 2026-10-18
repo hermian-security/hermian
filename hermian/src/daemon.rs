@@ -543,6 +543,10 @@ async fn async_main(
                     report_dropped_events(&mut engine, &notifier, &grown, &dropped_now);
                 }
                 dropped_seen = dropped_now;
+                let conflicts = tgbot::take_conflicts();
+                if conflicts >= 2 {
+                    report_bot_conflict(&mut engine, &notifier, conflicts);
+                }
                 let unmonitored = ebpf::unmonitored_cpus();
                 if !unmonitored.is_empty() && unmonitored != hotplug_reported {
                     report_unmonitored_cpus(&mut engine, &notifier, &unmonitored);
@@ -660,6 +664,33 @@ fn report_dropped_events(
             ),
         );
     }
+}
+
+/// Page when something else keeps reading this bot's button presses: each
+/// press then reaches only one of the readers, and the other answers that
+/// it doesn't know the button. The dedup window keeps it to one page.
+fn report_bot_conflict(engine: &mut Engine, notifier: &notify::Notifier, conflicts: u32) {
+    let n = conflicts.to_string();
+    emit_self(
+        notifier,
+        self_alert(
+            engine,
+            Severity::High,
+            "Another host is reading this bot's button presses",
+            "Telegram refused to hand this host its button presses because something else is \
+             polling the same bot. Each press now reaches only one of them, at random.",
+            "A press that lands on the wrong host does nothing there, so a Block or Disconnect \
+             can silently not happen.",
+            &[
+                "Give each host with buttons its own bot (see docs/FLEET.md), or turn buttons off \
+                 on the others (notifications.telegram.actions = false).",
+                "If no other host should use this bot, someone else has its token: revoke it with \
+                 @BotFather.",
+            ],
+            &[("Conflicts", n.as_str())],
+            "selfprotect|tg-conflict",
+        ),
+    );
 }
 
 fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>, cfg: &Config) {

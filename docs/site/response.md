@@ -105,6 +105,10 @@ either way.
   blocked**, whatever is pressed.
 - Hermian polls Telegram for presses (outbound only): it still listens on no
   port, and it works during isolation.
+- **One bot per host with buttons.** If two hosts poll the same bot, each
+  press reaches only one of them: Hermian pages HIGH "Another host is reading
+  this bot's button presses", and a press that lands on the wrong host says
+  whose alert it is instead of acting.
 - Every press and its result are answered in the chat, logged, and stored.
 
 Every button has a twin on the command line, for when the button has

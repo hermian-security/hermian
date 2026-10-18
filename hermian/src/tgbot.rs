@@ -118,6 +118,14 @@ fn undelivered() -> &'static Mutex<Vec<String>> {
 /// Buttons are saved to disk only by the running poller, not in tests.
 static PERSIST: AtomicBool = AtomicBool::new(false);
 static STARTED: OnceLock<DateTime<Utc>> = OnceLock::new();
+/// HTTP 409s from getUpdates since the daemon last asked: something else
+/// is polling this bot.
+static CONFLICTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Poll conflicts since the last call (see `daemon::report_bot_conflict`).
+pub fn take_conflicts() -> u32 {
+    CONFLICTS.swap(0, Ordering::Relaxed)
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
@@ -387,6 +395,24 @@ fn labels_of(s: &HashMap<String, Pending>, alert_ref: &str) -> Vec<(String, Stri
     v.into_iter().map(|(_, d, l)| (d, l)).collect()
 }
 
+/// The host an alert's text names: its "host" line, or "... on <host>" in
+/// the minimal format.
+fn host_in(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("host ") {
+            let h = rest.trim();
+            if !h.is_empty() {
+                return Some(h.to_string());
+            }
+        }
+    }
+    let first = text.lines().next()?;
+    let (_, after) = first.rsplit_once(" alert ")?;
+    let (_, host) = after.split_once(" on ")?;
+    let host = host.trim();
+    (!host.is_empty() && !host.contains(' ')).then(|| host.to_string())
+}
+
 /// The alert reference in a message's text, for the "details" hint.
 fn alert_ref_in(text: &str) -> Option<String> {
     let i = text.find("HER-")?;
@@ -399,9 +425,17 @@ fn alert_ref_in(text: &str) -> Option<String> {
 
 /// A button we know nothing about: say why, and where the alert is.
 fn unknown_button(cq: &Value, now: DateTime<Utc>) -> String {
-    let hint = cq["message"]["text"]
-        .as_str()
-        .and_then(alert_ref_in)
+    let text = cq["message"]["text"].as_str().unwrap_or("");
+    // Another host's alert: two hosts are polling this bot, and this one
+    // got a press meant for the other.
+    let me = crate::procsrc::hostname();
+    if let Some(host) = host_in(text).filter(|h| *h != me) {
+        return format!(
+            "This is {}'s alert, but {} answered: both read this bot's presses. Give each host              with buttons its own bot. Nothing was done.",
+            host, me
+        );
+    }
+    let hint = alert_ref_in(text)
         .map(|r| format!(" Details: sudo hermian show {}", r))
         .unwrap_or_default();
     let sent = cq["message"]["date"]
@@ -886,7 +920,11 @@ fn poll_loop(
                 // 409: something else is reading this bot's updates. Either
                 // another host with actions on shares the bot (each press
                 // reaches only one of them), or a webhook is set.
-                let hint = if e.starts_with("HTTP 409") {
+                let conflict = e.starts_with("HTTP 409");
+                if conflict {
+                    CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                }
+                let hint = if conflict {
                     " (another host with Telegram actions on may be using this bot: give each \
                      host with buttons its own bot, see docs/FLEET.md; or a webhook is set: \
                      call deleteWebhook)"
@@ -1650,5 +1688,40 @@ mod tests {
         let long = "x".repeat(500);
         assert_eq!(clip(long).chars().count(), ANSWER_MAX);
         assert_eq!(clip("short".into()), "short");
+    }
+
+    #[test]
+    fn a_press_for_another_hosts_alert_says_so() {
+        let cq = |text: &str| {
+            json!({
+                "id": "q", "from": { "id": 42, "username": "op" },
+                "message": { "message_id": 9, "chat": { "id": -1001 }, "text": text },
+                "data": "hm:111111111111111111111111",
+            })
+        };
+        let full = "◉◉◉○  HIGH · SSH
+Root login
+
+host   db-02-elsewhere
+rule   D2 · SSH";
+        let (msg, out) = handle_callback(&cq(full), &cfg(), Utc::now());
+        assert!(out.request.is_none());
+        assert!(
+            msg.starts_with("This is db-02-elsewhere's alert, but "),
+            "{}",
+            msg
+        );
+        assert!(msg.contains("its own bot"), "{}", msg);
+        assert_eq!(
+            host_in(
+                "HIGH alert 025 on web-01
+sudo hermian show HER-1"
+            ),
+            Some("web-01".into())
+        );
+        // Our own host: the usual answer.
+        let own = format!("host   {}", crate::procsrc::hostname());
+        let (msg, _) = handle_callback(&cq(&own), &cfg(), Utc::now());
+        assert!(msg.starts_with("This button is no longer valid"), "{}", msg);
     }
 }
