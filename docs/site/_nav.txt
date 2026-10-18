@@ -1,0 +1,41 @@
+# The docs site's table of contents, read by the website build
+# (hermian-security/website, build_site.py). One section per unindented
+# line; under it, one page per line: URL slug, the Markdown file relative
+# to this directory, and optionally a short label for the sidebar. "/" is
+# the docs home.
+Getting started
+  /                              index.md
+  install                        install.md
+  quickstart                     quickstart.md
+Concepts
+  how-it-works                   how-it-works.md
+  baseline                       baseline.md
+  noise                          noise.md
+  self-protection                self-protection.md
+Detections
+  detections                     detections/index.md  All alerts
+  detections/process-chains      detections/process-chains.md
+  detections/ssh-and-accounts    detections/ssh-and-accounts.md
+  detections/persistence         detections/persistence.md
+  detections/privilege-escalation  detections/privilege-escalation.md
+  detections/network             detections/network.md
+  detections/self                detections/self.md
+Notifications
+  notifications                  notifications.md  Overview
+  notifications/telegram         telegram.md
+  notifications/email            email.md
+  notifications/webhooks         webhooks.md
+Response
+  response                       response.md
+Reference
+  cli                            cli.md
+  configuration                  configuration.md
+  files                          files.md
+Operations
+  fleet                          ../FLEET.md  Several servers
+  troubleshooting                troubleshooting.md
+  faq                            faq.md
+Project
+  limits                         limits.md
+  evidence                       ../EVIDENCE.md  Evidence
+  beta                           ../BETA.md  Beta testing
