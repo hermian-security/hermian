@@ -37,7 +37,7 @@ and Telegram button presses are fetched by outbound polling.
 | inotify | Changes to persistence, SSH, account and loader files | 400 ms debounce, 2.5 s at most. The writer is found from open file descriptors when possible. |
 | sshd's journal (or `auth.log` / `secure`) | Logins, failures, the key used and where it's stored | sshd's own entries only, so a local program can't forge one. |
 | `/proc/net/tcp` | New listening ports | Every 5 seconds. |
-| setuid sweep | New setuid/setgid files and file capabilities | Every 20 seconds, four levels deep under user-writable trees. |
+| setuid sweep | New setuid/setgid files and file capabilities | Four levels deep under user-writable trees: every 20 seconds in /tmp, /var/tmp and /dev/shm, every minute in homes and service trees. |
 | PAM module | Login results | Optional (`hermian enable --with-pam`); never sees passwords, always returns `PAM_IGNORE`. |
 
 eBPF needs kernel 5.8 or newer with BTF. Without it, execution falls back to

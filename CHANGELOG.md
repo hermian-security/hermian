@@ -60,6 +60,19 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- Hermian no longer burns CPU on busy hosts. Self-protection makes
+  /etc/ld.so.preload read as /dev/null inside the daemon, and the file was
+  still watched directly, so every write to /dev/null on the host (Docker
+  writes there constantly) looked like an ld.so.preload change, and each one
+  set off a scan of every process's open files to find the writer, about
+  300 ms on a host with a JVM and a database. The file is now watched
+  through /etc only, which still sees the host's copy change. A burst of
+  changes also looks for its writer at most twice, not once per event.
+  Measured at 4-9% of a core on that host, from about 0.06% on small ones.
+- The setuid sweep is cheaper on hosts with large home directories. It
+  stats only regular files, and sweeps homes, /opt, /srv and /var/www every
+  minute instead of every 20 seconds; /tmp, /var/tmp and /dev/shm stay at 20
+  seconds.
 - ntfy alerts arrive as notifications again, not as raw JSON text. The
   JSON body now goes to the server root with the topic inside it, which is
   the only place ntfy reads JSON; `url` stays the topic URL
