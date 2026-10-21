@@ -813,29 +813,44 @@ fn describe_user(from: &Value) -> String {
     }
 }
 
-fn agent(timeout: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(timeout)
-        .user_agent(&format!("hermian/{}", hermian_core::VERSION))
+/// HTTP client for Telegram and webhooks. An error status comes back as a
+/// response, so its body (Telegram's `description`) can be read.
+pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .user_agent(format!("hermian/{}", hermian_core::VERSION))
+        .http_status_as_error(false)
         .build()
+        .into()
 }
 
 fn call(cfg: &TelegramCfg, method: &str, body: Value, timeout: Duration) -> Result<Value, String> {
-    let url = format!(
-        "{}/bot{}/{}",
-        crate::channels::telegram::api_base(),
-        cfg.bot_token,
-        method
-    );
+    let base = crate::channels::telegram::api_base();
+    call_at(&base, cfg, method, body, timeout)
+}
+
+fn call_at(
+    base: &str,
+    cfg: &TelegramCfg,
+    method: &str,
+    body: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let url = format!("{}/bot{}/{}", base, cfg.bot_token, method);
     match agent(timeout).post(&url).send_json(body) {
-        Ok(r) => r.into_json::<Value>().map_err(|e| e.to_string()),
-        Err(ureq::Error::Status(code, r)) => {
+        Ok(mut r) if r.status().as_u16() < 400 => {
+            r.body_mut().read_json::<Value>().map_err(|e| e.to_string())
+        }
+        Ok(mut r) => {
             let desc = r
-                .into_json::<Value>()
+                .body_mut()
+                .read_json::<Value>()
                 .ok()
                 .and_then(|v| v["description"].as_str().map(str::to_string))
                 .unwrap_or_default();
-            Err(format!("HTTP {} {}", code, desc).trim().to_string())
+            Err(format!("HTTP {} {}", r.status().as_u16(), desc)
+                .trim()
+                .to_string())
         }
         Err(e) => Err(crate::notify::webhook::strip_url_paths(
             &e.to_string().replace(&cfg.bot_token, "<token>"),
@@ -1349,6 +1364,45 @@ mod tests {
             }
         });
         (base, calls)
+    }
+
+    /// An error status still yields Telegram's description: the shared-bot
+    /// alert keys on "HTTP 409", and the token never shows in an error.
+    #[test]
+    fn error_status_keeps_the_description() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = r#"{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request"}"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        });
+        let e = call_at(
+            &base,
+            &cfg(),
+            "getUpdates",
+            json!({}),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(
+            e,
+            "HTTP 409 Conflict: terminated by other getUpdates request"
+        );
+        // Nothing listening: a transport error, with the token redacted.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let e = call_at(&base, &cfg(), "getMe", json!({}), Duration::from_secs(5)).unwrap_err();
+        assert!(!e.contains("1:x"), "{e}");
     }
 
     /// Alert with buttons -> Telegram -> a press from an allowed user ->

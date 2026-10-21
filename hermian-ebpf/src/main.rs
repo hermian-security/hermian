@@ -7,9 +7,9 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes,
         bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
-    macros::{map, tracepoint},
+    macros::{kprobe, map, tracepoint},
     maps::{LruHashMap, PerCpuArray, PerfEventArray},
-    programs::TracePointContext,
+    programs::{ProbeContext, TracePointContext},
     EbpfContext,
 };
 
@@ -41,6 +41,76 @@ const OFF_TASK_FS: usize = 8;
 const OFF_FS_PWD: usize = 9;
 const OFF_PATH_DENTRY: usize = 10;
 const OFF_DENTRY_INODE: usize = 11;
+
+/// For the kprobes on the syscall wrappers (`__x64_sys_*`, `__arm64_sys_*`),
+/// set by userspace for the running arch, so one object serves both:
+/// KPROBE_ARCH says where the wrapper's own argument (the caller's saved
+/// registers) is, SYSCALL_ARG_WORDS where each syscall argument sits in
+/// them, in u64 words (x86_64: di si dx r10 r8 r9; arm64: x0..x5).
+/// 0 means unknown, and userspace doesn't attach the kprobes.
+#[no_mangle]
+static KPROBE_ARCH: u32 = 0;
+#[no_mangle]
+static SYSCALL_ARG_WORDS: [u32; 6] = [0; 6];
+
+const ARCH_X86_64: u32 = 1;
+const ARCH_ARM64: u32 = 2;
+
+/// Where the wrapper's own argument sits in the kprobe's `struct pt_regs`:
+/// x86_64's di, arm64's x0.
+const X86_64_DI: usize = 14 * 8;
+const ARM64_X0: usize = 0;
+
+/// A hook's syscall arguments: from the tracepoint record, or, for a kprobe
+/// on the syscall wrapper, from the caller's saved registers.
+///
+/// Since 6.19 (7.0 on Ubuntu 26.04), a syscall tracepoint with a user string
+/// argument (execve, chmod, setxattr...) copies that string before running
+/// BPF, and drops the event, BPF included, often enough: 0 out of 50 chmods
+/// seen on 7.0. The wrapper kprobes don't go through that path.
+///
+/// 0 when the argument can't be read, which every caller already treats as
+/// absent (a NULL pointer, a mode without setid bits). Not an Option: LLVM
+/// left a register unset on the None path and the verifier refused it.
+trait SysArgs: EbpfContext {
+    fn arg(&self, i: usize) -> u64;
+}
+
+impl SysArgs for TracePointContext {
+    #[inline(always)]
+    fn arg(&self, i: usize) -> u64 {
+        // SAFETY: the 6 u64 args start at ARG0 in the record.
+        unsafe { self.read_at::<u64>(ARG0 + 8 * i).unwrap_or(0) }
+    }
+}
+
+impl SysArgs for ProbeContext {
+    #[inline(always)]
+    fn arg(&self, i: usize) -> u64 {
+        if i >= 6 {
+            return 0;
+        }
+        // Through the helper: the verifier refuses a load from the context
+        // at an offset LLVM has already added to the pointer.
+        let off = match unsafe { core::ptr::read_volatile(&KPROBE_ARCH) } {
+            ARCH_X86_64 => X86_64_DI,
+            ARCH_ARM64 => ARM64_X0,
+            _ => return 0,
+        };
+        // SAFETY: a fixed offset inside pt_regs on both arches; bounds-checked
+        // kernel read.
+        let user: u64 = unsafe {
+            bpf_probe_read_kernel((self.regs as *const u8).add(off) as *const u64).unwrap_or(0)
+        };
+        if user == 0 {
+            return 0;
+        }
+        // SAFETY: our own global.
+        let word = unsafe { core::ptr::read_volatile(&SYSCALL_ARG_WORDS[i]) } as u64;
+        // SAFETY: the saved registers are kernel memory; bounds-checked read.
+        unsafe { bpf_probe_read_kernel((user + word * 8) as *const u64).unwrap_or(0) }
+    }
+}
 
 #[map]
 static EXEC_EVENTS: PerfEventArray<ExecEvent> = PerfEventArray::new(0);
@@ -155,8 +225,6 @@ pub struct PtraceEvent {
 // followed by `int __syscall_nr` + padding, then the 6 u64 args starting at 16).
 const ARG0: usize = 16;
 const ARG1: usize = 24;
-const ARG2: usize = 32;
-const ARG3: usize = 40;
 
 // sched/sched_process_exec: { common(8) ; __data_loc char[] filename (4) ; pid_t pid (4) ; pid_t old_pid (4) }
 // __data_loc packs (len << 16 | offset) relative to the start of the record.
@@ -256,7 +324,7 @@ fn scan_env_for_ld_preload(envp: u64) -> u8 {
 /// (faultable tracepoints), and a second exec on the same CPU mid-way would
 /// have overwritten a shared slot, mixing argv0/LD_PRELOAD between tasks.
 #[inline(always)]
-fn record_intent(ctx: &TracePointContext, argv_off: usize, envp_off: usize, via_execveat: u8) {
+fn record_intent<C: SysArgs>(ctx: &C, argv_i: usize, envp_i: usize, via_execveat: u8) {
     let mut intent = ExecIntent {
         ld_preload: 0,
         via_execveat,
@@ -264,13 +332,8 @@ fn record_intent(ctx: &TracePointContext, argv_off: usize, envp_off: usize, via_
         argv0: [0u8; 128],
     };
 
-    // SAFETY: offsets are within the tracepoint's fixed argument block.
-    let (argv, envp) = unsafe {
-        (
-            ctx.read_at::<u64>(argv_off).unwrap_or(0),
-            ctx.read_at::<u64>(envp_off).unwrap_or(0),
-        )
-    };
+    let argv = ctx.arg(argv_i);
+    let envp = ctx.arg(envp_i);
     if argv != 0 {
         if let Some(a0) = read_user_ptr(argv) {
             // SAFETY: user pointer, bounds-checked by the helper; dst is map memory.
@@ -287,14 +350,26 @@ fn record_intent(ctx: &TracePointContext, argv_off: usize, envp_off: usize, via_
 /// execve(const char *filename, char *const argv[], char *const envp[])
 #[tracepoint(name = "hermian_execve", category = "syscalls")]
 pub fn hermian_execve(ctx: TracePointContext) -> u32 {
-    record_intent(&ctx, ARG1, ARG2, 0);
+    record_intent(&ctx, 1, 2, 0);
+    0
+}
+
+#[kprobe]
+pub fn hermian_kp_execve(ctx: ProbeContext) -> u32 {
+    record_intent(&ctx, 1, 2, 0);
     0
 }
 
 /// execveat(int dfd, const char *filename, char *const argv[], char *const envp[], int flags)
 #[tracepoint(name = "hermian_execveat", category = "syscalls")]
 pub fn hermian_execveat(ctx: TracePointContext) -> u32 {
-    record_intent(&ctx, ARG2, ARG3, 1);
+    record_intent(&ctx, 2, 3, 1);
+    0
+}
+
+#[kprobe]
+pub fn hermian_kp_execveat(ctx: ProbeContext) -> u32 {
+    record_intent(&ctx, 2, 3, 1);
     0
 }
 
@@ -351,14 +426,22 @@ pub fn hermian_sched_exec(ctx: TracePointContext) -> u32 {
 /// connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 #[tracepoint(name = "hermian_connect", category = "syscalls")]
 pub fn hermian_connect(ctx: TracePointContext) -> u32 {
+    on_connect(&ctx);
+    0
+}
+
+#[kprobe]
+pub fn hermian_kp_connect(ctx: ProbeContext) -> u32 {
+    on_connect(&ctx);
+    0
+}
+
+#[inline(always)]
+fn on_connect<C: SysArgs>(ctx: &C) {
     let (pid, uid, gid) = current_pid_uid();
-    // SAFETY: ARG1 is inside the tracepoint argument block.
-    let sa_addr: u64 = match unsafe { ctx.read_at::<u64>(ARG1) } {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
+    let sa_addr = ctx.arg(1);
     if sa_addr == 0 {
-        return 0;
+        return;
     }
     // Read the family first, then only as many bytes as that family needs.
     // A fixed 28-byte read failed (and dropped the event) whenever a 16-byte
@@ -367,7 +450,7 @@ pub fn hermian_connect(ctx: TracePointContext) -> u32 {
     // SAFETY: sa_addr is a user pointer; the helper bounds-checks the read.
     let family: u16 = match unsafe { bpf_probe_read_user(sa_addr as *const u16) } {
         Ok(f) => f,
-        Err(_) => return 0,
+        Err(_) => return,
     };
     let mut ev = ConnectEvent {
         pid,
@@ -389,7 +472,7 @@ pub fn hermian_connect(ctx: TracePointContext) -> u32 {
             // SAFETY: 8 bytes, inside any valid sockaddr_in (16 bytes).
             let sa: In4 = match unsafe { bpf_probe_read_user(sa_addr as *const In4) } {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return,
             };
             ev.dport = u16::from_be(sa.port_be);
             ev.daddr6[..4].copy_from_slice(&sa.addr);
@@ -406,15 +489,14 @@ pub fn hermian_connect(ctx: TracePointContext) -> u32 {
             // SAFETY: 24 bytes, inside any valid sockaddr_in6 (28 bytes).
             let sa: In6 = match unsafe { bpf_probe_read_user(sa_addr as *const In6) } {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return,
             };
             ev.dport = u16::from_be(sa.port_be);
             ev.daddr6.copy_from_slice(&sa.addr);
         }
-        _ => return 0,
+        _ => return,
     }
-    CONNECT_EVENTS.output(&ctx, &ev, 0);
-    0
+    CONNECT_EVENTS.output(ctx, &ev, 0);
 }
 
 /// ptrace(long request, long pid, void *addr, void *data)
@@ -512,7 +594,7 @@ fn fd_inode(fd: i32) -> Option<(u32, u64)> {
 
 /// Pass up a file being given setuid/setgid bits or capabilities. Userspace
 /// resolves the path, checks the call took effect and judges the location.
-fn emit_priv(ctx: &TracePointContext, fd: i32, path: u64, mode: u64, kind: u8) {
+fn emit_priv<C: EbpfContext>(ctx: &C, fd: i32, path: u64, mode: u64, kind: u8) {
     let Some(ev) = PRIV_SCRATCH.get_ptr_mut(0) else {
         return;
     };
@@ -542,18 +624,9 @@ fn emit_priv(ctx: &TracePointContext, fd: i32, path: u64, mode: u64, kind: u8) {
 
 /// Shared by fchmodat(int dfd, const char *filename, umode_t mode) and
 /// fchmodat2(..., int flags).
-fn on_fchmodat(ctx: &TracePointContext) {
-    // SAFETY: offsets are inside the tracepoint argument block.
-    let (dfd, path, mode) = match unsafe {
-        (
-            ctx.read_at::<u64>(ARG0),
-            ctx.read_at::<u64>(ARG1),
-            ctx.read_at::<u64>(ARG2),
-        )
-    } {
-        (Ok(d), Ok(p), Ok(m)) => (d, p, m),
-        _ => return,
-    };
+#[inline(always)]
+fn on_fchmodat<C: SysArgs>(ctx: &C) {
+    let (dfd, path, mode) = (ctx.arg(0), ctx.arg(1), ctx.arg(2));
     if mode & SETID_BITS != 0 && path != 0 {
         emit_priv(ctx, dfd as i32, path, mode, PRIV_SETID);
     }
@@ -571,16 +644,37 @@ pub fn hermian_fchmodat2(ctx: TracePointContext) -> u32 {
     0
 }
 
+#[kprobe]
+pub fn hermian_kp_fchmodat(ctx: ProbeContext) -> u32 {
+    on_fchmodat(&ctx);
+    0
+}
+
+#[kprobe]
+pub fn hermian_kp_fchmodat2(ctx: ProbeContext) -> u32 {
+    on_fchmodat(&ctx);
+    0
+}
+
 /// chmod(const char *filename, umode_t mode); x86_64 only, arm64 has fchmodat.
 #[tracepoint(name = "hermian_chmod", category = "syscalls")]
 pub fn hermian_chmod(ctx: TracePointContext) -> u32 {
-    // SAFETY: offsets are inside the tracepoint argument block.
-    if let (Ok(path), Ok(mode)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
-        if mode & SETID_BITS != 0 && path != 0 {
-            emit_priv(&ctx, AT_FDCWD, path, mode, PRIV_SETID);
-        }
-    }
+    on_chmod(&ctx);
     0
+}
+
+#[kprobe]
+pub fn hermian_kp_chmod(ctx: ProbeContext) -> u32 {
+    on_chmod(&ctx);
+    0
+}
+
+#[inline(always)]
+fn on_chmod<C: SysArgs>(ctx: &C) {
+    let (path, mode) = (ctx.arg(0), ctx.arg(1));
+    if mode & SETID_BITS != 0 && path != 0 {
+        emit_priv(ctx, AT_FDCWD, path, mode, PRIV_SETID);
+    }
 }
 
 /// fchmod(unsigned int fd, umode_t mode): `cp -p`, `install`, tar and rsync.
@@ -609,12 +703,11 @@ fn is_caps_xattr(name: u64) -> bool {
 }
 
 /// Shared by setxattr and lsetxattr(const char *pathname, const char *name, ...).
-fn on_setxattr(ctx: &TracePointContext) {
-    // SAFETY: offsets are inside the tracepoint argument block.
-    if let (Ok(path), Ok(name)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
-        if path != 0 && is_caps_xattr(name) {
-            emit_priv(ctx, AT_FDCWD, path, 0, PRIV_CAPS);
-        }
+#[inline(always)]
+fn on_setxattr<C: SysArgs>(ctx: &C) {
+    let (path, name) = (ctx.arg(0), ctx.arg(1));
+    if path != 0 && is_caps_xattr(name) {
+        emit_priv(ctx, AT_FDCWD, path, 0, PRIV_CAPS);
     }
 }
 
@@ -631,16 +724,37 @@ pub fn hermian_lsetxattr(ctx: TracePointContext) -> u32 {
     0
 }
 
+#[kprobe]
+pub fn hermian_kp_setxattr(ctx: ProbeContext) -> u32 {
+    on_setxattr(&ctx);
+    0
+}
+
+#[kprobe]
+pub fn hermian_kp_lsetxattr(ctx: ProbeContext) -> u32 {
+    on_setxattr(&ctx);
+    0
+}
+
 /// fsetxattr(int fd, const char *name, ...).
 #[tracepoint(name = "hermian_fsetxattr", category = "syscalls")]
 pub fn hermian_fsetxattr(ctx: TracePointContext) -> u32 {
-    // SAFETY: offsets are inside the tracepoint argument block.
-    if let (Ok(fd), Ok(name)) = unsafe { (ctx.read_at::<u64>(ARG0), ctx.read_at::<u64>(ARG1)) } {
-        if is_caps_xattr(name) {
-            emit_priv(&ctx, fd as i32, 0, 0, PRIV_CAPS);
-        }
-    }
+    on_fsetxattr(&ctx);
     0
+}
+
+#[kprobe]
+pub fn hermian_kp_fsetxattr(ctx: ProbeContext) -> u32 {
+    on_fsetxattr(&ctx);
+    0
+}
+
+#[inline(always)]
+fn on_fsetxattr<C: SysArgs>(ctx: &C) {
+    let (fd, name) = (ctx.arg(0), ctx.arg(1));
+    if is_caps_xattr(name) {
+        emit_priv(ctx, fd as i32, 0, 0, PRIV_CAPS);
+    }
 }
 
 #[panic_handler]

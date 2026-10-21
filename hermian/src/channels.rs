@@ -232,15 +232,13 @@ pub mod telegram {
         if !buttons.is_empty() {
             payload["reply_markup"] = crate::tgbot::keyboard(&buttons);
         }
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(cfg.timeout_secs.clamp(3, 60)))
-            .user_agent(&format!("hermian/{}", hermian_core::VERSION))
-            .build();
+        let agent = crate::tgbot::agent(Duration::from_secs(cfg.timeout_secs.clamp(3, 60)));
         match agent.post(&url).send_json(payload) {
-            Ok(resp) => {
+            Ok(mut resp) if resp.status().as_u16() < 400 => {
                 if !buttons.is_empty() {
                     if let Some(mid) = resp
-                        .into_json::<serde_json::Value>()
+                        .body_mut()
+                        .read_json::<serde_json::Value>()
                         .ok()
                         .and_then(|v| v["result"]["message_id"].as_i64())
                     {
@@ -249,9 +247,11 @@ pub mod telegram {
                 }
                 Ok(())
             }
-            Err(ureq::Error::Status(code, resp)) => {
+            Ok(mut resp) => {
+                let code = resp.status().as_u16();
                 let detail = resp
-                    .into_string()
+                    .body_mut()
+                    .read_to_string()
                     .ok()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                     .and_then(|v| v["description"].as_str().map(str::to_string))
@@ -270,34 +270,38 @@ pub mod telegram {
 
     /// Verify the token and chat without sending an alert.
     pub fn probe(cfg: &TelegramCfg) -> Result<String, String> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(10))
-            .build();
-        let me: serde_json::Value = agent
-            .get(&format!("{}/bot{}/getMe", api_base(), cfg.bot_token))
+        let agent = crate::tgbot::agent(Duration::from_secs(10));
+        let mut me = agent
+            .get(format!("{}/bot{}/getMe", api_base(), cfg.bot_token))
             .call()
-            .map_err(|e| match e {
-                ureq::Error::Status(401, _) => {
-                    "bot_token rejected by Telegram (401); re-copy it from @BotFather".to_string()
-                }
-                other => format!("getMe failed: {}", redact(cfg, other)),
-            })?
-            .into_json()
-            .map_err(|e| redact(cfg, e))?;
+            .map_err(|e| format!("getMe failed: {}", redact(cfg, e)))?;
+        match me.status().as_u16() {
+            401 => {
+                return Err(
+                    "bot_token rejected by Telegram (401); re-copy it from @BotFather".to_string(),
+                )
+            }
+            code if code >= 400 => return Err(format!("getMe failed: HTTP {}", code)),
+            _ => {}
+        }
+        let me: serde_json::Value = me.body_mut().read_json().map_err(|e| redact(cfg, e))?;
         let name = me["result"]["username"].as_str().unwrap_or("?").to_string();
-        let chat: serde_json::Value = agent
-            .post(&format!("{}/bot{}/getChat", api_base(), cfg.bot_token))
+        let mut chat = agent
+            .post(format!("{}/bot{}/getChat", api_base(), cfg.bot_token))
             .send_json(serde_json::json!({"chat_id": cfg.chat_id}))
-            .map_err(|e| match e {
-                ureq::Error::Status(400 | 403, _) => format!(
+            .map_err(|e| format!("getChat failed: {}", redact(cfg, e)))?;
+        match chat.status().as_u16() {
+            400 | 403 => {
+                return Err(format!(
                     "chat_id {} not reachable: send a message to the bot first (or add it to the group), \
                      then read the id from /getUpdates",
                     cfg.chat_id
-                ),
-                other => format!("getChat failed: {}", redact(cfg, other)),
-            })?
-            .into_json()
-            .map_err(|e| redact(cfg, e))?;
+                ))
+            }
+            code if code >= 400 => return Err(format!("getChat failed: HTTP {}", code)),
+            _ => {}
+        }
+        let chat: serde_json::Value = chat.body_mut().read_json().map_err(|e| redact(cfg, e))?;
         let title = chat["result"]["title"]
             .as_str()
             .or(chat["result"]["username"].as_str())

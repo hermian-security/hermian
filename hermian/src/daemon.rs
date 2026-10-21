@@ -313,6 +313,9 @@ async fn async_main(
         match ebpf::load_and_attach(raw_tx) {
             Ok(runtime) => {
                 sources.ebpf = Some(runtime.attached.clone());
+                if !runtime.kprobes.is_empty() {
+                    eprintln!("hermian: through kprobes: {}", runtime.kprobes.join(" "));
+                }
                 // chmod reported as it happens: the setuid sweep can slow down.
                 if ["sys_enter_fchmodat", "sys_enter_fchmod"]
                     .iter()

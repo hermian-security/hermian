@@ -981,10 +981,7 @@ pub mod webhook {
 
     pub fn send(alert: &Alert, cfg: &WebhookCfg) -> Result<(), SendError> {
         let body = payload(alert, &cfg.format);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(cfg.timeout_secs.clamp(2, 60)))
-            .user_agent(&format!("hermian/{}", hermian_core::VERSION))
-            .build();
+        let agent = crate::tgbot::agent(Duration::from_secs(cfg.timeout_secs.clamp(2, 60)));
         let mut body = body;
         let mut req = if cfg.format == "matrix" {
             agent.put(&matrix_url(&cfg.url, alert))
@@ -1001,16 +998,19 @@ pub mod webhook {
         } else {
             agent.post(&cfg.url)
         }
-        .set("Content-Type", "application/json");
+        .header("Content-Type", "application/json");
         if !cfg.token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", cfg.token));
+            req = req.header("Authorization", format!("Bearer {}", cfg.token));
         }
         match req.send_json(body) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, _)) => Err(SendError::http(
-                code,
-                format!("webhook returned HTTP {}", code),
-            )),
+            Ok(resp) if resp.status().as_u16() < 400 => Ok(()),
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                Err(SendError::http(
+                    code,
+                    format!("webhook returned HTTP {}", code),
+                ))
+            }
             Err(e) => Err(SendError::transient(format!(
                 "webhook request failed: {}",
                 redact(cfg, e)
