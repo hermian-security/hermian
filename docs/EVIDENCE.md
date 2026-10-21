@@ -8,12 +8,16 @@ as unproven.
 
 ## 1. Tests
 
-Last run 2026-10-16, on every change in CI:
+Last run 2026-10-21, on every change in CI:
 
-- hermian-core (detection engine, synthetic events): 165 passing.
-- hermian (daemon, Linux only): 127 passing, 7 ignored.
+- hermian-core (detection engine, synthetic events): 197 passing.
+- hermian (daemon, Linux only): 182 passing, 8 ignored (the live ones).
 - hermian-pam (the PAM hook): 2 passing.
-- tests/helpers (installer, packaging, suite plumbing): 41 passing.
+- tests/helpers (installer, packaging, suite plumbing): 50 passing.
+- Live eBPF (the ignored ones, as root on the runner): the object loads,
+  and exec with LD_PRELOAD/LD_AUDIT, connect, setuid chmod, setcap and
+  ptrace attach are seen. On kernel 7.0 (ubuntu-latest), 6.8 (ubuntu-22.04)
+  and 6.8 arm64 (ubuntu-22.04-arm).
 
 These don't prove live collection works on a host. The field runs below do.
 
@@ -87,12 +91,34 @@ point was to see what a real infection looks like from Hermian's side.
 - Uninstall: the first run left dpkg listing the package (fixed in #90);
   the retest on 2026-10-18 left nothing behind.
 
+A test host with things planted on it (October 2026). Ubuntu 24.04,
+kernel 6.8, internet-facing. Installed with Telegram and email; the plants
+aren't looked for, only what Hermian reports.
+
+- CPU (2026-10-18): 14% at first, from an inotify watch on a bind-mounted
+  /dev/null and the setuid sweep (#98), then eBPF chmod hooks (#99): 1.5%.
+  0.54% over 2 minutes on 2026-10-21 (#103 to #105).
+- Noise over 72 hours (2026-10-21, beta.12): the brute-force digest paged
+  every 2 hours. It's weekly now, sent only when a tried account accepts a
+  password, with a fast alert for 20 failures in a minute (#103).
+- Hooks (2026-10-21): all nine string-argument syscalls on kprobes, none
+  on the tracepoint fallback.
+
+A local VM (2026-10-21). Ubuntu 26.04.1, kernel 7.0.0-38, 2 vCPU. No
+suites: the live eBPF tests only.
+
+- On the old hooks, 10 of 10 runs failed: execs with LD_PRELOAD, setuid
+  chmods and setcap went unseen. bpftrace showed the syscall tracepoints
+  themselves dropping them (0 of 50 chmods). With kprobes (#105), 10 of 10
+  runs passed.
+
 
 ## 3. Not proven yet
 
-- The suites on anything but Ubuntu 22.04. Ubuntu 24.04 has run live (see
-  2) but not the suites; Debian, the RHEL family with SELinux, the kernel
-  5.4 fallback path and arm64 on real hardware haven't run at all.
+- The suites on anything but Ubuntu 22.04. Ubuntu 24.04 has run live and
+  Ubuntu 26.04 the live eBPF tests (see 2), not the suites; Debian, the
+  RHEL family with SELinux, the kernel 5.4 fallback path and arm64 on real
+  hardware haven't run at all.
 - 72 hours with zero unexplained HIGH alerts on several hosts. The runs
   above were 5-minute workloads.
 - Automatic isolation during a real incident (unit tests only).
@@ -180,3 +206,9 @@ caused by the test harness, not a false positive; see 2.)
   after an upgrade. The installer removes it.
 - An upgrade's own restart paged "Hermian is stopping". Planned restarts
   are now INFO.
+- On kernel 7.0 the syscall tracepoints with a string argument lost events
+  before eBPF ran: LD_PRELOAD and setuid went unseen on Ubuntu 26.04. Those
+  syscalls are hooked with kprobes now, the tracepoint as fallback.
+- The brute-force digest paged every 2 hours on an internet-facing host,
+  even when no account it named could be opened with a password. Weekly
+  now, and only then.
