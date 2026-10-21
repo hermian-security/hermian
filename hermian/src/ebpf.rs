@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use aya::maps::perf::AsyncPerfEventArray;
-use aya::programs::TracePoint;
+use aya::programs::{KProbe, TracePoint};
 use aya::util::online_cpus;
 use aya::{include_bytes_aligned, Ebpf};
 use bytes::BytesMut;
@@ -102,6 +102,8 @@ pub struct EbpfRuntime {
     _bpf: Ebpf,
     /// Human-readable list of attached tracepoints, for `hermian status`.
     pub attached: Vec<&'static str>,
+    /// The ones of those hooked through a kprobe on the syscall instead.
+    pub kprobes: Vec<&'static str>,
 }
 
 struct Hook {
@@ -109,7 +111,22 @@ struct Hook {
     category: &'static str,
     tracepoint: &'static str,
     required: bool,
+    /// (program, syscall): a kprobe on the syscall wrapper, tried first.
+    /// From 6.19 (7.0 on Ubuntu 26.04) a syscall tracepoint with a user
+    /// string argument drops events before BPF runs: on 7.0, 0 of 50
+    /// chmods and some execs never reached the tracepoint program.
+    kprobe: Option<(&'static str, &'static str)>,
 }
+
+/// The running arch for the kprobes: id for the object, the wrappers'
+/// prefix, and where each syscall argument sits in `struct pt_regs`, in u64
+/// words. Must match KPROBE_ARCH in hermian-ebpf.
+#[cfg(target_arch = "x86_64")]
+const KPROBE_ARCH: Option<(u32, &str, [u32; 6])> = Some((1, "__x64_sys_", [14, 13, 12, 7, 9, 8]));
+#[cfg(target_arch = "aarch64")]
+const KPROBE_ARCH: Option<(u32, &str, [u32; 6])> = Some((2, "__arm64_sys_", [0, 1, 2, 3, 4, 5]));
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const KPROBE_ARCH: Option<(u32, &str, [u32; 6])> = None;
 
 const HOOKS: &[Hook] = &[
     // Exec is observed at sched_process_exec (image is live: correct comm and
@@ -118,30 +135,35 @@ const HOOKS: &[Hook] = &[
         program: "hermian_sched_exec",
         category: "sched",
         tracepoint: "sched_process_exec",
+        kprobe: None,
         required: true,
     },
     Hook {
         program: "hermian_execve",
         category: "syscalls",
         tracepoint: "sys_enter_execve",
+        kprobe: Some(("hermian_kp_execve", "execve")),
         required: false,
     },
     Hook {
         program: "hermian_execveat",
         category: "syscalls",
         tracepoint: "sys_enter_execveat",
+        kprobe: Some(("hermian_kp_execveat", "execveat")),
         required: false,
     },
     Hook {
         program: "hermian_connect",
         category: "syscalls",
         tracepoint: "sys_enter_connect",
+        kprobe: Some(("hermian_kp_connect", "connect")),
         required: true,
     },
     Hook {
         program: "hermian_ptrace",
         category: "syscalls",
         tracepoint: "sys_enter_ptrace",
+        kprobe: None,
         required: false,
     },
     // A file given setuid/setgid bits or capabilities, as it happens. The
@@ -152,42 +174,49 @@ const HOOKS: &[Hook] = &[
         program: "hermian_fchmodat",
         category: "syscalls",
         tracepoint: "sys_enter_fchmodat",
+        kprobe: Some(("hermian_kp_fchmodat", "fchmodat")),
         required: false,
     },
     Hook {
         program: "hermian_fchmodat2",
         category: "syscalls",
         tracepoint: "sys_enter_fchmodat2",
+        kprobe: Some(("hermian_kp_fchmodat2", "fchmodat2")),
         required: false,
     },
     Hook {
         program: "hermian_chmod",
         category: "syscalls",
         tracepoint: "sys_enter_chmod",
+        kprobe: Some(("hermian_kp_chmod", "chmod")),
         required: false,
     },
     Hook {
         program: "hermian_fchmod",
         category: "syscalls",
         tracepoint: "sys_enter_fchmod",
+        kprobe: None,
         required: false,
     },
     Hook {
         program: "hermian_setxattr",
         category: "syscalls",
         tracepoint: "sys_enter_setxattr",
+        kprobe: Some(("hermian_kp_setxattr", "setxattr")),
         required: false,
     },
     Hook {
         program: "hermian_lsetxattr",
         category: "syscalls",
         tracepoint: "sys_enter_lsetxattr",
+        kprobe: Some(("hermian_kp_lsetxattr", "lsetxattr")),
         required: false,
     },
     Hook {
         program: "hermian_fsetxattr",
         category: "syscalls",
         tracepoint: "sys_enter_fsetxattr",
+        kprobe: Some(("hermian_kp_fsetxattr", "fsetxattr")),
         required: false,
     },
 ];
@@ -210,6 +239,10 @@ pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
         loader.set_global("FILE_OFFS", offs, true);
         loader.set_global("FILE_OFFS_SET", &1u32, true);
     }
+    if let Some((arch, _, words)) = &KPROBE_ARCH {
+        loader.set_global("KPROBE_ARCH", arch, true);
+        loader.set_global("SYSCALL_ARG_WORDS", words, true);
+    }
     let mut bpf = loader
         .load(include_bytes_aligned!(env!("HERMIAN_EBPF_OBJECT")))
         .context("failed to load eBPF object (kernel too old, or missing CAP_BPF/CAP_SYS_ADMIN)")?;
@@ -218,7 +251,23 @@ pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
     }
 
     let mut attached = Vec::new();
+    let mut kprobes = Vec::new();
     for hook in HOOKS {
+        if let (Some((program, syscall)), Some((_, prefix, _))) = (hook.kprobe, &KPROBE_ARCH) {
+            match attach_kprobe(&mut bpf, program, &format!("{}{}", prefix, syscall)) {
+                Ok(()) => {
+                    attached.push(hook.tracepoint);
+                    kprobes.push(hook.tracepoint);
+                    continue;
+                }
+                // Falls back to the tracepoint below; chmod has no wrapper
+                // on arm64, fchmodat2 none before 6.6.
+                Err(e) => eprintln!(
+                    "hermian: kprobe {}{} unavailable ({}); using the tracepoint",
+                    prefix, syscall, e
+                ),
+            }
+        }
         match attach(&mut bpf, hook) {
             Ok(()) => attached.push(hook.tracepoint),
             Err(e) if hook.required => {
@@ -238,7 +287,18 @@ pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
     Ok(EbpfRuntime {
         _bpf: bpf,
         attached,
+        kprobes,
     })
+}
+
+fn attach_kprobe(bpf: &mut Ebpf, program: &str, function: &str) -> Result<()> {
+    let prog: &mut KProbe = bpf
+        .program_mut(program)
+        .ok_or_else(|| anyhow!("program {} not found in object", program))?
+        .try_into()?;
+    prog.load()?;
+    prog.attach(function, 0)?;
+    Ok(())
 }
 
 fn attach(bpf: &mut Ebpf, hook: &Hook) -> Result<()> {
@@ -409,6 +469,9 @@ mod tests {
             let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
             assert!(runtime.attached.contains(&"sched_process_exec"));
             assert!(runtime.attached.contains(&"sys_enter_execve"));
+            // Through the wrapper kprobe: the tracepoint loses events on 6.19+.
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            assert!(runtime.kprobes.contains(&"sys_enter_execve"));
 
             // Filler variables sort before LD_PRELOAD (Command keeps env
             // sorted), pushing it past the old 12-entry scan.
