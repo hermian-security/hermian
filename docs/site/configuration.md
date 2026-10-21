@@ -47,7 +47,9 @@ See [Learning and novelty](baseline).
 | `permit_root` | `false` | | `true` silences the root-login alerts, for hosts that rely on them |
 | `failed_burst_count` | `5` | 1 to 10000 | Failures from one source that make a burst (INFO until a login follows) |
 | `failed_burst_window_secs` | `60` | 1 to 86400 | Window for a burst, and for "login after a burst" |
-| `brute_digest_hours` | `2` | 1 to 24 | How often the brute-force digest is computed |
+| `brute_digest_days` | `7` | 1 to 30 | How often the brute-force digest is computed; it's sent only when an account tried accepts a password |
+| `brute_alert_count` | `20` | 2 to 10000 | Failures from one source that page at once, against an account that accepts a password… |
+| `brute_alert_window_secs` | `60` | 1 to 3600 | …within this many seconds |
 | `brute_min_attempts` | `10` | 1 to 10000 | Attempts a source needs in that period to be listed |
 | `known_key_new_network` | `"alert"` | `alert`, `log` | A key the account has used before, from a network it hasn't: `log` records it without sending. Passwords and new keys always page |
 
@@ -85,7 +87,7 @@ Turning one off pages CRITICAL, like any change to what Hermian watches.
 | `timeout_secs` | `10` | 1 to 300 |
 | `actions` | `false` | Response buttons; needs `allowed_user_ids` and a `hermian enable` afterwards |
 | `allowed_user_ids` | `[]` | Numeric user ids allowed to press buttons |
-| `action_ttl_mins` | `15` | 1 to 1440 |
+| `action_ttl_mins` | `1440` | 1 to 1440 |
 
 Details: [Telegram](notifications/telegram).
 

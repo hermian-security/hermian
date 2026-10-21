@@ -60,8 +60,10 @@ pub enum ConfigError {
     EmptyReason(&'static str),
     #[error("general.alert_retention_days must be at most 3650 (0 keeps alerts forever)")]
     RetentionDays,
-    #[error("ssh.brute_digest_hours must be between 1 and 24")]
-    DigestHours,
+    #[error("ssh.brute_digest_days must be between 1 and 30")]
+    DigestDays,
+    #[error("ssh.brute_alert_count must be between 2 and 10000, and brute_alert_window_secs between 1 and 3600")]
+    BruteAlert,
     #[error("ssh.brute_min_attempts must be between 1 and 10000")]
     DigestMinAttempts,
     #[error("notifications.telegram.actions needs the telegram channel and at least one entry in allowed_user_ids")]
@@ -134,9 +136,17 @@ pub struct SshCfg {
     /// out; dropped at v0.1.0.
     pub off_hours_start: u32,
     pub off_hours_end: u32,
-    /// Failed logins against *existing* accounts are summed up in a digest
-    /// every this many hours, sent only if there were any.
+    /// Retired: the digest is weekly now (`brute_digest_days`). Accepted so
+    /// old configs still load; `hermian enable` comments it out.
     pub brute_digest_hours: u32,
+    /// Failed logins against *existing* accounts are summed up in a digest
+    /// every this many days. It's sent only when one of those accounts
+    /// accepts a password; otherwise it's recorded.
+    pub brute_digest_days: u32,
+    /// One source failing this many times within `brute_alert_window_secs`,
+    /// against an account that exists and accepts a password, pages at once.
+    pub brute_alert_count: u32,
+    pub brute_alert_window_secs: u64,
     /// A source needs at least this many failures against existing accounts
     /// in a digest period to be listed.
     pub brute_min_attempts: u32,
@@ -154,7 +164,10 @@ impl Default for SshCfg {
             failed_burst_window_secs: 60,
             off_hours_start: 22,
             off_hours_end: 6,
-            brute_digest_hours: 2,
+            brute_digest_hours: 0,
+            brute_digest_days: 7,
+            brute_alert_count: 20,
+            brute_alert_window_secs: 60,
             brute_min_attempts: 10,
             known_key_new_network: "alert".to_string(),
         }
@@ -238,7 +251,7 @@ impl Default for TelegramCfg {
             timeout_secs: 10,
             actions: false,
             allowed_user_ids: Vec::new(),
-            action_ttl_mins: 15,
+            action_ttl_mins: 1440,
         }
     }
 }
@@ -418,8 +431,13 @@ impl Config {
         if self.general.alert_retention_days > MAX_RETENTION_DAYS {
             return Err(ConfigError::RetentionDays);
         }
-        if !(1..=24).contains(&self.ssh.brute_digest_hours) {
-            return Err(ConfigError::DigestHours);
+        if !(1..=30).contains(&self.ssh.brute_digest_days) {
+            return Err(ConfigError::DigestDays);
+        }
+        if !(2..=10_000).contains(&self.ssh.brute_alert_count)
+            || !(1..=3600).contains(&self.ssh.brute_alert_window_secs)
+        {
+            return Err(ConfigError::BruteAlert);
         }
         if !(1..=10_000).contains(&self.ssh.brute_min_attempts) {
             return Err(ConfigError::DigestMinAttempts);
@@ -559,8 +577,14 @@ duration_hours = 24
 permit_root = false     # true suppresses the "root login over SSH" alert
 failed_burst_count = 5          # failures in the window; INFO until a login follows
 failed_burst_window_secs = 60
-brute_digest_hours = 2  # failed logins against existing accounts, summed up this often
+## Failed logins against accounts that exist are summed up once a week, and
+## sent only when one of those accounts accepts a password.
+brute_digest_days = 7
 brute_min_attempts = 10 # failures a source needs in that period to be listed
+## One source failing this often, this fast, against an account that accepts
+## a password, pages at once with a button to block it.
+brute_alert_count = 20
+brute_alert_window_secs = 60
 ## A login with a key the account has used before, from a network it hasn't
 ## used: "alert" pages it like any root login from a new place, "log" records
 ## it without sending. Passwords and keys never seen before always page.
@@ -606,7 +630,7 @@ timeout_secs = 10
 ## each host with buttons its own bot.
 actions = false
 allowed_user_ids = []          # numbers, no quotes, e.g. [123456789]
-action_ttl_mins = 15           # buttons expire after this
+action_ttl_mins = 1440         # buttons expire after this (24 hours)
 
 [notifications.email]
 transport = "smtp"             # smtp | sendmail (use the host's MTA)
@@ -795,14 +819,27 @@ mod tests {
         ));
         let block = Config::parse("[response]\nblock_duration_hours = 0\n").unwrap();
         assert!(matches!(block.validate(), Err(ConfigError::BlockHours)));
-        let digest = Config::parse("[ssh]\nbrute_digest_hours = 48\n").unwrap();
-        assert!(matches!(digest.validate(), Err(ConfigError::DigestHours)));
-        // Defaults: off, 24 h blocks, 2 h digest, 10 attempts.
+        let digest = Config::parse("[ssh]\nbrute_digest_days = 60\n").unwrap();
+        assert!(matches!(digest.validate(), Err(ConfigError::DigestDays)));
+        let fast = Config::parse("[ssh]\nbrute_alert_count = 1\n").unwrap();
+        assert!(matches!(fast.validate(), Err(ConfigError::BruteAlert)));
+        // An old config's digest hours still load (retired, ignored).
+        assert!(Config::parse("[ssh]\nbrute_digest_hours = 2\n")
+            .unwrap()
+            .validate()
+            .is_ok());
+        // Defaults: off, 24 h blocks, weekly digest, 10 attempts, 20 in a
+        // minute pages, buttons last a day.
         let d = Config::default();
         assert!(!d.notifications.telegram.actions_enabled());
         assert_eq!(d.response.block_duration_hours, 24);
-        assert_eq!(d.ssh.brute_digest_hours, 2);
+        assert_eq!(d.ssh.brute_digest_days, 7);
         assert_eq!(d.ssh.brute_min_attempts, 10);
+        assert_eq!(
+            (d.ssh.brute_alert_count, d.ssh.brute_alert_window_secs),
+            (20, 60)
+        );
+        assert_eq!(d.notifications.telegram.action_ttl_mins, 1440);
     }
 
     #[test]

@@ -62,9 +62,13 @@ from unattended writes:
   is a **login right after a burst** from the same source.
 - Failed logins for usernames that don't exist (`admin`, `test`, `oracle`…)
   never count. Attempts against real accounts are summed up in one
-  **brute-force digest** every `ssh.brute_digest_hours` (2 by default), only
-  listing sources with at least `ssh.brute_min_attempts` (10) attempts. When
-  none of those accounts accepts a password, the digest is recorded, not sent.
+  **brute-force digest a week** (`ssh.brute_digest_days`), only listing
+  sources with at least `ssh.brute_min_attempts` (10) attempts, and only sent
+  when one of those accounts accepts a password.
+- What pages at once is **one source hammering an account that accepts a
+  password**: `ssh.brute_alert_count` (20) failures in
+  `ssh.brute_alert_window_secs` (60), once per source, with a button to block
+  it.
 
 ## Your own logins
 

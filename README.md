@@ -293,11 +293,11 @@ sudo hermian notify-test
 
 ### Response buttons (optional)
 
-Telegram alerts can carry buttons: **Block** on the brute-force digest, and
+Telegram alerts can carry buttons: **Block** on brute-force alerts, and
 **Ignore**, **Disconnect session**, or **Disconnect and block** on suspicious
 SSH logins. Block and Disconnect ask first: the buttons turn into **Confirm**
 and **Cancel**, and Confirm expires after two minutes. Every button works once,
-expires after 15 minutes (`action_ttl_mins`), and is only accepted from the
+expires after a day (`action_ttl_mins`), and is only accepted from the
 configured chat and from the users you list, so only list people you trust:
 
 ```toml

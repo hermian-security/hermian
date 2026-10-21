@@ -49,6 +49,23 @@ fn save_engine_state(engine: &Engine) {
     }
 }
 
+/// The brute-force digest's running week, saved on its own (it can hold
+/// thousands of sources) every ten minutes and on a clean stop, so a restart
+/// doesn't throw the week away.
+fn brute_digest_file() -> std::path::PathBuf {
+    paths::state_dir().join("brute.json")
+}
+
+fn load_brute_digest() -> Option<hermian_core::detect::brute::BruteDigest> {
+    serde_json::from_str(&fs::read_to_string(brute_digest_file()).ok()?).ok()
+}
+
+fn save_brute_digest(engine: &Engine) {
+    if let Ok(text) = serde_json::to_string(&engine.brute) {
+        let _ = config::write_secure(&brute_digest_file(), &text);
+    }
+}
+
 pub fn run() -> Result<()> {
     config::require_root()?;
     // Not dumpable: no core dumps with alert data in them, and other users'
@@ -100,6 +117,9 @@ pub fn run() -> Result<()> {
     if let Some(st) = load_engine_state() {
         engine.restore(Utc::now(), &st.ref_day, st.ref_seq, st.counters);
         engine.root_warning_snoozed_until = st.root_warning_snoozed_until;
+    }
+    if let Some(brute) = load_brute_digest() {
+        engine.brute = brute;
     }
     if let Some(auth) = sessions::sshd_auth() {
         engine.set_sshd_auth(auth.root_password, auth.password, auth.per_match);
@@ -594,6 +614,7 @@ async fn async_main(
                 // start and every ten minutes, each reported once.
                 if std::time::Instant::now() >= next_sshd_audit {
                     next_sshd_audit = std::time::Instant::now() + Duration::from_secs(600);
+                    save_brute_digest(&engine);
                     run_self_check(&mut engine, &notifier, &mut self_maps);
                     tokio::task::spawn_blocking(sshkeys::refresh);
                 }
@@ -648,6 +669,7 @@ async fn async_main(
     heartbeat::clean_stop(&paths::run_marker_file());
     let _ = config::save_baseline(&engine.baseline);
     save_engine_state(&engine);
+    save_brute_digest(&engine);
     // Give the notifier a moment to flush persisted alerts.
     tokio::time::sleep(Duration::from_millis(200)).await;
     // Let the audit thread notice and drop its socket, which removes our

@@ -26,7 +26,7 @@ still get in.
 [notifications.telegram]
 actions = true
 allowed_user_ids = [123456789]   # numeric Telegram user ids (ask @userinfobot)
-action_ttl_mins = 15
+action_ttl_mins = 1440           # a day
 
 [response]
 block_duration_hours = 24
@@ -39,7 +39,8 @@ which it doesn't have otherwise.
 | Alert | Buttons |
 |---|---|
 | Suspicious SSH login (after a burst, from a new source, root from a new place, hidden key) | Ignore · Disconnect session · Disconnect and block |
-| Brute-force digest | Block each top source · Block all · Ignore 2h · a 7-day reminder when root can log in with a password |
+| Brute force in progress (one source, fast) | Block it |
+| Weekly brute-force digest | Block all |
 
 ### What each one does
 
@@ -48,7 +49,7 @@ which it doesn't have otherwise.
 | **Block** | Adds the source to an nftables set of Hermian's own (`inet hermian_block`) for `block_duration_hours`. IPv6 sources are blocked as their /64. |
 | **Disconnect session** | Stops the sshd processes holding that one connection (source and port), nothing else. |
 | **Disconnect and block** | Blocks the source first, then ends the session, so it can't reconnect. |
-| **Ignore** | Nothing changes. On a digest, "Ignore 2h" stops reporting those sources for two hours; a successful login from them still alerts. |
+| **Ignore** | Nothing changes. |
 | **Undo: unblock** | Appears after a block, for as long as the block lasts (up to a day). Lifts it. |
 
 ### What you're told
@@ -60,9 +61,8 @@ used button then turns into a label with the outcome:
 ✓ Blocked 203.0.113.24 · @op 14:02 UTC
 ```
 
-Pressing the label shows the full result. Block, Disconnect and Unblock, and
-anything refused or failed, also get a short reply under the alert, one line
-per address and a footer:
+Pressing the label shows the full result, one line per address and a
+footer:
 
 ```text
 ✓ Blocked 203.0.113.24 until 14:02 UTC tomorrow
@@ -71,14 +71,16 @@ Their key or password still works from other addresses.
 web-01 · @op · 14:02 UTC
 ```
 
+Only a result where something was refused or failed is also posted as a reply
+under the alert: that's when someone has to read it. A Block that worked shows
+on its button, and that's all.
+
 | Sign | Meaning |
 |---|---|
 | ✓ | Done. |
 | · | Already the case, since when and by whom ("already blocked by @op at 14:02 UTC"). A second Block doesn't extend the first. |
 | ⊘ | Refused by a safety rule, named ("Not blocked: 10.0.0.5 is inside your management network 10.0.0.0/8 (response.management_cidrs)"). |
 | ✗ | Failed: the cause and what to run ("Couldn't block: nftables isn't installed. Run: sudo apt install nftables"). |
-
-Ignore and Snooze change nothing on the host, so they only update the label.
 
 Pressing a button again, or one another admin's choice retired, says who did
 what instead of acting twice. A button pressed after `action_ttl_mins` says so

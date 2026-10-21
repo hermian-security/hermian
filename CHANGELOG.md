@@ -83,6 +83,22 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- Brute force pages when it matters, not every two hours:
+  - The digest is weekly (`ssh.brute_digest_days`, 7) and gives the attempts
+    per account. It's sent only when an account tried accepts a password;
+    the running week is saved, so restarts don't reset it.
+    `ssh.brute_digest_hours` is retired; `hermian enable` comments it out.
+  - New: "SSH brute force in progress", HIGH, when one source fails 20 times
+    in a minute (`ssh.brute_alert_count`, `ssh.brute_alert_window_secs`)
+    against an account that exists and accepts a password. Once per source,
+    with a Block button.
+  - The digest has one button, Block all, instead of one per source plus
+    Block all, Ignore and Remind me.
+- Telegram buttons stay valid for a day (`action_ttl_mins = 1440`) instead
+  of 15 minutes, so an alert read the next morning can still be acted on.
+  Existing configs keep the value they have: set it to 1440 there too.
+- A button that worked no longer posts a reply under the alert: the button
+  shows the result. Only a refusal or a failure gets a message.
 - Fewer pages about your own activity, the same pages for an intruder's:
   - A key the account has used before, logging in from a new network, says
     so ("Root login with a known key from a new network"), and logins with

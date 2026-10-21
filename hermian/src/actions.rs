@@ -448,15 +448,12 @@ pub fn summary(a: &ResponseAction, lines: &[Line], by: &str, now: DateTime<Utc>)
     format!("{} · {} {}", head, short(by), now.format("%H:%M UTC"))
 }
 
-/// Whether the result is worth its own message under the alert. Choices
-/// that change nothing on the host (Ignore, Snooze) only update the label,
-/// unless something was refused or failed.
-pub fn needs_reply(a: &ResponseAction, lines: &[Line]) -> bool {
-    use ResponseAction as A;
-    matches!(
-        a,
-        A::Block { .. } | A::Unblock { .. } | A::Disconnect { .. }
-    ) || lines
+/// Whether the result is worth its own message under the alert. The used
+/// button already shows the outcome ("✓ Blocked 203.0.113.24 · @op 14:02"),
+/// and pressing it shows the full result: a message only when something was
+/// refused or failed, which is when someone has to read it.
+pub fn needs_reply(_a: &ResponseAction, lines: &[Line]) -> bool {
+    lines
         .iter()
         .any(|l| matches!(l.mark, Mark::Refused | Mark::Failed))
 }
@@ -860,7 +857,14 @@ mod tests {
         };
         let done = vec![Line::new(Mark::Done, "Ignored")];
         assert!(!needs_reply(&ignore, &done));
-        assert!(needs_reply(&block, &done));
+        assert!(!needs_reply(&block, &done), "the button shows it");
+        assert!(needs_reply(
+            &block,
+            &[Line::new(
+                Mark::Refused,
+                "Not blocked: in your management network"
+            )]
+        ));
         assert!(needs_reply(
             &ignore,
             &[Line::new(Mark::Failed, "Couldn't ignore")]

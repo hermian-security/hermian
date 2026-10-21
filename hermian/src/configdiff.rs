@@ -98,6 +98,7 @@ const HARMLESS_FIELDS: &[&str] = &[
     "general.hostname",
     "baseline.duration_hours",
     "ssh.brute_digest_hours",
+    "ssh.brute_digest_days",
     "notifications.dedup_window_secs",
     "notifications.content",
     "notifications.telegram.silent_below_critical",
@@ -143,9 +144,12 @@ fn loosens(path: &str, a: &Value, b: &Value) -> bool {
         "baseline.enabled" | "response.auto_isolate" => b == &Value::Bool(false),
         "ssh.known_key_new_network" => b.as_str() == Some("log"),
         // More failures needed before anything shows: quieter.
-        "ssh.failed_burst_count" | "ssh.brute_min_attempts" | "ssh.failed_burst_window_secs" => {
-            num(b) > num(a)
-        }
+        "ssh.failed_burst_count"
+        | "ssh.brute_min_attempts"
+        | "ssh.failed_burst_window_secs"
+        | "ssh.brute_alert_count" => num(b) > num(a),
+        // A shorter window needs the same failures faster: quieter.
+        "ssh.brute_alert_window_secs" => num(b) < num(a),
         // More people who can press buttons, more addresses that are never
         // blocked, more exceptions: wider. Removing entries tightens.
         "notifications.telegram.allowed_user_ids" | "response.management_cidrs" => added(a, b),
