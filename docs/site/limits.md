@@ -25,6 +25,11 @@ tell you on a channel you'll see.
 ## What it doesn't see
 
 - **Inside containers.** It watches the host, not pods.
+- **What a script does, as such.** A script is judged by its interpreter.
+  A Python or shell script started by systemd or cron that runs commands
+  it's sent (a chat-bot backdoor, say) isn't flagged for that alone: its
+  persistence when it's installed, execution from `/tmp` and what its
+  commands touch are.
 - **Injection without a new program.** Code run inside an existing process
   (an interpreter's `eval`, shellcode, writes to `/proc/<pid>/mem`) isn't a
   process chain. `LD_PRELOAD` and ptrace are covered.
@@ -59,8 +64,9 @@ tell you on a channel you'll see.
 ## Maturity
 
 Hermian is in beta. Ubuntu 22.04 hosts have passed the full attack and
-false-positive suites, and Ubuntu 24.04 has run live on a compromised host;
-other distributions, the RHEL family with SELinux, the
-older-kernel fallback and arm64 hardware haven't been verified in the field
-yet. What's proven, where and when, is in [Evidence](evidence), along with
+false-positive suites, Ubuntu 24.04 has run live on a compromised host and on
+a test host for several days, and the eBPF hooks pass their live tests on
+Ubuntu 26.04 (kernel 7.0) and on arm64 in CI. Other distributions, the RHEL
+family with SELinux, the older-kernel fallback and arm64 hardware haven't
+been verified in the field yet. What's proven, where and when, is in [Evidence](evidence), along with
 what has to happen before a stable release.

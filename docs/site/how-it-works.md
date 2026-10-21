@@ -33,13 +33,21 @@ and Telegram button presses are fetched by outbound polling.
 | Source | What it gives | Notes |
 |---|---|---|
 | eBPF `sched_process_exec` | Every program start: pid, parent, uid, executable, `argv[0]`, TTY, container flag, `LD_PRELOAD`/`LD_AUDIT` in the environment | Parent pids from kernel BTF offsets, with a `/proc` fallback. The first 64 environment entries are checked. |
-| eBPF syscall entry (`connect`, `ptrace`) | Outbound connection attempts and ptrace attaches | Attempts, not confirmed success. Not seen: 32-bit syscalls on x86_64, io_uring connects, unconnected UDP sends, TCP Fast Open. |
-| eBPF syscall entry (`chmod` family, `setxattr` family) | A file given setuid/setgid bits, or capabilities with `setcap` | As it happens; reported once the call has taken effect, so a failed chmod is silent. |
+| eBPF syscall hooks (`connect`, `ptrace`) | Outbound connection attempts and ptrace attaches | Attempts, not confirmed success. Not seen: 32-bit syscalls on x86_64, io_uring connects, unconnected UDP sends, TCP Fast Open. |
+| eBPF syscall hooks (`chmod` family, `setxattr` family) | A file given setuid/setgid bits, or capabilities with `setcap` | As it happens; reported once the call has taken effect, so a failed chmod is silent. |
 | inotify | Changes to persistence, SSH, account and loader files | 400 ms debounce, 2.5 s at most. The writer is found from open file descriptors when possible. |
 | sshd's journal (or `auth.log` / `secure`) | Logins, failures, the key used and where it's stored | sshd's own entries only, so a local program can't forge one. |
 | `/proc/net/tcp` | New listening ports | Every 5 seconds. |
 | setuid sweep | New setuid/setgid files the hooks can't see (created with the bits set, brought in from another filesystem) | Four levels deep under user-writable trees: every minute in /tmp, /var/tmp and /dev/shm, every 5 minutes in homes and service trees. Without the eBPF hooks, every 20 seconds and every minute. |
 | PAM module | Login results | Optional (`hermian enable --with-pam`); never sees passwords, always returns `PAM_IGNORE`. |
+
+Syscalls with a path or buffer argument (`execve`, `connect`, the `chmod`
+and `setxattr` families) are hooked with kprobes on the kernel's syscall
+entry points; `ptrace` and `fchmod` with syscall tracepoints. From kernel
+6.19 (7.0 on Ubuntu 26.04), a syscall tracepoint with a string argument can
+drop the event before eBPF sees it, so the tracepoint is only the fallback
+when a kprobe can't attach. The daemon logs which hooks use kprobes when it
+starts.
 
 eBPF needs kernel 5.8 or newer with BTF. Without it, execution falls back to
 polling `/proc` every second, and to the audit subsystem when available (an

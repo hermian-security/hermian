@@ -171,6 +171,6 @@ them.
 
 `LOW`
 
-A 32-bit program on x86_64 makes compat syscalls the eBPF tracepoints don't
+A 32-bit program on x86_64 makes compat syscalls the eBPF hooks don't
 see, so its connections and ptrace calls are invisible. Rare on a 64-bit
 server, and used to get around syscall monitoring.
