@@ -30,7 +30,7 @@ hostname = "0.4"
 sha2 = "0.10"
 hex = "0.4"
 inotify = "0.11"
-ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "sendmail-transport", "rustls-tls", "builder"] }
 
 # `cargo deb -p hermian` builds the Debian/Ubuntu package (`make deb`; the

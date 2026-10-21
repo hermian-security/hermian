@@ -64,6 +64,8 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Changed
 
+- HTTP client moved to ureq 3, with the TLS crates bumped for
+  RUSTSEC-2026-0381 and RUSTSEC-2026-0382.
 - Block and Disconnect buttons ask first: the keyboard turns into Confirm
   and Cancel, Confirm expires after two minutes, and Cancel puts the
   buttons back. Buttons now expire after 15 minutes by default (was 30).
