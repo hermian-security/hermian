@@ -83,6 +83,10 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ### Fixed
 
+- On kernel 6.19 and later (Ubuntu 26.04's 7.0), execs with LD_PRELOAD and
+  setuid/setcap changes went unseen: those syscall tracepoints drop events
+  before eBPF runs. They're hooked through kprobes on the syscall now, with
+  the tracepoint as fallback.
 - Fewer pages about your own activity, the same pages for an intruder's:
   - A key the account has used before, logging in from a new network, says
     so ("Root login with a known key from a new network"), and logins with

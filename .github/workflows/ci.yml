@@ -183,6 +183,35 @@ jobs:
   # arm64 used to be built only at release time, so arch-specific lints (c_char
   # is u8 there, i8 on x86_64) failed the release instead of the PR. Not a
   # required check; the release workflow still gates on the five above.
+  # The live eBPF tests on an older kernel (tracepoints still fine there)
+  # and on arm64 (its own syscall wrappers), with the vendored object; the
+  # job above runs them on the newest kernel.
+  ebpf-live:
+    name: eBPF live (${{ matrix.os }})
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+      - name: Load the eBPF object (verifier + live events)
+        run: |
+          BIN=$(HERMIAN_EBPF_FROM_SOURCE=0 cargo test --release --locked -p hermian --no-run --message-format=json             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
+          test -n "$BIN"
+          uname -r
+          sudo "$BIN" --ignored --test-threads=1 ebpf::tests::
+
   arm64:
     name: clippy (arm64)
     needs: changes
