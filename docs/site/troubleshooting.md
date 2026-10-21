@@ -48,7 +48,8 @@ too.
 
 `actions = true` needs `allowed_user_ids`, and then `sudo hermian enable` once
 to grant the firewall and kill capabilities. Buttons expire after
-`action_ttl_mins` (15) and work once; pending buttons don't survive a restart.
+`action_ttl_mins` (a day) and work once; they're saved, so a restart doesn't
+cancel them.
 
 ### Email doesn't send
 

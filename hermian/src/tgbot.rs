@@ -328,7 +328,12 @@ fn add_label(
 /// What an expired button says: how long they last, and the command that
 /// does the same thing from the host.
 fn expired_text(hints: &[String], ttl_mins: u32) -> String {
-    let head = format!("Expired (buttons last {} min).", ttl_mins);
+    let ttl = if ttl_mins >= 60 && ttl_mins.is_multiple_of(60) {
+        format!("{} h", ttl_mins / 60)
+    } else {
+        format!("{} min", ttl_mins)
+    };
+    let head = format!("Expired (buttons last {}).", ttl);
     if hints.is_empty() {
         format!("{} Nothing was done.", head)
     } else {
@@ -1255,7 +1260,7 @@ mod tests {
         let later = now + chrono::Duration::minutes(2);
         let (msg, out) = handle_callback(&press(&b[0].0, 42, -1001), &cfg(), later);
         assert!(out.request.is_none(), "{}", msg);
-        assert_eq!(msg, "Expired (buttons last 15 min). Nothing was done.");
+        assert_eq!(msg, "Expired (buttons last 24 h). Nothing was done.");
     }
 
     #[test]
@@ -1562,7 +1567,7 @@ mod tests {
         assert!(out.request.is_none());
         assert_eq!(
             msg,
-            "Expired (buttons last 15 min). From the host: sudo hermian block 198.51.100.7"
+            "Expired (buttons last 24 h). From the host: sudo hermian block 198.51.100.7"
         );
         let (mid, kb) = out.keyboard.expect("keyboard tidied");
         assert_eq!(mid, 70);

@@ -39,6 +39,7 @@ Each family can be switched off in `[detections]`
 | Fileless execution from memory (memfd) | D1 | `HIGH` |
 | SSH authentication burst | D2 | `INFO` |
 | SSH login after a failed-auth burst | D2 | `HIGH` |
+| SSH brute force in progress | D2 | `HIGH` |
 | SSH brute force against existing accounts | D2 | `HIGH` · `LOW` when no account tried accepts a password |
 | Root login over SSH from a new source | D2 | `HIGH` |
 | Root login over SSH | D2 | `INFO` |

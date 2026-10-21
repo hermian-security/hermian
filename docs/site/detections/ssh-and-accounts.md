@@ -122,18 +122,34 @@ this way is never learned as a known key.
 
 ## Brute force
 
+### SSH brute force in progress
+
+`HIGH`
+
+**Fires when** one source fails `ssh.brute_alert_count` (20) times within
+`ssh.brute_alert_window_secs` (60) against an account that exists **and**
+accepts a password (`sshd -T`). Once per source.
+
+**Why** That's an attack that could work, happening now. Against usernames
+that don't exist, or accounts that only take keys, the same speed can't
+succeed and stays out of it.
+
+**Buttons** Block it.
+
 ### SSH brute force against existing accounts
 
 `HIGH` · `LOW` when no account tried accepts a password
 
-**Fires when** every `ssh.brute_digest_hours` (2), if failed logins targeted
-accounts that can actually log in (a real shell in `/etc/passwd`), listing
-the sources with at least `ssh.brute_min_attempts` (10) attempts, busiest
-first.
+**Fires when** once a week (`ssh.brute_digest_days`, 7), if failed logins
+targeted accounts that can actually log in (a real shell in `/etc/passwd`).
+It gives the number of attempts per account, and lists the sources with at
+least `ssh.brute_min_attempts` (10) attempts, busiest first. The week
+survives restarts.
 
 **Why** Attempts against usernames that don't exist are background noise and
-never count. Attempts against your real accounts are worth a summary. The
-digest also says when root can log in with a password and is being tried.
+never count. Attempts against your real accounts are worth a weekly summary,
+not a page every few hours. The digest also says when root can log in with a
+password and is being tried.
 
 On a host where none of the accounts tried accepts a password (`sshd -T`:
 password and keyboard-interactive logins off, or root on `prohibit-password`
@@ -142,8 +158,7 @@ LOW, not sent. If sshd has `Match` blocks, which can turn passwords back on
 for some users or addresses, or Hermian couldn't ask sshd, it pages as
 before.
 
-**Buttons** Block each top source, Block all, Ignore 2h, and a 7-day reminder
-for the root-password warning.
+**Buttons** One: Block all (the 50 busiest sources).
 
 ## sshd configuration
 

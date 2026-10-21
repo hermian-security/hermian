@@ -81,6 +81,9 @@ pub struct Engine {
     pub login_users: std::collections::HashSet<String>,
     /// Failed logins against existing accounts, for the periodic digest.
     pub brute: detect::brute::BruteDigest,
+    /// Failures per source against accounts that accept a password, for the
+    /// fast "brute force in progress" alert.
+    pub brute_live: BurstTracker,
     /// Sources an operator chose to ignore, until when.
     pub ignored_sources: HashMap<IpAddr, DateTime<Utc>>,
     /// Whether sshd lets root log in with a password (set by the daemon from
@@ -126,6 +129,7 @@ impl Engine {
             counters,
             login_users: std::collections::HashSet::new(),
             brute: detect::brute::BruteDigest::default(),
+            brute_live: BurstTracker::default(),
             ignored_sources: HashMap::new(),
             root_password_login: false,
             password_guessable: None,
@@ -334,7 +338,7 @@ impl Engine {
                         now,
                     };
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
-                    self.record_brute_force(&e, now);
+                    findings.extend(self.record_brute_force(&e, now));
                 }
                 // A login through a hidden key file is a backdoor, not a
                 // habit: learning its key or source would make the same key
@@ -372,17 +376,33 @@ impl Engine {
 
     /// Count a failed SSH login for the digest, if it named an account that
     /// exists and can log in (or root), from a source nobody chose to ignore.
-    fn record_brute_force(&mut self, e: &crate::events::AuthEvent, now: DateTime<Utc>) {
+    /// One source failing fast against an account a password can open raises
+    /// the "brute force in progress" alert, once, at the threshold.
+    fn record_brute_force(
+        &mut self,
+        e: &crate::events::AuthEvent,
+        now: DateTime<Utc>,
+    ) -> Option<Finding> {
         if e.result == AuthResult::Success || (e.service != "sshd" && e.service != "ssh") {
-            return;
+            return None;
         }
-        let Some(ip) = e.rhost else { return };
+        let ip = e.rhost?;
         if self.allowlist.source_allowed(ip) || self.source_ignored(&ip, now) {
-            return;
+            return None;
         }
-        if e.user == "root" || self.login_users.contains(&e.user) {
-            self.brute.record(ip, &e.user, now);
+        if e.user != "root" && !self.login_users.contains(&e.user) {
+            return None;
         }
+        self.brute.record(ip, &e.user, now);
+        if !detect::brute::password_could_work(&e.user, self.password_guessable) {
+            return None;
+        }
+        let window = self.cfg.ssh.brute_alert_window_secs.clamp(1, 3600);
+        let n = self
+            .brute_live
+            .record_failure(ip, now, window as i64, &e.user);
+        (n == self.cfg.ssh.brute_alert_count as usize)
+            .then(|| detect::brute::live_finding(ip, self.brute_live.recent_users(ip), n, window))
     }
 
     /// The brute-force digest, when its period is over and it found something.
@@ -390,19 +410,17 @@ impl Engine {
         if !self.cfg.detections.d2_auth {
             return None;
         }
-        let hours = self.cfg.ssh.brute_digest_hours.clamp(1, 24);
-        let (started, sources) = self
+        let days = self.cfg.ssh.brute_digest_days.clamp(1, 30);
+        let mut period = self
             .brute
-            .take_if_due(now, Duration::hours(i64::from(hours)))?;
-        let sources = sources
-            .into_iter()
-            .filter(|(ip, _)| !self.source_ignored(ip, now))
-            .collect();
+            .take_if_due(now, Duration::days(i64::from(days)))?;
+        period
+            .sources
+            .retain(|(ip, _)| !self.source_ignored(ip, now));
         detect::brute::digest_finding(
-            started,
-            sources,
+            period,
             self.cfg.ssh.brute_min_attempts,
-            hours,
+            days,
             self.root_warning_due(now),
             self.password_guessable,
         )
@@ -433,6 +451,8 @@ impl Engine {
         self.baseline.check_completion(now);
         self.tree.prune(now - Duration::hours(TREE_RETENTION_HOURS));
         self.bursts
+            .prune(now - Duration::seconds(BURST_RETENTION_SECS));
+        self.brute_live
             .prune(now - Duration::seconds(BURST_RETENTION_SECS));
         self.prune_flags(now);
         let listener_cutoff = now - Duration::hours(TREE_RETENTION_HOURS);

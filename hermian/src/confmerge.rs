@@ -160,6 +160,8 @@ pub const RETIRED: &[(&str, &str)] = &[
     ("general", "log_level"),
     ("ssh", "off_hours_start"),
     ("ssh", "off_hours_end"),
+    // Weekly now: ssh.brute_digest_days.
+    ("ssh", "brute_digest_hours"),
 ];
 
 /// The user's file with every retired setting commented out, or `None` if
@@ -312,7 +314,7 @@ mod tests {
         let allow = out.find("[allowlist]").unwrap();
         assert!(resp < block && block < allow, "{}", out);
         let ssh = out.find("[ssh]").unwrap();
-        let digest = out.find("#brute_digest_hours = 2").unwrap();
+        let digest = out.find("#brute_digest_days = 7").unwrap();
         assert!(ssh < digest && digest < out.find("[notifications]").unwrap());
         // Optional settings that are only commented in the template too.
         assert!(out.contains("#message_thread_id = 12345"));

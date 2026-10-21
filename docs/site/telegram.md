@@ -44,7 +44,7 @@ with [response buttons](response#telegram-buttons).
 | `timeout_secs` | `10` | HTTP timeout (1 to 300) |
 | `actions` | `false` | Response buttons under alerts that offer them |
 | `allowed_user_ids` | `[]` | Who may press them: numeric Telegram user ids (ask @userinfobot) |
-| `action_ttl_mins` | `15` | How long a button stays valid (1 to 1440) |
+| `action_ttl_mins` | `1440` | How long a button stays valid, in minutes (1 to 1440). A day, so an alert seen the next morning can still be acted on |
 
 ## The message
 
