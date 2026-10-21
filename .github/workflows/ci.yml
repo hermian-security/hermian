@@ -172,6 +172,7 @@ jobs:
           BIN=$(HERMIAN_EBPF_FROM_SOURCE=1 cargo test --release --locked -p hermian --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -1)
           test -n "$BIN"
+          uname -r
           sudo "$BIN" --ignored --test-threads=1 ebpf::tests::
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
