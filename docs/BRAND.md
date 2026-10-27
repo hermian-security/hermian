@@ -34,7 +34,7 @@ signal, the one thing that speaks up, like the alerts.
 
 | File | Use |
 | --- | --- |
-| [`brand/lockup-light.svg`](brand/lockup-light.svg), [`-dark`](brand/lockup-dark.svg) | the product: README, site header, docs |
+| [`brand/lockup-light.svg`](brand/lockup-light.svg), [`-dark`](brand/lockup-dark.svg) | the product: site header, docs |
 | [`brand/company-lockup-light.svg`](brand/company-lockup-light.svg), [`-dark`](brand/company-lockup-dark.svg) | the company: footers, legal pages, decks |
 
 `light` is for light backgrounds, `dark` for dark ones. Every file is outlined,
