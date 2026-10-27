@@ -3,6 +3,8 @@
 <p>
   <a href="https://hermian.me#gh-light-mode-only"><img src="docs/brand/lockup-light.svg#gh-light-mode-only" alt="Hermian" height="56"></a>
   <a href="https://hermian.me#gh-dark-mode-only"><img src="docs/brand/lockup-dark.svg#gh-dark-mode-only" alt="Hermian" height="56"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://www.nvidia.com/en-us/startups/"><img src="docs/brand/nvidia-inception.svg" alt="Member of the NVIDIA Inception Program" height="56"></a>
 </p>
 
 **Silent by default. Loud when it matters.**
