@@ -60,13 +60,7 @@ in the [install guide](https://hermian.me/docs/install/).
 
 - **Ubuntu only so far.** RHEL with SELinux, the older-kernel fallback, and
   arm64 are untested.
-- **It only sees what it hooks.** Anything outside its kernel and log sources
-  is invisible.
-- **Delivery is at-least-once.** A crash mid-send can send an alert twice.
 - **The dead-man switch is local.** It isn't an out-of-band monitor.
-- **Isolation isn't a full cutoff.** Alert endpoints stay reachable.
-- **Root still owns the box.** Hermian catches changes; it can't stop someone
-  who already has root.
 
 The full threat model is in [Limits](https://hermian.me/docs/limits/).
 
