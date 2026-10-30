@@ -32,7 +32,7 @@ the host when you turn that on.
 Linux with systemd and kernel 5.4+ (eBPF needs 5.8+), amd64 or arm64.
 
 ```bash
-curl -fsSL https://github.com/hermian-security/hermian/releases/download/v0.1.0-beta.12/install.sh | sudo sh
+curl -fsSL https://github.com/hermian-security/hermian/releases/download/v0.1.0/install.sh | sudo sh
 ```
 
 It installs the `.deb` on Debian/Ubuntu (and adds the signed APT repository
@@ -42,7 +42,7 @@ It installs the `.deb` on Debian/Ubuntu (and adds the signed APT repository
 By hand on Debian/Ubuntu:
 
 ```bash
-VER=v0.1.0-beta.12
+VER=v0.1.0
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 cd /tmp
 curl -fsSLO "$BASE/SHA256SUMS"

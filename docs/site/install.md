@@ -56,12 +56,13 @@ it, then run it with `sudo sh install.sh`.
 ```bash
 curl -fsSL https://apt.hermian.me/hermian-archive-keyring.gpg \
   | sudo tee /usr/share/keyrings/hermian-archive-keyring.gpg >/dev/null
-printf 'Types: deb\nURIs: https://apt.hermian.me\nSuites: beta\nComponents: main\nSigned-By: /usr/share/keyrings/hermian-archive-keyring.gpg\n' \
+printf 'Types: deb\nURIs: https://apt.hermian.me\nSuites: stable\nComponents: main\nSigned-By: /usr/share/keyrings/hermian-archive-keyring.gpg\n' \
   | sudo tee /etc/apt/sources.list.d/hermian.sources
 sudo apt update && sudo apt install hermian
 ```
 
-The `beta` suite gets every prerelease; `stable` starts with v0.1.0. apt
+`stable` gets releases. `beta` gets releases and every prerelease, if you
+want to try changes early. apt
 checks every download against that key. To compare it with the key a release
 ships, download `hermian-archive-keyring.gpg` from the release and diff the
 two.
@@ -75,7 +76,7 @@ script against `latest`. The same steps install and upgrade.
 **Debian and Ubuntu:**
 
 ```bash
-VER=v0.1.0-beta.12
+VER=v0.1.0
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 cd /tmp
 curl -fsSLO "$BASE/SHA256SUMS"
@@ -91,7 +92,7 @@ can read it.
 **Other systemd distros:**
 
 ```bash
-VER=v0.1.0-beta.12
+VER=v0.1.0
 BASE=https://github.com/hermian-security/hermian/releases/download/$VER
 ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 cd /tmp
