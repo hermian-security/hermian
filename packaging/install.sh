@@ -22,7 +22,7 @@
 set -eu
 
 REPO=hermian-security/hermian
-DEFAULT_VERSION=v0.1.0-beta.12   # release packaging rewrites this to the tag
+DEFAULT_VERSION=v0.1.0   # release packaging rewrites this to the tag
 
 # Styling comes from init_style (called by main); unset, everything is plain.
 say() { echo "  ${S_ACC:-}${G_STEP:-==>}${S_RST:-} $*"; }

@@ -6,12 +6,20 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+## 0.1.0 - 2026-10-30
+
+The first release. Hermian checks a host for an earlier compromise before it
+learns what's normal, protects itself from preload rootkits, pages once per
+incident instead of once per event, and every Telegram button press gets a
+clear answer. On Debian and Ubuntu it's in the new `stable` suite of
+apt.hermian.me; `beta` gets it too.
+
 ### Added
 
 - Every Telegram button press gets a clear answer. The used button turns
   into a label with the outcome ("✓ Blocked 203.0.113.24 · @op 14:02 UTC").
-  Block, Disconnect and Unblock, and anything refused or failed, also get a
-  short reply under the alert: one line per address, ✓ done, · already
+  A press that's refused or fails also gets a short reply under the alert:
+  one line per address, ✓ done, · already
   (since when and by whom), ⊘ refused (the rule, named) or ✗ failed (the
   cause and what to run), then host, who and when. No raw errors. A second
   Block on an address says it's already blocked and leaves the expiry alone,
@@ -69,8 +77,11 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 - tokio bumped to 1.53.3 for RUSTSEC-2026-0386 (AsyncFd I/O safety).
 - Block and Disconnect buttons ask first: the keyboard turns into Confirm
   and Cancel, Confirm expires after two minutes, and Cancel puts the
-  buttons back. Buttons now expire after 15 minutes by default (was 30).
-
+  buttons back.
+- Telegram buttons stay valid for a day by default (`action_ttl_mins =
+  1440`, was 30 minutes), so an alert read the next morning can still be
+  acted on. Existing configs keep the value they have: set it to 1440 there
+  too.
 - The installer has the CLI's look: the same header, brand colours on a
   terminal (`NO_COLOR` and `HERMIAN_COLOR` respected), one line per step,
   and next steps at the end. It now says whether the service is actually
@@ -101,11 +112,6 @@ Earlier release information remains in the repository's GitHub Releases and Git 
     with a Block button.
   - The digest has one button, Block all, instead of one per source plus
     Block all, Ignore and Remind me.
-- Telegram buttons stay valid for a day (`action_ttl_mins = 1440`) instead
-  of 15 minutes, so an alert read the next morning can still be acted on.
-  Existing configs keep the value they have: set it to 1440 there too.
-- A button that worked no longer posts a reply under the alert: the button
-  shows the result. Only a refusal or a failure gets a message.
 - Fewer pages about your own activity, the same pages for an intruder's:
   - A key the account has used before, logging in from a new network, says
     so ("Root login with a known key from a new network"), and logins with
