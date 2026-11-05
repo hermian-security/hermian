@@ -6,6 +6,8 @@
 [![Release](https://github.com/hermian-security/hermian/actions/workflows/release.yml/badge.svg)](https://github.com/hermian-security/hermian/releases)
 [![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+![How Hermian works: it watches the server through eBPF, works out who started what, judges it against five rule families, and sends one alert per incident.](docs/how-it-works.png)
+
 Hermian is a small security daemon for Linux servers. It stays quiet until
 something looks like a real compromise, then tells you in your logs, Telegram,
 email, or a webhook. There's no dashboard, no account, and no server to run.
