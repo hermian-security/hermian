@@ -172,6 +172,18 @@ create.
 
 `INFO`
 
+### snapd mount unit for a store-signed snap
+
+`INFO`
+
+**Fires when** snapd writes a `snap-*.mount` unit or its enable link during a
+refresh. Logged instead of paged only if the unit is exactly snapd's template
+(read-only `nodev` mount of `/var/lib/snapd/snaps/NAME_REV.snap` at
+`/snap/NAME/REV`) and the `.snap` file's SHA3-384 matches a store
+snap-revision assertion. Lookalike units and `--dangerous` snaps still page as
+"systemd unit installed with no session present" or "enabled outside of
+systemctl".
+
 ## Other surfaces
 
 | File | Why it matters |
