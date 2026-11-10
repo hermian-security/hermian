@@ -1,19 +1,6 @@
-//! What changed between two configs, for the runtime reload alert.
-//!
-//! Every field is compared, not a hand-picked list: a reload that only
-//! repoints the webhook or Telegram chat is exactly what an attacker would do
-//! to take over the alert path, so it mustn't read as "no functional change".
-//!
-//! Each change is also judged: does it loosen protection (fewer or other
-//! destinations, a rule off, a wider exception)? Those page CRITICAL. Changes
-//! that only tune or tighten (a timeout, a new channel, an exception removed)
-//! are recorded without paging, so editing your own config doesn't page you.
-//! Anything not known to be harmless counts as loosening.
-
 use hermian_core::Config;
 use serde_json::Value;
 
-/// Fields whose values are never shown, only that they changed.
 const SECRET_FIELDS: &[&str] = &[
     "token",
     "bot_token",
@@ -22,7 +9,6 @@ const SECRET_FIELDS: &[&str] = &[
     "url",
 ];
 
-/// Fields that decide *where* alerts go.
 const DESTINATION_FIELDS: &[&str] = &[
     "notifications.channels",
     "notifications.min_severity",
@@ -31,7 +17,6 @@ const DESTINATION_FIELDS: &[&str] = &[
     "notifications.telegram.bot_token",
     "notifications.telegram.chat_id",
     "notifications.telegram.message_thread_id",
-    // Who can act on alerts from Telegram is as sensitive as where they go.
     "notifications.telegram.actions",
     "notifications.telegram.allowed_user_ids",
     "notifications.email.transport",
@@ -43,13 +28,9 @@ const DESTINATION_FIELDS: &[&str] = &[
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ConfigDiff {
-    /// Dotted paths that changed, e.g. `notifications.telegram.chat_id`.
     pub changed: Vec<String>,
-    /// One line for the alert, with secrets redacted.
     pub summary: String,
-    /// Alerts may now go somewhere else (or nowhere).
     pub destinations_changed: bool,
-    /// Something now protects less (see the module doc).
     pub weakens: bool,
 }
 
@@ -61,7 +42,6 @@ impl ConfigDiff {
 
 pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
     let (Ok(a), Ok(b)) = (serde_json::to_value(old), serde_json::to_value(new)) else {
-        // Can't compare: assume the worst.
         return ConfigDiff {
             changed: vec!["(unknown)".into()],
             summary: "configuration changed (could not compare)".into(),
@@ -92,7 +72,6 @@ pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
     }
 }
 
-/// Fields that only tune how Hermian behaves, never what it protects.
 const HARMLESS_FIELDS: &[&str] = &[
     "general.alert_retention_days",
     "general.hostname",
@@ -123,40 +102,31 @@ fn severity_rank(v: &Value) -> u8 {
     }
 }
 
-/// Entries in `b` that weren't in `a`.
 fn added(a: &Value, b: &Value) -> bool {
     let old = a.as_array().cloned().unwrap_or_default();
     b.as_array()
         .is_some_and(|new| new.iter().any(|x| !old.contains(x)))
 }
 
-/// Whether changing `path` from `a` to `b` loosens protection.
 fn loosens(path: &str, a: &Value, b: &Value) -> bool {
     if HARMLESS_FIELDS.contains(&path) {
         return false;
     }
     let num = |v: &Value| v.as_f64().unwrap_or(0.0);
     match path {
-        // Fewer channels: alerts reach fewer places. A new one is fine.
         "notifications.channels" => added(b, a),
         "notifications.min_severity" => severity_rank(b) > severity_rank(a),
         "ssh.permit_root" | "notifications.telegram.actions" => b == &Value::Bool(true),
         "baseline.enabled" | "response.auto_isolate" => b == &Value::Bool(false),
         "ssh.known_key_new_network" => b.as_str() == Some("log"),
-        // More failures needed before anything shows: quieter.
         "ssh.failed_burst_count"
         | "ssh.brute_min_attempts"
         | "ssh.failed_burst_window_secs"
         | "ssh.brute_alert_count" => num(b) > num(a),
-        // A shorter window needs the same failures faster: quieter.
         "ssh.brute_alert_window_secs" => num(b) < num(a),
-        // More people who can press buttons, more addresses that are never
-        // blocked, more exceptions: wider. Removing entries tightens.
         "notifications.telegram.allowed_user_ids" | "response.management_cidrs" => added(a, b),
         p if p.starts_with("allowlist.") => added(a, b),
         p if p.starts_with("detections.") => b == &Value::Bool(false),
-        // Repointing where alerts go (a token, a chat, a URL, recipients...)
-        // and anything unknown: assume the worst.
         _ => true,
     }
 }
@@ -188,7 +158,6 @@ fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<(String, String, bool)>)
     let line = if SECRET_FIELDS.contains(&field) {
         format!("{} changed", path)
     } else if path.starts_with("allowlist.") {
-        // Entries can be long; the count and section are what matter here.
         format!("{}: {} -> {} entries", path, len(a), len(b))
     } else {
         format!("{}: {} -> {}", path, short(a), short(b))
@@ -277,7 +246,6 @@ mod tests {
 
     #[test]
     fn swapping_allowlist_entries_is_seen() {
-        // Same count, different entry: the old count-only check missed this.
         let mut old = cfg();
         old.allowlist
             .binaries
@@ -337,7 +305,6 @@ mod tests {
                 reason: "x".into(),
             }
         )));
-        // Removing an exception tightens.
         let mut with = cfg();
         with.allowlist
             .ssh_sources

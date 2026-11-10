@@ -1,6 +1,3 @@
-//! `hermian enable`: idempotent install/upgrade of the systemd unit, state
-//! directories, integrity hashes and baseline, then start the daemon.
-
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
@@ -21,8 +18,6 @@ const WATCHDOG_TIMER_TEMPLATE: &str =
 const SYSCTL_TEMPLATE: &str = include_str!("../../packaging/sysctl/60-hermian.conf");
 const SYSCTL_PATH: &str = "/etc/sysctl.d/60-hermian.conf";
 
-/// Raise inotify limits if they are below what reliable monitoring needs.
-/// Never lowers a value the operator has already set higher.
 fn ensure_inotify_limits() -> Result<()> {
     let read = |k: &str| -> u64 {
         fs::read_to_string(format!("/proc/sys/fs/inotify/{}", k))
@@ -53,9 +48,6 @@ fn ensure_inotify_limits() -> Result<()> {
     Ok(())
 }
 
-/// The unit for this binary. Isolation and the Telegram responses need
-/// nftables (`CAP_NET_ADMIN`); disconnecting a session needs `CAP_KILL`.
-/// Neither is granted unless configured.
 fn render_unit(exec_path: &str, isolation_enabled: bool, actions_enabled: bool) -> String {
     let mut caps = "CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_AUDIT_CONTROL CAP_AUDIT_READ".to_string();
     if isolation_enabled || actions_enabled {
@@ -70,9 +62,6 @@ fn render_unit(exec_path: &str, isolation_enabled: bool, actions_enabled: bool) 
         .replace("%CAP_AMBIENT%", &format!("AmbientCapabilities={}", caps))
 }
 
-/// The watchdog runs as a plain root oneshot via a timer: it pages and
-/// restarts the daemon when the heartbeat goes stale, so it must not share
-/// the daemon's fate (crash, capabilities, memory limits).
 fn render_watchdog_units(exec_path: &str) -> (String, String) {
     (
         WATCHDOG_UNIT_TEMPLATE.replace("%EXEC%", exec_path),
@@ -97,8 +86,6 @@ pub fn run(args: &EnableArgs) -> Result<()> {
     }
     let _ = fs::set_permissions(paths::config_path(), fs::Permissions::from_mode(0o600));
 
-    // Show settings new in this version in the existing file, commented
-    // out. Before the hashes are recorded, so the integrity check matches.
     match document_new_settings() {
         Ok(Some(n)) if !args.quiet => println!(
             "{}",
@@ -151,8 +138,6 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         }
     }
 
-    // An existing hook is refreshed too, so upgrades (the package's postinst
-    // runs `enable` without --with-pam) pick up placement fixes.
     if args.with_pam
         || (pam_hook_configured() && std::path::Path::new(paths::PAM_MODULE_PATH).exists())
     {
@@ -164,9 +149,6 @@ pub fn run(args: &EnableArgs) -> Result<()> {
         .map(|s| status::pid_alive(s.pid))
         .unwrap_or(false);
     if running {
-        // Upgrade path: pick up the new binary/unit. The marker tells the
-        // stopping daemon this restart is ours, so it isn't paged as an
-        // unexplained stop.
         run_systemctl(&["enable", "hermian"])?;
         let _ = crate::config::write_secure(
             &paths::planned_restart_file(),
@@ -176,9 +158,6 @@ pub fn run(args: &EnableArgs) -> Result<()> {
     } else if run_systemctl(&["enable", "--now", "hermian"]).is_err() {
         run_systemctl(&["start", "hermian"])?;
     }
-    // The dead-man switch: a timer, not part of the daemon, so it still runs
-    // when the daemon can't. Failure to enable it shouldn't abort an
-    // otherwise finished install.
     if let Err(e) = run_systemctl(&["enable", "--now", "hermian-watchdog.timer"]) {
         eprintln!("hermian: could not enable the watchdog timer: {:#}", e);
     }
@@ -192,13 +171,9 @@ pub fn run(args: &EnableArgs) -> Result<()> {
     Ok(())
 }
 
-/// Add template settings the config lacks, commented out (see confmerge).
-/// Returns how many lines were added, if any.
 fn document_new_settings() -> Result<Option<usize>> {
     let path = paths::config_path();
     let current = fs::read_to_string(&path)?;
-    // Retired settings first (commented out, see confmerge::RETIRED), then
-    // the new ones; one backup of the original either way.
     let retired = crate::confmerge::retire(&current);
     let base = retired.as_deref().unwrap_or(&current);
     let merged = crate::confmerge::merge(
@@ -228,9 +203,6 @@ fn init_baseline(cfg: &hermian_core::Config, no_baseline: bool) -> Result<()> {
     if paths::baseline_file().exists() {
         return Ok(());
     }
-    // --no-baseline skips the learning period, it doesn't switch novelty off:
-    // it used to write a disabled baseline, and every novelty rule went quiet
-    // for good.
     let baseline = if no_baseline && cfg.baseline.enabled {
         Baseline::judging_from(Utc::now(), cfg.baseline.duration_hours)
     } else {
@@ -278,7 +250,6 @@ fn enable_pam_module() -> Result<()> {
     let Some(new_content) = pam_config_with_hook(&content) else {
         return Ok(());
     };
-    // Keep a backup; PAM edits deserve one.
     if !content.contains("pam_hermian.so") {
         let _ = fs::copy(sshd_pam, "/etc/pam.d/sshd.hermian-bak");
     }
@@ -286,7 +257,6 @@ fn enable_pam_module() -> Result<()> {
     Ok(())
 }
 
-/// Whether `/etc/pam.d/sshd` already loads the Hermian module.
 pub fn pam_hook_configured() -> bool {
     fs::read_to_string("/etc/pam.d/sshd")
         .map(|c| {
@@ -296,18 +266,6 @@ pub fn pam_hook_configured() -> bool {
         .unwrap_or(false)
 }
 
-/// `content` with Hermian's PAM lines, or `None` if nothing needs to change.
-///
-/// The module is referenced by absolute path. A bare `pam_hermian.so` is
-/// looked up in libpam's own directory, which is `/lib/<triplet>/security`
-/// on Debian/Ubuntu and `/usr/lib64/security` on RHEL, not the
-/// `/usr/lib/security` we install to, so the hook silently never loaded.
-/// Older lines (bare name, or `auth` at the end) are rewritten.
-///
-/// The `auth` line goes *before* the first auth rule. Appended at the end it
-/// never ran on a failed login: Debian's common-auth ends failures with
-/// `pam_deny requisite`, which stops the stack. The `session` line can stay
-/// last, since session stacks don't stop early on success.
 fn pam_config_with_hook(content: &str) -> Option<String> {
     let comment = "# HERMIAN: passive auth telemetry (never affects the auth decision)";
     let auth = format!("auth    optional    {}", paths::PAM_MODULE_PATH);
@@ -390,7 +348,6 @@ mod tests {
         let out = pam_config_with_hook(base).unwrap();
         let auth = format!("auth    optional    {}", paths::PAM_MODULE_PATH);
         let lines: Vec<&str> = out.lines().collect();
-        // The auth hook runs before common-auth, so failed logins reach it.
         let hook_at = lines.iter().position(|l| *l == auth).unwrap();
         let common_at = lines
             .iter()
@@ -399,9 +356,7 @@ mod tests {
         assert!(hook_at < common_at, "{}", out);
         assert_eq!(lines[0], "# PAM configuration for sshd");
         assert!(lines.last().unwrap().starts_with("session optional"));
-        // Idempotent.
         assert!(pam_config_with_hook(&out).is_none());
-        // Old bare-name lines are replaced, not duplicated.
         let old = format!(
             "{}# HERMIAN: passive auth telemetry\nauth    optional    pam_hermian.so\nsession optional    pam_hermian.so\n",
             base

@@ -1,5 +1,3 @@
-//! `hermian status` and the state snapshot the daemon publishes for it.
-
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -32,7 +30,6 @@ pub struct StatusState {
     pub watches_active: usize,
     pub watches_failed: usize,
     pub watch_error: String,
-    /// Age of the dead-man switch's heartbeat file, if it exists.
     #[serde(default)]
     pub heartbeat_age_secs: Option<u64>,
     pub channels: Vec<String>,
@@ -43,13 +40,9 @@ pub struct StatusState {
     pub pending_notifications: usize,
     pub last_notify_error: String,
     pub delivered_per_channel: BTreeMap<String, u64>,
-    /// Alerts a notifying channel gave up on, by channel.
     pub dropped_per_channel: BTreeMap<String, u64>,
-    /// Telemetry lost since start, by source (eBPF ring, inotify, audit).
     pub events_dropped: BTreeMap<String, u64>,
-    /// Telegram response buttons: "off", or "on (N users)".
     pub telegram_actions: String,
-    /// Last problem fetching button presses (empty when fine).
     pub telegram_poll_error: String,
     pub config_hash: String,
     pub binary_hash: String,
@@ -114,7 +107,6 @@ pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // SAFETY: kill with signal 0 only checks existence/permission.
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
@@ -126,9 +118,6 @@ const DETECTIONS: &[(&str, &str)] = &[
     ("d5", "Network correlation"),
 ];
 
-/// When the `hermian` you typed isn't the version the daemon runs: either
-/// an upgrade the daemon hasn't restarted into, or an older copy earlier in
-/// PATH (a build from source in /usr/local/bin) answering instead.
 pub fn version_mismatch(daemon: &str, cli: &str) -> Option<[String; 2]> {
     (daemon != cli).then(|| {
         [
@@ -359,9 +348,6 @@ fn short_hash(h: &str) -> String {
     }
 }
 
-/// Whether the state directory exists but this user can't read it. State is
-/// root-only on purpose; without sudo, "can't read" must not be reported as
-/// "never installed".
 pub fn state_unreadable() -> bool {
     matches!(
         fs::metadata(paths::state_file()),
@@ -369,8 +355,6 @@ pub fn state_unreadable() -> bool {
     )
 }
 
-/// `systemctl is-active hermian`, which needs no privileges. Also used by
-/// the watchdog to judge the unit state.
 pub(crate) fn unit_state() -> String {
     crate::procsrc::system_command("systemctl")
         .args(["is-active", "hermian"])
@@ -452,16 +436,14 @@ mod tests {
 
     #[test]
     fn unreadable_state_is_not_reported_as_missing() {
-        // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
-            return; // root can read anything
+            return;
         }
         let dir = std::env::temp_dir().join(format!("hermian-state-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("state.json"), "{}").unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-        // SAFETY: no other test reads HERMIAN_STATE_DIR.
         unsafe { std::env::set_var("HERMIAN_STATE_DIR", &dir) };
         let unreadable = state_unreadable();
         let state = read_state();
@@ -474,7 +456,6 @@ mod tests {
 
     #[test]
     fn missing_state_is_not_permission_denied() {
-        // The default path doesn't exist on a dev machine, or is root-only.
         let p = paths::state_file();
         if !p.parent().map(|d| d.exists()).unwrap_or(false) {
             assert!(!state_unreadable());

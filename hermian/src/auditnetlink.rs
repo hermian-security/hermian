@@ -1,12 +1,3 @@
-//! Linux audit (NETLINK_AUDIT) exec source, used when eBPF is unavailable.
-//!
-//! Registers this process as the audit daemon, installs an `execve`/`execveat`
-//! exit rule, and parses the resulting text records. Refuses to run when a
-//! real auditd is present because the kernel supports exactly one listener.
-//!
-//! Record format (kernel, `AUDIT_SYSCALL` = 1300):
-//! `audit(1700000000.123:456): arch=c000003e syscall=59 success=yes exit=0 ... ppid=1 pid=1234 ... uid=0 ... comm="sh" exe="/usr/bin/dash" ...`
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -110,7 +101,6 @@ impl AuditRuleData {
     }
 }
 
-/// (audit arch constant, execve nr, execveat nr) for the build target.
 fn arch_syscalls() -> (u32, u32, u32) {
     match std::env::consts::ARCH {
         "x86_64" => (0xC000_003E, 59, 322),
@@ -126,7 +116,6 @@ pub fn auditd_running() -> bool {
         .any(|p| std::path::Path::new(p).exists())
 }
 
-/// The kernel accepts a single audit listener; never fight a real auditd.
 pub fn audit_usable() -> bool {
     !auditd_running()
 }
@@ -138,18 +127,13 @@ pub struct AuditSource {
 
 impl Drop for AuditSource {
     fn drop(&mut self) {
-        // Best-effort cleanup so the rule does not outlive us.
         let _ = send_msg(self.fd, AUDIT_DEL_RULE, self.rule);
-        // SAFETY: fd was returned by socket().
         unsafe {
             libc::close(self.fd);
         }
     }
 }
 
-/// Starts the reader thread. The handle lets shutdown wait for it, so the
-/// socket's Drop removes the exec rule instead of leaving it in the kernel
-/// after the process is gone.
 pub fn spawn_audit_reader(
     tx: mpsc::Sender<Event>,
     shutdown: Arc<AtomicBool>,
@@ -162,7 +146,6 @@ pub fn spawn_audit_reader(
 }
 
 fn open_audit_socket() -> Result<AuditSource> {
-    // SAFETY: standard socket/bind sequence with correctly sized structs.
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -173,10 +156,8 @@ fn open_audit_socket() -> Result<AuditSource> {
     if fd < 0 {
         return Err(anyhow!("failed to open NETLINK_AUDIT socket"));
     }
-    // SAFETY: sockaddr_nl is plain data.
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    // SAFETY: valid fd and sockaddr.
     let rc = unsafe {
         libc::bind(
             fd,
@@ -185,7 +166,6 @@ fn open_audit_socket() -> Result<AuditSource> {
         )
     };
     if rc != 0 {
-        // SAFETY: fd is ours.
         unsafe {
             libc::close(fd);
         }
@@ -196,7 +176,6 @@ fn open_audit_socket() -> Result<AuditSource> {
         mask: AUDIT_STATUS_ENABLED | AUDIT_STATUS_PID,
         enabled: 1,
         failure: 1,
-        // SAFETY: getpid has no preconditions.
         pid: unsafe { libc::getpid() } as u32,
         rate_limit: 0,
         backlog_limit: 8192,
@@ -217,10 +196,8 @@ fn open_audit_socket() -> Result<AuditSource> {
     rule.add_syscall(execveat);
     rule.add_field(AUDIT_ARCH, arch, AUDIT_EQUAL);
     send_msg(fd, AUDIT_ADD_RULE, rule)?;
-    // EEXIST is fine (rule already present from a previous unclean exit).
     if let Err(e) = expect_ack(fd) {
         if !e.to_string().contains("EEXIST") {
-            // SAFETY: fd is ours.
             unsafe {
                 libc::close(fd);
             }
@@ -241,7 +218,6 @@ fn send_msg<T: Copy>(fd: libc::c_int, kind: u16, payload: T) -> Result<()> {
         seq: 1,
         pid: 0,
     };
-    // SAFETY: buf is exactly hdr + payload bytes; both types are repr(C) POD.
     unsafe {
         std::ptr::copy_nonoverlapping(
             &hdr as *const NlMsgHdr as *const u8,
@@ -260,19 +236,10 @@ fn send_msg<T: Copy>(fd: libc::c_int, kind: u16, payload: T) -> Result<()> {
     Ok(())
 }
 
-/// `recv`, but only messages the kernel sent (netlink port id 0).
-///
-/// Other local sockets can address ours, and a plain `recv` took whatever
-/// arrived: a forged exec record could put a fake web-shell chain (and a
-/// CRITICAL that may auto-isolate) into the engine. Anything not from the
-/// kernel is discarded and counted. Errors come back as `Err` (EAGAIN on
-/// timeout, as with `recv`).
 fn recv_from_kernel(fd: libc::c_int, buf: &mut [u8]) -> std::io::Result<usize> {
     for _ in 0..64 {
-        // SAFETY: sockaddr_nl is plain data.
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-        // SAFETY: valid fd, buffer and address storage of the stated size.
         let n = unsafe {
             libc::recvfrom(
                 fd,
@@ -294,7 +261,6 @@ fn recv_from_kernel(fd: libc::c_int, buf: &mut [u8]) -> std::io::Result<usize> {
     Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
 }
 
-/// Netlink messages from something other than the kernel, discarded.
 pub static SPOOFED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn set_rcv_timeout(fd: libc::c_int, secs: i64) {
@@ -306,7 +272,6 @@ fn set_rcv_timeout_ms(fd: libc::c_int, ms: i64) {
         tv_sec: (ms / 1000) as libc::time_t,
         tv_usec: ((ms % 1000) * 1000) as libc::suseconds_t,
     };
-    // SAFETY: valid fd and timeval.
     unsafe {
         libc::setsockopt(
             fd,
@@ -318,7 +283,6 @@ fn set_rcv_timeout_ms(fd: libc::c_int, ms: i64) {
     }
 }
 
-/// Wait for the NLMSG_ERROR ack that follows a request; error 0 means success.
 fn expect_ack(fd: libc::c_int) -> Result<()> {
     set_rcv_timeout(fd, 2);
     let mut buf = [0u8; 8192];
@@ -329,7 +293,6 @@ fn expect_ack(fd: libc::c_int) -> Result<()> {
         };
         let mut offset = 0;
         while offset + std::mem::size_of::<NlMsgHdr>() <= n {
-            // SAFETY: bounds checked above.
             let hdr =
                 unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr() as *const NlMsgHdr) };
             let msg_len = hdr.len as usize;
@@ -362,7 +325,6 @@ fn nlmsg_align(len: u32) -> usize {
     ((len as usize) + 3) & !3
 }
 
-/// Fields collected from the SYSCALL record while waiting for EOE.
 struct PendingExec {
     ppid: u32,
     uid: u32,
@@ -376,11 +338,8 @@ struct PendingExec {
 
 fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     let fd = source.fd;
-    // Short, so shutdown notices quickly and Drop removes the rule before
-    // the process exits.
     set_rcv_timeout_ms(fd, 200);
     let mut buf = [0u8; 65536];
-    // Keyed by audit serial number, which ties SYSCALL/EXECVE/EOE records together.
     let mut pending: HashMap<u64, (u32, PendingExec)> = HashMap::new();
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -396,9 +355,7 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
                 .err()
                 .unwrap_or_else(|| std::io::Error::from_raw_os_error(libc::EAGAIN));
             match err.raw_os_error() {
-                // Timeout or signal: the normal idle path.
                 Some(libc::EAGAIN) | Some(libc::EINTR) => {}
-                // The kernel dropped audit records for us.
                 Some(libc::ENOBUFS) => {
                     crate::health::AUDIT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
                     crate::daemon::log_daemon(
@@ -406,7 +363,6 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
                         "audit receive buffer overflowed; exec events were lost",
                     );
                 }
-                // Anything else would repeat immediately: don't spin.
                 _ if n < 0 => std::thread::sleep(Duration::from_millis(200)),
                 _ => {}
             }
@@ -416,7 +372,6 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
         let n = n as usize;
         let mut offset = 0;
         while offset + std::mem::size_of::<NlMsgHdr>() <= n {
-            // SAFETY: bounds checked.
             let hdr =
                 unsafe { std::ptr::read_unaligned(buf[offset..].as_ptr() as *const NlMsgHdr) };
             let msg_len = hdr.len as usize;
@@ -433,7 +388,6 @@ fn audit_loop(source: AuditSource, tx: mpsc::Sender<Event>, shutdown: Arc<Atomic
     drop(source);
 }
 
-/// Parse `audit(1700000000.123:456): ...` -> (serial, rest).
 fn split_header(text: &str) -> Option<(u64, &str)> {
     let rest = text.strip_prefix("audit(")?;
     let close = rest.find("):")?;
@@ -442,7 +396,6 @@ fn split_header(text: &str) -> Option<(u64, &str)> {
     Some((serial, rest[close + 2..].trim_start()))
 }
 
-/// Extract `key=value` where value may be quoted or hex-encoded.
 fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!(" {}=", key);
     let start = if let Some(s) = body.strip_prefix(&needle[1..]) {
@@ -457,11 +410,6 @@ fn field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
-/// A string field (`comm`, `exe`, `a0`...). The kernel writes a value in
-/// quotes when it's plain, and as bare hex when it contains spaces or
-/// control characters. Only the bare form may be hex-decoded: `field` strips
-/// the quotes, so decoding its output mangled any quoted name that happened
-/// to look like hex (a binary called `cafe` or `deadbeef` became garbage).
 fn text_field(body: &str, key: &str) -> Option<String> {
     let needle = format!(" {}=", key);
     let start = if let Some(s) = body.strip_prefix(&needle[1..]) {
@@ -475,7 +423,6 @@ fn text_field(body: &str, key: &str) -> Option<String> {
     start.split_whitespace().next().map(decode_value)
 }
 
-/// Decode a bare audit value, which is hex when it isn't `(null)`/`(none)`.
 fn decode_value(v: &str) -> String {
     let odd_len = v.len() & 1 == 1;
     if v.is_empty() || v.starts_with('"') || odd_len || !v.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -596,7 +543,6 @@ mod tests {
         assert_eq!(field(body, "uid"), Some("0"));
         assert_eq!(field(body, "comm"), Some("sh"));
         assert_eq!(field(body, "exe"), Some("/usr/bin/dash"));
-        // `uid` must not match `auid`/`euid`.
         assert_eq!(field("auid=5 uid=7 euid=9", "uid"), Some("7"));
     }
 
@@ -609,11 +555,9 @@ mod tests {
 
     #[test]
     fn quoted_hex_looking_names_are_not_decoded() {
-        // A binary really named "cafe" is logged quoted; it must stay "cafe".
         let body = "pid=1 comm=\"cafe\" exe=\"/tmp/deadbeef\" a0=2F746D702F61206220";
         assert_eq!(text_field(body, "comm").as_deref(), Some("cafe"));
         assert_eq!(text_field(body, "exe").as_deref(), Some("/tmp/deadbeef"));
-        // Bare values are hex and do get decoded.
         assert_eq!(text_field(body, "a0").as_deref(), Some("/tmp/a b "));
     }
 

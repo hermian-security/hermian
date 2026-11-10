@@ -1,5 +1,3 @@
-//! Datagram socket receiving auth events from `pam_hermian.so`.
-
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,9 +14,6 @@ pub fn pam_module_installed() -> bool {
     std::path::Path::new(paths::PAM_MODULE_PATH).exists()
 }
 
-/// Whether sshd actually loads the module: installed *and* referenced by an
-/// uncommented line in /etc/pam.d/sshd. The package always ships the .so,
-/// so its presence alone says nothing about coverage.
 pub fn pam_active() -> bool {
     pam_module_installed()
         && std::fs::read_to_string("/etc/pam.d/sshd")
@@ -40,8 +35,6 @@ pub fn spawn_pam_listener(
 ) -> Result<()> {
     let dir = paths::run_dir();
     std::fs::create_dir_all(&dir)?;
-    // The PAM module runs as root inside sshd; keep the dir private but the
-    // socket itself must be writable by root only, which is the default.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     let path = paths::pam_socket();
     let _ = std::fs::remove_file(&path);
@@ -55,14 +48,10 @@ pub fn spawn_pam_listener(
     Ok(())
 }
 
-/// Whether a PAM event should reach the engine. See `spawn_pam_listener`.
 fn keep_event(ev: &AuthEvent, forward_attempts: bool) -> bool {
     forward_attempts || ev.result != AuthResult::Attempt
 }
 
-/// Larger than any datagram the module sends. The username is chosen by the
-/// remote client; a 4 KiB buffer truncated long ones, the JSON then failed to
-/// parse and the attempt vanished, so long usernames hid brute force.
 const MAX_DATAGRAM: usize = 64 * 1024;
 
 fn pam_listener_loop(
@@ -121,8 +110,6 @@ pub fn parse_pam_payload(payload: &str) -> Option<AuthEvent> {
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok());
-    // The module stamps the time it saw the attempt; it's sent a moment ago,
-    // so anything far off means a bad clock or a bad sender. Use now then.
     let now = chrono::Utc::now();
     let ts = v
         .get("ts")

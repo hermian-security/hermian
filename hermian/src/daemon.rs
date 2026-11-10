@@ -1,6 +1,3 @@
-//! The long-running daemon: wires event sources into the engine and alerts
-//! into the notifier.
-
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,14 +16,12 @@ use crate::{
     tgbot, watchers,
 };
 
-/// Persisted across restarts so reference ids never repeat within a day.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct EngineState {
     ref_day: String,
     ref_seq: u32,
     #[serde(default)]
     counters: Option<hermian_core::Counters>,
-    /// "Remind me in 7 days" on the root-password warning.
     #[serde(default)]
     root_warning_snoozed_until: Option<chrono::DateTime<Utc>>,
 }
@@ -49,9 +44,6 @@ fn save_engine_state(engine: &Engine) {
     }
 }
 
-/// The brute-force digest's running week, saved on its own (it can hold
-/// thousands of sources) every ten minutes and on a clean stop, so a restart
-/// doesn't throw the week away.
 fn brute_digest_file() -> std::path::PathBuf {
     paths::state_dir().join("brute.json")
 }
@@ -68,9 +60,6 @@ fn save_brute_digest(engine: &Engine) {
 
 pub fn run() -> Result<()> {
     config::require_root()?;
-    // Not dumpable: no core dumps with alert data in them, and other users'
-    // processes can't ptrace it or read its memory through /proc.
-    // SAFETY: plain prctl with integer arguments.
     unsafe {
         libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
     }
@@ -81,9 +70,6 @@ pub fn run() -> Result<()> {
     } else {
         cfg.general.hostname.clone()
     };
-    // No baseline.json (deleted to start over, or started without `hermian
-    // enable`): learn afresh. Loading it as Default used to mean "disabled",
-    // which silently switched every novelty rule off.
     let mut baseline = if paths::baseline_file().exists() {
         config::load_baseline()?
     } else {
@@ -104,9 +90,6 @@ pub fn run() -> Result<()> {
     fs::create_dir_all(paths::state_dir())?;
     fs::create_dir_all(paths::run_dir())?;
 
-    // The dead-man switch watches the heartbeat; the marker tells the next
-    // start whether this run stopped cleanly, and the watchdog leaves a note
-    // when it had to restart the previous one.
     let unclean_prev = heartbeat::start(&paths::run_marker_file());
     let watchdog_note = heartbeat::take_restart_note(&paths::watchdog_note_file());
     let panic_note = heartbeat::take_restart_note(&paths::panic_note_file());
@@ -130,8 +113,6 @@ pub fn run() -> Result<()> {
             engine.seed_file_snapshot(path, content);
         }
     }
-    // Seed the full process tree so ancestry is known for processes that were
-    // already running when we started (sshd sessions, web servers...).
     for p in procsrc::scan_processes() {
         engine.tree.upsert(p);
     }
@@ -148,8 +129,6 @@ pub fn run() -> Result<()> {
         )
     });
     let result = rt.block_on(async_main(cfg, engine, cause));
-    // Don't hang on a blocking-pool thread (the eBPF converter, a delivery in
-    // flight) once main is done.
     rt.shutdown_timeout(Duration::from_secs(2));
     result
 }
@@ -162,8 +141,6 @@ struct Sources {
     watch_health: Option<watchers::SharedWatchHealth>,
 }
 
-/// Why the previous run stopped uncleanly, as `(sentence, fact label)`. A
-/// panic note is the most specific; the watchdog's note comes next.
 fn unclean_cause(panic: Option<&str>, watchdog: Option<&str>) -> (String, &'static str) {
     match (panic, watchdog) {
         (Some(p), _) => (format!("It crashed ({})", p), "Crash"),
@@ -199,7 +176,6 @@ async fn async_main(
     let notifier =
         notify::Notifier::spawn(initial_cfg.notifications.clone(), initial_notify.clone());
 
-    // --- Self-protection -------------------------------------------------
     let integrity = selfprotect::verify_at_startup();
     if !integrity.binary_ok {
         emit_self(
@@ -271,7 +247,6 @@ async fn async_main(
         );
     }
 
-    // --- Unclean restart ------------------------------------------------
     if let Some((prev, (cause, cause_label))) = unclean {
         emit_self(
             &notifier,
@@ -295,7 +270,6 @@ async fn async_main(
         );
     }
 
-    // --- Event sources ---------------------------------------------------
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(16384);
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut sources = Sources {
@@ -316,7 +290,6 @@ async fn async_main(
                 if !runtime.kprobes.is_empty() {
                     eprintln!("hermian: through kprobes: {}", runtime.kprobes.join(" "));
                 }
-                // chmod reported as it happens: the setuid sweep can slow down.
                 if ["sys_enter_fchmodat", "sys_enter_fchmod"]
                     .iter()
                     .all(|t| runtime.attached.contains(t))
@@ -324,14 +297,10 @@ async fn async_main(
                     fallback::PRIV_HOOKED.store(true, Ordering::Relaxed);
                 }
                 _ebpf_runtime = Some(runtime);
-                // Several /proc reads per event: on a blocking thread, not
-                // one of the runtime's two workers, so an exec storm can't
-                // stall the event loop (and back up into ring loss).
                 let tx = event_tx.clone();
                 tokio::task::spawn_blocking(move || convert_ebpf_events(raw_rx, tx));
             }
             Err(e) => {
-                // Verifier output can be thousands of lines; keep the first.
                 let full = format!("{:#}", e);
                 let first = full.lines().next().unwrap_or("").trim_end_matches(':');
                 log_daemon(
@@ -382,10 +351,6 @@ async fn async_main(
             &format!("auth log source unavailable: {:#}", e),
         ),
     }
-    // The PAM module reports an "attempt" for every authentication, before
-    // the outcome is known. With a log source already reporting failures,
-    // counting attempts too would double every failure and count successful
-    // logins as failures, so they're only used when there's no log source.
     let pam_attempts = sources.auth == authlog::AuthSource::None;
     if let Err(e) = pamsock::spawn_pam_listener(event_tx.clone(), shutdown.clone(), pam_attempts) {
         log_daemon(Severity::Low, &format!("PAM socket unavailable: {:#}", e));
@@ -400,16 +365,12 @@ async fn async_main(
     fallback::spawn_listener_poller(event_tx.clone(), listener_close_tx, shutdown.clone())?;
     fallback::spawn_suid_sweeper(event_tx.clone(), shutdown.clone())?;
 
-    // --- Telegram response buttons ---------------------------------------
-    // The poller follows config reloads through this shared copy; it idles
-    // while actions are off.
     let tg_cfg = Arc::new(std::sync::Mutex::new(
         initial_cfg.notifications.telegram.clone(),
     ));
     let (action_tx, mut action_rx) = mpsc::channel::<tgbot::ActionRequest>(64);
     tgbot::spawn_poller(tg_cfg.clone(), action_tx, shutdown.clone())?;
 
-    // --- Signals ---------------------------------------------------------
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -424,13 +385,9 @@ async fn async_main(
     let mut last_cpu = procsrc::self_cpu_sample();
     let mut first_tick = true;
     let mut current_cfg = initial_cfg;
-    // Hash of the config actually in effect. Reloads compare against this,
-    // not config.sha256: writing that file first, then the config, used to
-    // make the change skip both the reload and its alert.
     let mut applied_hash = integrity.config_hash.clone();
     let mut dropped_seen = health::snapshot();
     let mut compat_seen: HashMap<String, bool> = HashMap::new();
-    // First pass shortly after start, then hourly.
     let mut next_retention = std::time::Instant::now() + Duration::from_secs(60);
     let mut hotplug_reported: Vec<u32> = Vec::new();
     let started_at = Utc::now();
@@ -452,13 +409,6 @@ async fn async_main(
         );
     }
 
-    // Start-up audit. An intrusion already in place when Hermian starts is
-    // invisible to the rules until it acts, and the baseline would learn its
-    // routine as normal: on a failed audit, learning stops and novelty is
-    // judged from now on, against nothing learned on this host.
-    // Hermian checks itself first: injected code would make everything
-    // below untrustworthy. Then again every ten minutes (cheap when the
-    // daemon's mappings haven't changed).
     let mut self_maps: Vec<String> = Vec::new();
     run_self_check(&mut engine, &notifier, &mut self_maps);
 
@@ -474,8 +424,6 @@ async fn async_main(
              destinations and programs are judged from now on",
         );
         if let Some(mut f) = hermian_core::audit::finding(&signs, note) {
-            // The same findings at every restart (an install restarts more
-            // than once) page once a day, not each time.
             let now = Utc::now();
             let saved = paths::state_dir().join("audit-last");
             match fs::read_to_string(&saved)
@@ -519,8 +467,6 @@ async fn async_main(
         &cpu_ring,
         started_at,
     );
-    // Start the heartbeat before the first tick so the watchdog doesn't see
-    // a "never written" daemon during a slow startup.
     let _ = heartbeat::touch(&paths::heartbeat_file());
     log_daemon(
         Severity::Info,
@@ -543,10 +489,6 @@ async fn async_main(
                 }
                 match &ev {
                     Event::Exec(e) => seed_missing_ancestors(&mut engine, e.ppid, e.ts),
-                    // A process that forked without exec'ing (or started before
-                    // us and never exec'd since) isn't in the tree; without it
-                    // a connect or ptrace has no exe or chain, and a forked
-                    // child that calls itself "gdb" passed as a debugger.
                     Event::Connect(c) => seed_process(&mut engine, c.pid, c.ts),
                     Event::Ptrace(p) => seed_process(&mut engine, p.pid, p.ts),
                     _ => {}
@@ -577,8 +519,6 @@ async fn async_main(
                 handle_action(&mut engine, &notifier, &current_cfg, req);
             }
             _ = ticker.tick() => {
-                // The dead-man switch reads this; it must be the first thing
-                // a slow tick refreshes.
                 let _ = heartbeat::touch(&paths::heartbeat_file());
                 let now = Utc::now();
                 engine.reap_exited(&procsrc::live_pids(), now);
@@ -607,14 +547,11 @@ async fn async_main(
                     next_retention = std::time::Instant::now() + Duration::from_secs(3600);
                     let days = current_cfg.general.alert_retention_days;
                     tokio::task::spawn_blocking(move || retention::run(days));
-                    // sshd settings can change any time; recheck hourly.
                     tokio::task::spawn_blocking(sessions::refresh_sshd_auth);
                 }
                 if let Some(auth) = sessions::cached_sshd_auth() {
                     engine.set_sshd_auth(auth.root_password, auth.password, auth.per_match);
                 }
-                // Hidden key sources in sshd's effective config: audited at
-                // start and every ten minutes, each reported once.
                 if std::time::Instant::now() >= next_sshd_audit {
                     next_sshd_audit = std::time::Instant::now() + Duration::from_secs(600);
                     save_brute_digest(&engine);
@@ -631,8 +568,6 @@ async fn async_main(
 
                 let sample = procsrc::self_cpu_sample();
                 let dt = sample.1 - last_cpu.1;
-                // The first interval includes the startup process scan and eBPF
-                // load, which is not representative of steady-state overhead.
                 if dt > 0.0 && !first_tick {
                     let dticks = sample.0.saturating_sub(last_cpu.0);
                     let pct = (dticks as f64 / (dt * procsrc::clock_ticks() as f64)) * 100.0;
@@ -666,17 +601,11 @@ async fn async_main(
     }
 
     shutdown.store(true, Ordering::Relaxed);
-    // Reaching here means a handled signal (SIGTERM/SIGINT) or a closed event
-    // channel: a clean stop. Crashes and SIGKILLs skip this, and the next
-    // start reports the leftover marker.
     heartbeat::clean_stop(&paths::run_marker_file());
     let _ = config::save_baseline(&engine.baseline);
     save_engine_state(&engine);
     save_brute_digest(&engine);
-    // Give the notifier a moment to flush persisted alerts.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    // Let the audit thread notice and drop its socket, which removes our
-    // exec rule; returning first left the rule (and audit enabled) behind.
     if let Some(h) = audit_thread {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !h.is_finished() && std::time::Instant::now() < deadline {
@@ -686,8 +615,6 @@ async fn async_main(
     Ok(())
 }
 
-/// Page when telemetry was dropped since the last tick. The engine's dedup
-/// window keeps a sustained loss to one alert per source every few minutes.
 fn report_dropped_events(
     engine: &mut Engine,
     notifier: &notify::Notifier,
@@ -719,9 +646,6 @@ fn report_dropped_events(
     }
 }
 
-/// Page when a channel has been failing for a while. The page goes to every
-/// channel: the working ones deliver it, so a dead bot or mailbox doesn't
-/// silently cut the host off.
 fn report_channel_failing(
     engine: &mut Engine,
     notifier: &notify::Notifier,
@@ -752,9 +676,6 @@ fn report_channel_failing(
     );
 }
 
-/// Page when something else keeps reading this bot's button presses: each
-/// press then reaches only one of the readers, and the other answers that
-/// it doesn't know the button. The dedup window keeps it to one page.
 fn report_bot_conflict(engine: &mut Engine, notifier: &notify::Notifier, conflicts: u32) {
     let n = conflicts.to_string();
     emit_self(
@@ -785,13 +706,6 @@ fn sync_tg_cfg(shared: &Arc<std::sync::Mutex<hermian_core::config::TelegramCfg>>
     }
 }
 
-/// Carry out a Telegram button press that passed every check (see tgbot).
-///
-/// Quick engine-side choices (ignore, snooze) happen here; firewall and
-/// process work runs on a blocking thread. Either way the outcome is posted
-/// as a reply to the alert, one line per target (see `actions`), and the
-/// alert's buttons are updated to show it. Every press is also recorded as
-/// a local alert.
 fn handle_action(
     engine: &mut Engine,
     notifier: &notify::Notifier,
@@ -822,7 +736,6 @@ fn handle_action(
     let tg = cfg.notifications.telegram.clone();
     let host = engine.host.clone();
     let cfg = cfg.clone();
-    // An Undo lasts as long as the block, up to a day.
     let undo_mins = (cfg.response.block_duration_hours.max(1) * 60).min(1440);
     let conclude =
         move |req: tgbot::ActionRequest, lines: Vec<Line>, undo: Vec<std::net::IpAddr>| {
@@ -903,7 +816,6 @@ fn handle_action(
                 let ctx = action_ctx(&cfg, &req);
                 let mut lines = Vec::new();
                 let mut undo = Vec::new();
-                // Block first: otherwise the session can come right back.
                 if block {
                     let l = actions::block(&ctx, source);
                     if l.mark == Mark::Done {
@@ -926,7 +838,6 @@ fn handle_action(
     }
 }
 
-/// What the action decisions need for a button press.
 fn action_ctx<'a>(cfg: &'a Config, req: &'a tgbot::ActionRequest) -> actions::Ctx<'a> {
     actions::Ctx {
         host: &actions::RealHost,
@@ -938,20 +849,14 @@ fn action_ctx<'a>(cfg: &'a Config, req: &'a tgbot::ActionRequest) -> actions::Ct
     }
 }
 
-/// Cap on remembered exe paths for the 32-bit check.
 const COMPAT_CACHE: usize = 4096;
 
-/// A 32-bit program on x86_64 uses compat syscalls, which the eBPF
-/// `sys_enter_*` hooks don't see: its connects and ptrace calls are
-/// invisible. Rare on servers, so each such program is logged once (LOW,
-/// not paged) to make the blind spot visible.
 fn check_compat_exec(
     engine: &mut Engine,
     notifier: &notify::Notifier,
     seen: &mut HashMap<String, bool>,
     e: &ExecEvent,
 ) {
-    // Each exe is checked (and, if 32-bit, reported) once.
     if seen.contains_key(&e.exe) {
         return;
     }
@@ -1002,12 +907,6 @@ fn report_unmonitored_cpus(engine: &mut Engine, notifier: &notify::Notifier, cpu
     );
 }
 
-/// Tell the alert channels the daemon is stopping, and give delivery a few
-/// seconds. A clean `systemctl stop` used to be silent remotely; that's the
-/// simplest way to blind a host. (A SIGKILL still can't be reported.)
-/// Whether the marker `hermian enable` leaves before restarting the daemon
-/// is fresh: written within the last two minutes (a little clock skew
-/// allowed). An old or garbled marker doesn't count.
 fn planned_restart(marker: &str, now: chrono::DateTime<Utc>) -> bool {
     marker
         .trim()
@@ -1017,15 +916,11 @@ fn planned_restart(marker: &str, now: chrono::DateTime<Utc>) -> bool {
 }
 
 async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal: &str) {
-    // A restart by `hermian enable` (installs and upgrades) is routine:
-    // logged, not paged. The marker is used once.
     let marker = paths::planned_restart_file();
     let planned = fs::read_to_string(&marker)
         .map(|m| planned_restart(&m, Utc::now()))
         .unwrap_or(false);
     let _ = fs::remove_file(&marker);
-    // `systemctl restart`: the daemon is back in seconds. A plain stop (what
-    // an intruder does) stays HIGH.
     let restarting = !planned && systemd_restarting();
     if restarting {
         let alert = self_alert(
@@ -1087,8 +982,6 @@ async fn announce_stop(engine: &mut Engine, notifier: &notify::Notifier, signal:
     }
 }
 
-/// Whether systemd is restarting the unit rather than stopping it: while it
-/// stops, a restart job is queued for it.
 fn systemd_restarting() -> bool {
     procsrc::system_command("systemctl")
         .args(["list-jobs", "--no-legend", "--plain"])
@@ -1097,7 +990,6 @@ fn systemd_restarting() -> bool {
         .unwrap_or(false)
 }
 
-/// `systemctl list-jobs` lines: "JOB UNIT TYPE STATE".
 fn restart_job_in(jobs: &str) -> bool {
     jobs.lines().any(|l| {
         let w: Vec<&str> = l.split_whitespace().collect();
@@ -1107,8 +999,6 @@ fn restart_job_in(jobs: &str) -> bool {
     })
 }
 
-/// When the same start-up audit findings (`signature`) were last paged, if
-/// that was under a day ago. `saved` is "<signature> <unix time>".
 fn audit_repeat_of(
     saved: &str,
     signature: &str,
@@ -1119,16 +1009,8 @@ fn audit_repeat_of(
     (sig == signature && now - at < chrono::Duration::hours(24) && at <= now).then_some(at)
 }
 
-/// How long shutdown waits for the stop notice. The unit's TimeoutStopSec
-/// must be comfortably above this.
 const STOP_NOTICE_WAIT_SECS: u64 = 6;
 
-/// Walk up from `ev.ppid` and make sure every ancestor is present and current.
-///
-/// "Current" matters: a process may have renamed itself (prctl PR_SET_NAME,
-/// which is how nginx/postgres/php-fpm workers get their titles) or exec'd a
-/// new image since we last saw it. Ancestors are refreshed from /proc when the
-/// recorded comm no longer matches, so role classification uses the live name.
 fn seed_missing_ancestors(engine: &mut Engine, ppid: u32, now: chrono::DateTime<Utc>) {
     let mut pid = ppid;
     let mut depth = 0;
@@ -1136,7 +1018,6 @@ fn seed_missing_ancestors(engine: &mut Engine, ppid: u32, now: chrono::DateTime<
         let known = engine.tree.get(pid).map(|p| (p.comm.clone(), p.ppid));
         match known {
             Some((comm, ppid)) => {
-                // Cheap check: has the comm changed since we recorded it?
                 match procsrc::comm_of(pid) {
                     Some(live) if live != comm => {
                         if let Some(info) = procsrc::proc_info(pid, now) {
@@ -1160,8 +1041,6 @@ fn seed_missing_ancestors(engine: &mut Engine, ppid: u32, now: chrono::DateTime<
     }
 }
 
-/// Make sure `pid` itself (and its ancestry) is in the tree, reading /proc
-/// if we never saw it exec.
 fn seed_process(engine: &mut Engine, pid: u32, now: chrono::DateTime<Utc>) {
     if pid <= 1 {
         return;
@@ -1180,7 +1059,6 @@ fn seed_process(engine: &mut Engine, pid: u32, now: chrono::DateTime<Utc>) {
     seed_missing_ancestors(engine, ppid, now);
 }
 
-/// Runs on a blocking thread (see the caller).
 fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sender<Event>) {
     let self_pid = std::process::id();
     while let Some(raw) = raw_rx.blocking_recv() {
@@ -1190,17 +1068,11 @@ fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sen
                     continue;
                 }
                 let pid = raw.pid;
-                // sched_process_exec delivers the live image: filename is the
-                // resolved path and comm is the new program's. No /proc race.
                 let filename = ebpf::to_str(&raw.filename);
                 let argv0 = ebpf::to_str(&raw.argv0);
                 let bpf_comm = ebpf::to_str(&raw.comm);
-                // ppid from the kernel task_struct is exact even if the parent
-                // has already exited; /proc reparents to 1 in that case.
                 let (proc_ppid, tty_nr, _start) = procsrc::stat_of(pid).unwrap_or((0, 0, 0));
                 let ppid = if raw.ppid != 0 { raw.ppid } else { proc_ppid };
-                // /proc/<pid>/exe is authoritative for "(deleted)"/memfd; fall
-                // back to the tracepoint's filename when the process is gone.
                 let (exe, deleted) = match procsrc::exe_of(pid) {
                     Some((exe, deleted)) if !exe.is_empty() => (exe, deleted),
                     _ => (filename.clone(), false),
@@ -1282,19 +1154,12 @@ fn convert_ebpf_events(mut raw_rx: mpsc::Receiver<ebpf::RawEvent>, tx: mpsc::Sen
     }
 }
 
-/// A chmod or setxattr that gave a file setuid/setgid bits or capabilities.
-/// The hook fires on entry, before the call has done anything: wait a moment
-/// for it to land, and report nothing if it never does (it failed).
 fn priv_event(raw: &ebpf::RawPriv) -> Option<hermian_core::FileEvent> {
     let rel = ebpf::to_str(&raw.path);
-    // chmod and setcap are usually gone before /proc can say what their fd
-    // or working directory was: then find the inode the kernel gave us.
     let path = procsrc::path_at(raw.pid, raw.fd, &rel).or_else(|| {
         let base = fallback::find_inode(fallback::st_dev_of_kernel(raw.dev), raw.ino)?;
         procsrc::join_at(&base, &rel)
     })?;
-    // The kernel's comm and uid still say who when the process is gone
-    // (writer_info then has an empty comm and uid 0).
     let mut writer = procsrc::writer_info(raw.pid)
         .map(fallback::writer_from)
         .unwrap_or(hermian_core::WriterInfo {
@@ -1330,7 +1195,6 @@ fn priv_event(raw: &ebpf::RawPriv) -> Option<hermian_core::FileEvent> {
     None
 }
 
-/// Re-read, validate and apply the configuration.
 fn reload_config(
     engine: &mut Engine,
     notifier: &notify::Notifier,
@@ -1359,10 +1223,7 @@ fn reload_config(
         }
     };
     let new_hash = selfprotect::sha256_hex(text.as_bytes());
-    // Compared with what's in effect, not with config.sha256 on disk, which
-    // anyone who can write the config can also rewrite first.
     if new_hash == *applied_hash {
-        // Touched but unchanged (editor re-save, SIGHUP with no edit).
         return;
     }
     let parsed = Config::parse(&text)
@@ -1375,9 +1236,6 @@ fn reload_config(
         Ok(new_cfg) => {
             let diff = configdiff::diff(current_cfg, &new_cfg);
             let functional = diff.is_functional();
-            // Loosening (fewer or other destinations, a rule off, a wider
-            // exception) is how a host gets blinded: CRITICAL. Tuning and
-            // tightening are recorded without paging.
             let alert = self_alert(
                 engine,
                 if !functional {
@@ -1400,8 +1258,6 @@ fn reload_config(
                 &[("Trigger", trigger), ("Changes", &diff.summary), ("Config hash", &new_hash)],
                 &reload_signature(functional, &new_hash),
             );
-            // If alerts are being repointed, the old destinations must hear
-            // about it too: otherwise the notice goes only to whoever did it.
             if diff.destinations_changed && diff.weakens {
                 if let Some(a) = &alert {
                     notify_old_destinations(a.clone(), current_cfg.notifications.clone());
@@ -1432,8 +1288,6 @@ fn reload_config(
     }
 }
 
-/// Best-effort, one-shot delivery to the notifying channels of a config that
-/// is about to be replaced. Runs off the event loop; failures are only logged.
 fn notify_old_destinations(alert: Alert, old: hermian_core::config::NotificationsCfg) {
     let _ = std::thread::Builder::new()
         .name("hermian-old-dest".into())
@@ -1452,11 +1306,6 @@ fn notify_old_destinations(alert: Alert, old: hermian_core::config::Notification
         });
 }
 
-/// Dedup signature for the reload alert. Each distinct functional config gets
-/// its own, so a second change within the dedup window still pages: with one
-/// fixed signature, a harmless edit followed by the real one within five
-/// minutes left the second silent (seen on the test VM when auto_isolate was
-/// switched on). No-op reloads share one signature, they're only INFO.
 fn reload_signature(functional: bool, config_hash: &str) -> String {
     if functional {
         format!("selfprotect|config-reload|{}", config_hash)
@@ -1465,7 +1314,6 @@ fn reload_signature(functional: bool, config_hash: &str) -> String {
     }
 }
 
-/// See [`audit::self_check`].
 fn run_self_check(engine: &mut Engine, notifier: &notify::Notifier, last: &mut Vec<String>) {
     let Some(signs) = audit::self_check(last) else {
         return;
@@ -1507,7 +1355,6 @@ fn self_alert(
 }
 
 pub fn log_daemon(severity: Severity, msg: &str) {
-    // Under systemd, stderr already lands in the journal; avoid double entries.
     let under_systemd =
         std::env::var_os("INVOCATION_ID").is_some() || std::env::var_os("JOURNAL_STREAM").is_some();
     if under_systemd {
@@ -1641,8 +1488,6 @@ fn write_status_snapshot(
     let _ = status::write_state(&state);
 }
 
-/// Every SSH auth source actually in use. PAM used to hide the log source
-/// (and was claimed whenever the .so existed, even with no hook).
 fn auth_source_label(pam: bool, log: authlog::AuthSource) -> &'static str {
     match (pam, log) {
         (true, authlog::AuthSource::File) => "PAM + auth.log + inotify",
@@ -1667,8 +1512,6 @@ mod tests {
     use super::*;
     use hermian_core::{Allowlist, Baseline};
 
-    /// The upgrade restart (#198 on the test VPS) paged HIGH. Only a fresh
-    /// marker from `hermian enable` makes a stop routine.
     #[test]
     fn a_restart_job_is_told_from_a_stop() {
         assert!(restart_job_in("812 hermian.service restart running\n"));
@@ -1765,11 +1608,8 @@ mod tests {
     fn every_distinct_config_change_pages() {
         let mut eng = engine();
         assert!(reload(&mut eng, true, "aaa").is_some());
-        // A second, different change a moment later must not be deduped away.
         assert!(reload(&mut eng, true, "bbb").is_some());
-        // The same config again (e.g. a re-save) is.
         assert!(reload(&mut eng, true, "bbb").is_none());
-        // No-op reloads stay collapsed.
         assert!(reload(&mut eng, false, "c1").is_some());
         assert!(reload(&mut eng, false, "c2").is_none());
     }

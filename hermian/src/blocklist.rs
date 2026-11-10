@@ -1,12 +1,3 @@
-//! Blocking source addresses (the "Block IP" response).
-//!
-//! An nftables table of its own, separate from isolation, holding two sets
-//! with per-element timeouts: blocks expire by themselves in the kernel, and
-//! survive a daemon restart (not a reboot). IPv4 addresses are blocked one by
-//! one; IPv6 ones as their /64, since an attacker holding one address of a
-//! /64 usually holds them all. Traffic is dropped both ways, before anything
-//! else sees it (prerouting, so containers and forwarded ports are covered).
-
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
 
@@ -35,18 +26,12 @@ fn table_script() -> String {
     )
 }
 
-/// How long one nft call may take before it's given up on.
 const NFT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Why an nft call didn't work, so the person who pressed a button can be
-/// told in a sentence (see `actions::explain`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NftError {
-    /// nft isn't installed.
     Missing,
-    /// It didn't finish in time and was killed.
     Timeout(Duration),
-    /// It ran and refused; its first line of output.
     Failed(String),
 }
 
@@ -62,8 +47,6 @@ impl std::fmt::Display for NftError {
 
 impl std::error::Error for NftError {}
 
-/// Run a command with a time limit, feeding it `stdin`. Its output is read
-/// on threads, so a long listing can't fill a pipe and stall it.
 fn run_limited(
     mut cmd: std::process::Command,
     stdin: Option<&[u8]>,
@@ -149,17 +132,12 @@ fn table_exists() -> bool {
     nft(&["list", "table", "inet", TABLE]).is_ok()
 }
 
-/// Serializes changes: two button presses at once each run on their own
-/// blocking thread, and both could see no table and create it, doubling
-/// its rules.
 static NFT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn nft_lock() -> std::sync::MutexGuard<'static, ()> {
     NFT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Create the table once. Re-declaring it would append its rules again.
-/// Call with [`nft_lock`] held.
 fn ensure_table() -> Result<()> {
     if table_exists() {
         return Ok(());
@@ -167,7 +145,6 @@ fn ensure_table() -> Result<()> {
     nft_script(&table_script())
 }
 
-/// What a block covers: the address itself (IPv4) or its /64 (IPv6).
 pub fn block_key(ip: IpAddr) -> (&'static str, String) {
     match ip {
         IpAddr::V4(v4) => ("v4", v4.to_string()),
@@ -181,11 +158,6 @@ pub fn block_key(ip: IpAddr) -> (&'static str, String) {
     }
 }
 
-/// Why `ip` must not be blocked, if it mustn't.
-///
-/// The operator's own way in (management CIDRs, allowlisted SSH sources) and
-/// addresses that would break the host itself are refused, whoever presses
-/// the button.
 pub fn refusal(ip: IpAddr, cfg: &Config) -> Option<String> {
     let special = match ip {
         IpAddr::V4(v4) => {
@@ -241,8 +213,6 @@ fn cidr_contains((net, prefix): (IpAddr, u32), ip: IpAddr) -> bool {
     }
 }
 
-/// A v6 block covers the whole /64: refuse if that /64 holds any of a
-/// management CIDR.
 fn overlaps_v6_block((net, prefix): (IpAddr, u32), ip: IpAddr) -> bool {
     match (net, ip) {
         (IpAddr::V6(n), IpAddr::V6(a)) => {
@@ -254,7 +224,6 @@ fn overlaps_v6_block((net, prefix): (IpAddr, u32), ip: IpAddr) -> bool {
     }
 }
 
-/// Block `ip` for `hours`. Re-blocking refreshes the timeout.
 pub fn block(ip: IpAddr, hours: u32, cfg: &Config) -> Result<String> {
     if let Some(why) = refusal(ip, cfg) {
         anyhow::bail!("not blocking: {}", why);
@@ -262,7 +231,6 @@ pub fn block(ip: IpAddr, hours: u32, cfg: &Config) -> Result<String> {
     let _guard = nft_lock();
     ensure_table()?;
     let (set, key) = block_key(ip);
-    // Remove first so the timeout starts over; it's fine if it wasn't there.
     let _ = nft(&[
         "delete",
         "element",
@@ -300,7 +268,6 @@ pub fn unblock(ip: IpAddr) -> Result<String> {
     Ok(key)
 }
 
-/// One blocked entry and its remaining time, as nft prints them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
     pub key: String,
@@ -320,8 +287,6 @@ pub fn list() -> Result<Vec<Blocked>> {
     Ok(out)
 }
 
-/// Pull `elements = { a timeout 1d expires 23h59m, b ... }` out of
-/// `nft list set` output.
 fn parse_set_listing(text: &str) -> Vec<Blocked> {
     let Some(start) = text.find("elements = {") else {
         return Vec::new();
@@ -346,7 +311,6 @@ fn parse_set_listing(text: &str) -> Vec<Blocked> {
         .collect()
 }
 
-/// Drop the whole table (uninstall).
 pub fn remove_table() {
     if table_exists() {
         let _ = nft(&["delete", "table", "inet", TABLE]);
@@ -401,7 +365,6 @@ mod tests {
         assert!(refusal("203.0.113.40".parse().unwrap(), &c).is_some());
         assert!(refusal("127.0.0.1".parse().unwrap(), &c).is_some());
         assert!(refusal("fe80::1".parse().unwrap(), &c).is_some());
-        // The /64 of this address is inside the management /48.
         assert!(refusal("2001:db8:1:2::99".parse().unwrap(), &c).is_some());
         assert!(refusal("2001:db8:2::99".parse().unwrap(), &c).is_none());
     }
@@ -419,9 +382,6 @@ mod tests {
         );
     }
 
-    /// Really creates, fills, lists and empties the table. Needs root, and
-    /// changes the firewall, so only run it in a throwaway network namespace:
-    ///   sudo unshare -n <test-binary> --ignored --exact blocklist::tests::live_block_list_unblock
     #[test]
     #[ignore]
     fn live_block_list_unblock() {
@@ -430,10 +390,7 @@ mod tests {
         let v6: IpAddr = "2001:db8:9:9::1".parse().unwrap();
         assert_eq!(block(v4, 24, &c).unwrap(), "198.51.100.7");
         assert_eq!(block(v6, 1, &c).unwrap(), "2001:db8:9:9::/64");
-        // Re-blocking refreshes rather than failing.
         block(v4, 24, &c).unwrap();
-        // Two presses at once (the table is gone first) mustn't both create
-        // it and double its rules; checked below.
         remove_table();
         let presses: Vec<_> = ["198.51.100.8", "198.51.100.9"]
             .iter()
@@ -448,7 +405,6 @@ mod tests {
         }
         block(v4, 24, &c).unwrap();
         block(v6, 1, &c).unwrap();
-        // Refused addresses never reach nft.
         assert!(block("203.0.113.5".parse().unwrap(), 24, &c).is_err());
         let l = list().unwrap();
         assert!(
@@ -458,7 +414,6 @@ mod tests {
             l
         );
         assert!(l.iter().any(|b| b.key == "2001:db8:9:9::/64"), "{:?}", l);
-        // The table is created once, its rules aren't duplicated.
         let rules = nft(&["list", "table", "inet", TABLE]).unwrap();
         assert_eq!(rules.matches("ip saddr @v4 drop").count(), 1, "{}", rules);
         unblock(v4).unwrap();
@@ -470,7 +425,6 @@ mod tests {
         assert!(!table_exists());
     }
 
-    /// `nft -c` parses the table without applying it. Needs root.
     #[test]
     #[ignore]
     fn nft_accepts_the_block_table() {
@@ -511,7 +465,6 @@ mod tests {
             run_limited(sh("sleep 5"), None, Duration::from_millis(200)),
             Err(NftError::Timeout(Duration::from_millis(200)))
         );
-        // Only the first non-empty line of what it said.
         assert_eq!(
             run_limited(
                 sh("printf '\nError: no such set\nmore\n' >&2; exit 1"),
@@ -524,7 +477,6 @@ mod tests {
             run_limited(sh("cat"), Some(b"fed in"), NFT_TIMEOUT).as_deref(),
             Ok("fed in")
         );
-        // A big listing doesn't stall on a full pipe.
         let big = run_limited(
             sh("head -c 300000 /dev/zero | tr '\\0' x"),
             None,

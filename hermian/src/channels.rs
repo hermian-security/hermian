@@ -1,8 +1,3 @@
-//! Outbound notification transports: Telegram and email.
-//!
-//! Each `send` is synchronous and returns `Err(String)` with a one-line reason
-//! so the notifier can retry with backoff and surface it in `hermian status`.
-
 use std::time::Duration;
 
 use hermian_core::config::{EmailCfg, TelegramCfg};
@@ -10,46 +5,34 @@ use hermian_core::{render, Alert, Severity, Theme};
 
 use crate::notify::SendError;
 
-// ---------------------------------------------------------------------------
-// Telegram
-// ---------------------------------------------------------------------------
-
 pub mod telegram {
     use super::*;
 
-    /// Bot API base. Overridable for integration tests against a mock server.
     pub fn api_base() -> String {
         std::env::var("HERMIAN_TELEGRAM_API")
             .unwrap_or_else(|_| "https://api.telegram.org".to_string())
     }
 
-    /// ureq includes the request URL (and thus the bot token) in its errors.
     fn redact(cfg: &TelegramCfg, e: impl std::fmt::Display) -> String {
         let s = e.to_string();
-        // replace("") would insert "<token>" between every character.
         let s = if cfg.bot_token.is_empty() {
             s
         } else {
             s.replace(&cfg.bot_token, "<token>")
         };
-        // And if the URL comes back escaped or normalised, drop its path.
         crate::notify::webhook::strip_url_paths(&s)
     }
 
-    /// Escape for Telegram's HTML parse mode.
     fn esc(s: &str) -> String {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     }
 
-    /// The severity meter, shared with the CLI.
     pub(super) fn meter(s: Severity) -> &'static str {
         hermian_core::alert::severity_meter(s)
     }
 
-    /// Cut `s` to at most `max` chars, marking the cut. Applied before
-    /// escaping so an HTML entity is never split.
     pub(super) fn clip(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             return s.to_string();
@@ -59,31 +42,9 @@ pub mod telegram {
         out
     }
 
-    /// Most facts on the fact sheet; the CLI has the rest.
     const SHEET_FACTS: usize = 5;
 
-    /// Build the HTML message body:
-    ///
-    /// ```text
-    /// ◉◉◉○  HIGH · Persistence               <- meter, level, detection family
-    /// Shell profile changed with no ...      <- headline, on its own line
-    /// ┃ /root/.bashrc was moved into ...     <- what happened, as a quote card
-    /// host  web-01                           <- <pre> fact sheet, tap to copy
-    /// path  /root/.bashrc
-    /// rule  D3 · Persistence modification
-    /// time  16 Oct 2026 · 12:36 UTC
-    /// ┃ Risk ... Next steps 1. ... 2. ...    <- expandable quote, collapsed
-    /// hermian show HER-2026-1016-163         <- tap to copy
-    /// ```
-    ///
-    /// Telegram allows no colour or fonts, so hierarchy does the work. The
-    /// bot's name and avatar already say who's talking, so there's no
-    /// product name. The why and the steps sit in a collapsed quote: the
-    /// push notification and the first screen stay short.
     pub fn body(alert: &Alert) -> String {
-        // Escaping can triple hostile text, so shed detail until it fits
-        // Telegram's 4096-character limit: first the collapsed section, then
-        // the fact sheet's length.
         let levels = [
             (SHEET_FACTS, 120, true, 500),
             (SHEET_FACTS, 120, false, 500),
@@ -95,7 +56,6 @@ pub mod telegram {
                 return b;
             }
         }
-        // Worst case, every field escaped 5x: still well under the limit.
         body_with(alert, 0, 0, false, 120)
     }
 
@@ -148,9 +108,6 @@ pub mod telegram {
         out
     }
 
-    /// Aligned `key  value` lines: host, the first detector facts, the
-    /// process chain, the rule and the time. Plain text; escaped by the
-    /// caller.
     fn fact_sheet(alert: &Alert, facts: usize, value_max: usize) -> String {
         let mut rows: Vec<(String, String)> = vec![("host".into(), clip(&alert.host, 60))];
         for f in alert.facts.iter().take(facts) {
@@ -188,7 +145,6 @@ pub mod telegram {
             .join("\n")
     }
 
-    /// The risk and the numbered steps, escaped, or empty.
     fn why_and_steps(alert: &Alert) -> String {
         let mut s = String::new();
         if !alert.why.is_empty() {
@@ -218,7 +174,6 @@ pub mod telegram {
         if let Some(t) = cfg.message_thread_id {
             payload["message_thread_id"] = serde_json::json!(t);
         }
-        // Response buttons, when enabled and the alert offers any.
         let buttons = if cfg.actions_enabled() && !alert.offers.is_empty() {
             crate::tgbot::register(
                 &alert.ref_id,
@@ -268,7 +223,6 @@ pub mod telegram {
         }
     }
 
-    /// Verify the token and chat without sending an alert.
     pub fn probe(cfg: &TelegramCfg) -> Result<String, String> {
         let agent = crate::tgbot::agent(Duration::from_secs(10));
         let mut me = agent
@@ -314,10 +268,6 @@ pub mod telegram {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Email
-// ---------------------------------------------------------------------------
-
 pub mod email {
     use super::*;
     use lettre::message::{header::ContentType, Attachment, Mailbox, MultiPart, SinglePart};
@@ -325,12 +275,6 @@ pub mod email {
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::{Message, SendmailTransport, SmtpTransport, Transport};
 
-    /// The header lockup (light on the ink band, 176x44 shown at 88x22) and
-    /// the company lockup for the footer (one mid-tone colour, so it reads on
-    /// light and dark clients). Both travel inside the message as inline
-    /// attachments: no remote image (blocked by default, and it would tell a
-    /// server when an alert was read), no data: URI (Gmail drops them).
-    /// About 1.1 KB each.
     pub(super) const LOCKUP_PNG: &[u8] = include_bytes!("../assets/lockup-email-dark.png");
     pub(super) const COMPANY_PNG: &[u8] = include_bytes!("../assets/company-email.png");
     const LOCKUP_CID: &str = "hermian-lockup";
@@ -342,9 +286,6 @@ pub mod email {
             .replace('>', "&gt;")
     }
 
-    /// "[Hermian] HIGH: <title> (<host>)". Severity and title lead because
-    /// inbox lists cut from the right. ASCII-only so the subject never needs
-    /// RFC 2047 encoding (which some clients render badly in previews).
     pub fn subject(alert: &Alert, prefix: &str) -> String {
         let ascii = |s: &str| s.chars().filter(|c| c.is_ascii()).collect::<String>();
         format!(
@@ -362,7 +303,6 @@ pub mod email {
         "-apple-system,BlinkMacSystemFont,'Segoe UI',Manrope,Helvetica,Arial,sans-serif";
     const MONO: &str = "'JetBrains Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace";
 
-    /// A section label in the brand accent.
     fn eyebrow(label: &str, top: u32) -> String {
         format!(
             "<div class=\"hm-ac\" style=\"margin-top:{}px;font:600 11px/1 {};letter-spacing:.1em;color:#5B4FD0\">{}</div>",
@@ -370,7 +310,6 @@ pub mod email {
         )
     }
 
-    /// Pill colours per severity: background, text and lit dots, unlit dots.
     fn pill(s: Severity) -> (&'static str, &'static str, &'static str) {
         match s {
             Severity::Critical => ("#FCE8EB", "#D9344C", "#F0A5B1"),
@@ -389,7 +328,6 @@ pub mod email {
         }
     }
 
-    /// One spec-grid cell: a small label over a monospace value.
     fn cell(label: &str, value: &str, td_attrs: &str, borders: &str) -> String {
         format!(
             "<td class=\"hm-line\" {} style=\"padding:14px 16px;border-color:#E3E1EF;border-style:solid;border-width:0;vertical-align:top{}\">\
@@ -403,13 +341,6 @@ pub mod email {
         )
     }
 
-    /// The alert as a branded, mail-client-safe page: tables and inline
-    /// styles only, the two logos carried inline (nothing remote), a hidden
-    /// preheader for the inbox preview, and a dark palette for clients that
-    /// honour `prefers-color-scheme`. An ink header band with the lockup,
-    /// the severity as a pill with a drawn four-dot meter (Unicode glyphs
-    /// turn into emoji in some clients), a spec grid, the risk, numbered
-    /// steps and both CLI commands in one terminal block.
     pub fn html(alert: &Alert) -> String {
         let sev = alert.severity;
         let (pill_bg, pill_fg, pill_off) = pill(sev);
@@ -435,7 +366,6 @@ pub mod email {
             "<body class=\"hm-bg\" style=\"margin:0;padding:0;background:#F4F4F8;font-family:{};color:#17142E\">",
             SANS
         ));
-        // Inbox preview text, padded so clients don't pull body text after it.
         let preview =
             super::telegram::clip(&format!("{} \u{00B7} {}", alert.host, alert.what), 140);
         h.push_str(&format!(
@@ -448,8 +378,6 @@ pub mod email {
              <tr><td align=\"center\" style=\"padding:32px 12px 36px\">\
              <table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;max-width:600px\">",
         );
-        // Header band: the lockup (inline PNG, already on the ink colour)
-        // and the reference.
         h.push_str(&format!(
             "<tr><td class=\"hm-pad\" style=\"background:#17142E;border-radius:16px 16px 0 0;padding:22px 32px\">\
              <table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\"><tr>\
@@ -464,7 +392,6 @@ pub mod email {
         h.push_str(
             "<tr><td class=\"hm-card hm-pad\" style=\"background:#FFFFFF;border:1px solid #E3E1EF;border-top:0;border-radius:0 0 16px 16px;padding:32px 32px 34px\">",
         );
-        // Severity pill with a drawn meter, then the detection.
         let mut dots = String::new();
         for i in 0..4 {
             let style = if i < lit_dots(sev) {
@@ -508,7 +435,6 @@ pub mod email {
                 esc(&alert.what)
             ));
         }
-        // Spec grid: host and time side by side, then one row per fact.
         h.push_str(
             "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" class=\"hm-line\" \
              style=\"margin-top:26px;border:1px solid #E3E1EF;border-radius:12px;border-collapse:separate;overflow:hidden\">",
@@ -592,7 +518,6 @@ pub mod email {
             }
             h.push_str("</table>");
         }
-        // Both commands in one terminal block.
         h.push_str(&format!(
             "<div style=\"margin-top:30px;background:#0F0E17;border-radius:12px;padding:16px 18px\">\
              <div style=\"font:600 10.5px/1 {mono};letter-spacing:.1em;color:#8D8AA8\">ON <span style=\"letter-spacing:0\">{host}</span></div>\
@@ -637,8 +562,6 @@ pub mod email {
         }
         let plain = render(alert, Theme::Plain);
         let png = ContentType::parse("image/png").map_err(|e| format!("build message: {}", e))?;
-        // alternative(plain, related(html, logos)): the standard shape for
-        // HTML mail with inline images.
         b.multipart(
             MultiPart::alternative()
                 .singlepart(
@@ -666,8 +589,6 @@ pub mod email {
         .map_err(|e| format!("build message: {}", e))
     }
 
-    /// Credentials over a cleartext connection to another host give the
-    /// password to anyone on the path. Local relays (loopback) are fine.
     pub fn cleartext_credentials(cfg: &EmailCfg) -> bool {
         let local = matches!(cfg.smtp_host.as_str(), "localhost" | "127.0.0.1" | "::1")
             || cfg.smtp_host.starts_with("127.");
@@ -707,7 +628,6 @@ pub mod email {
     }
 
     pub fn send(alert: &Alert, cfg: &EmailCfg) -> Result<(), SendError> {
-        // A message we can't build (bad address) won't build on retry either.
         let msg = build(alert, cfg).map_err(SendError::permanent)?;
         match cfg.transport.as_str() {
             "sendmail" => SendmailTransport::new_with_command(&cfg.sendmail_path)
@@ -729,7 +649,6 @@ pub mod email {
         }
     }
 
-    /// Connect and authenticate without sending.
     pub fn probe(cfg: &EmailCfg) -> Result<String, String> {
         match cfg.transport.as_str() {
             "sendmail" => {
@@ -804,7 +723,6 @@ mod tests {
         let b = telegram::body(&a);
         assert!(b.chars().count() <= 4096, "{}", b.chars().count());
         assert!(b.ends_with("<code>hermian show HER-1</code>"));
-        // Never a dangling entity or tag.
         for (open, close) in [
             ("<code>", "</code>"),
             ("<pre>", "</pre>"),
@@ -824,7 +742,6 @@ mod tests {
     #[test]
     fn telegram_body_has_a_meter_and_no_emoji() {
         let b = telegram::body(&alert());
-        // No emoji anywhere: severity is a word and a dot meter.
         assert!(!b.chars().any(|c| c as u32 >= 0x1F000), "{}", b);
         assert!(
             b.starts_with(
@@ -836,8 +753,6 @@ mod tests {
         assert!(b.ends_with("<code>hermian show HER-2025-0101-007</code>"));
     }
 
-    /// Header (meter, level, family), headline, the sentence as a quote,
-    /// the fact sheet, the risk and steps collapsed, then the command.
     #[test]
     fn telegram_body_layout() {
         let mut a = alert();
@@ -860,7 +775,6 @@ mod tests {
             at += i + part.len();
         }
         assert_eq!(at, b.len(), "{}", b);
-        // The bot's name says who's talking.
         assert!(
             !b.contains("HERMIAN") && !b.contains("hermian \u{00B7}"),
             "{}",
@@ -868,8 +782,6 @@ mod tests {
         );
     }
 
-    /// The process chain shows on the fact sheet; no risk or steps means no
-    /// collapsed section.
     #[test]
     fn telegram_fact_sheet_has_the_chain() {
         use hermian_core::alert::ChainNode;
@@ -916,8 +828,6 @@ mod tests {
         );
     }
 
-    /// The chain renders like a terminal, the flagged process in red, and
-    /// everything user-controlled is escaped.
     #[test]
     fn email_html_chain_and_escaping() {
         use hermian_core::alert::ChainNode;
@@ -982,7 +892,6 @@ mod tests {
         let h = email::html(&a);
         assert!(h.contains("&lt;modified&gt;"));
         assert!(h.contains("hermian show HER-2025-0101-007"));
-        // Critical pill, four lit dots, the detection beside it.
         assert!(h.contains("background:#FCE8EB"));
         assert_eq!(
             h.matches("vertical-align:middle;background:#D9344C")
@@ -990,7 +899,6 @@ mod tests {
             4
         );
         assert!(h.contains("D3 \u{00B7} PERSISTENCE MODIFICATION"));
-        // Header band and footer logos by Content-ID, the spec grid, both commands.
         assert!(h.contains("<img src=\"cid:hermian-lockup\""));
         assert!(h.contains("<img src=\"cid:hermian-company\""));
         assert!(h.contains(">HOST<") && h.contains(">DETECTED<") && h.contains(">PRELOADS<"));
@@ -1002,9 +910,6 @@ mod tests {
         assert_eq!(h.matches("<img").count(), 2, "only the inline logos");
     }
 
-    /// The logos travel inside the message: the HTML and the PNGs share a
-    /// multipart/related part, and each PNG carries the Content-ID the HTML
-    /// points at. The plain-text alternative stays.
     #[test]
     fn email_carries_the_logos_inline() {
         let cfg = EmailCfg {
@@ -1020,7 +925,6 @@ mod tests {
         assert!(raw.contains("Content-Disposition: inline"), "{}", raw);
         assert!(raw.contains("Content-Type: image/png"), "{}", raw);
         assert!(raw.contains("Content-Type: text/plain"), "{}", raw);
-        // Real PNGs, and small.
         for png in [email::LOCKUP_PNG, email::COMPANY_PNG] {
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
             assert!(png.len() < 2048);

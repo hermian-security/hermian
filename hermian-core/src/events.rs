@@ -29,7 +29,6 @@ impl Severity {
         }
     }
 
-    /// Whether this severity should interrupt a human (notify) rather than just be logged.
     pub fn is_actionable(&self) -> bool {
         *self >= Severity::High
     }
@@ -62,7 +61,6 @@ pub enum DetectionId {
     D3,
     D4,
     D5,
-    /// Self-protection and daemon lifecycle events (integrity, config, delivery).
     Self_,
 }
 
@@ -78,7 +76,6 @@ impl DetectionId {
         }
     }
 
-    /// One or two words for message headers ("◉◉◉○ HIGH · Persistence").
     pub fn family(&self) -> &'static str {
         match self {
             DetectionId::D1 => "Process chain",
@@ -135,9 +132,6 @@ pub struct ProcInfo {
     pub container: bool,
     pub container_id: Option<String>,
     pub seen_at: DateTime<Utc>,
-    /// Programs this PID ran *before* the current image (newest first). A
-    /// shell that tail-calls `exec /tmp/x` keeps its PID, so without this the
-    /// chain would lose the shell. Bounded to a few entries.
     pub previous: Vec<PrevImage>,
 }
 
@@ -207,13 +201,7 @@ pub struct FileEvent {
     pub kind: FileKind,
     pub dev: u64,
     pub ino: u64,
-    /// The process that had the file open, if it could still be identified.
-    /// Editors typically write via temp+rename and have closed the file by the
-    /// time the event is observed, so this is frequently `None`.
     pub writer: Option<WriterInfo>,
-    /// Whether an interactive session (a TTY-attached process or a login /
-    /// sshd / sudo descendant) was active on the host when the change occurred.
-    /// Used as the fallback for session attribution when `writer` is `None`.
     pub session_present: bool,
     pub is_suid: bool,
     pub has_file_caps: bool,
@@ -240,21 +228,15 @@ impl AuthResult {
     }
 }
 
-/// How a login authenticated, when the source log says. Failures and paths
-/// that don't carry it (PAM socket) are `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
     Password,
     PublicKey,
-    /// Keyboard-interactive is usually a password challenge under another
-    /// name; alerts say "(password)".
     KeyboardInteractive,
     Unknown,
 }
 
 impl AuthMethod {
-    /// Map the word sshd logs after "Accepted " ("publickey", "password",
-    /// "keyboard-interactive/pam", ...) to a method.
     pub fn from_ssh_word(word: &str) -> AuthMethod {
         match word {
             "publickey" => AuthMethod::PublicKey,
@@ -264,8 +246,6 @@ impl AuthMethod {
         }
     }
 
-    /// One-word note for alert text: " (key)", " (password)", or empty when
-    /// unknown. Deliberately terse; the CLI explains details if needed.
     pub fn note(&self) -> &'static str {
         match self {
             AuthMethod::PublicKey => " (key)",
@@ -283,35 +263,21 @@ pub struct AuthEvent {
     pub rhost: Option<IpAddr>,
     pub service: String,
     pub tty: String,
-    /// How the login authenticated ("(key)" / "(password)" in alerts).
     pub method: AuthMethod,
-    /// The client's source port, when the log line has it. Together with
-    /// `rhost` it identifies the session, so a response can disconnect that
-    /// login and not every session of the same user.
     pub port: Option<u16>,
-    /// For a public-key login: the key sshd accepted.
     pub key: Option<SshKey>,
 }
 
-/// The key a public-key login used. `kind` and `fingerprint` come from
-/// sshd's own log line (`ssh2: ED25519 SHA256:...`); `file`, `line` and
-/// `comment` are filled in by the daemon when it finds that key in the
-/// user's authorized_keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SshKey {
-    /// "ED25519", "RSA", "ECDSA", "ED25519-CERT", ...
     pub kind: String,
-    /// "SHA256:<base64>", as `ssh-keygen -l` prints it.
     pub fingerprint: String,
     pub file: Option<String>,
-    /// 1-based line in `file`.
     pub line: Option<usize>,
-    /// The comment after the key (often user@machine), when there is one.
     pub comment: Option<String>,
 }
 
 impl SshKey {
-    /// "ED25519 SHA256:abc…xyz": short enough for a chat line.
     pub fn short(&self) -> String {
         let fp = &self.fingerprint;
         let body = fp.strip_prefix("SHA256:").unwrap_or(fp);
@@ -325,7 +291,6 @@ impl SshKey {
         format!("{} {}", self.kind, shown)
     }
 
-    /// Where the key sits, "/root/.ssh/authorized_keys:3", when known.
     pub fn location(&self) -> Option<String> {
         let file = self.file.as_ref()?;
         Some(match self.line {
@@ -400,15 +365,11 @@ pub fn is_container_overlay_path(path: &str) -> bool {
     PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
-/// Temporary artifacts produced by editors and atomic-write tooling. These are
-/// never persistence targets themselves and generate a burst of inotify events
-/// around every legitimate edit.
 pub fn is_editor_artifact(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     if name.is_empty() {
         return false;
     }
-    // vim / neovim swap and backup files, emacs autosave/lock, nano, sed -i, generic tmp.
     name.ends_with(".swp")
         || name.ends_with(".swo")
         || name.ends_with(".swx")
@@ -419,13 +380,13 @@ pub fn is_editor_artifact(path: &str) -> bool {
         || name.starts_with(".sed")
         || name.starts_with(".tmp")
         || name.ends_with(".tmp")
-        || (name.starts_with("tmp.") && name.len() == 10) // mkstemp: tmp.XXXXXX (crontab, dpkg)
+        || (name.starts_with("tmp.") && name.len() == 10)
         || name.ends_with(".dpkg-new")
         || name.ends_with(".dpkg-old")
         || name.ends_with(".dpkg-dist")
         || name.ends_with(".rpmnew")
         || name.ends_with(".rpmsave")
-        || name == "4913" // vim's write-test file
+        || name == "4913"
 }
 
 #[cfg(test)]

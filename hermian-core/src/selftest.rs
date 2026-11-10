@@ -1,7 +1,3 @@
-//! Synthetic attack scenarios run through a fresh engine. Used by `hermian test`
-//! to prove the detection pipeline works end to end on the installed binary,
-//! and to show the operator what a real alert looks like.
-
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -295,8 +291,6 @@ pub fn run_selftests() -> Vec<SelfTestResult> {
         .iter()
         .map(|s| {
             let alerts = (s.run)();
-            // First alert at the highest severity: detection order puts the most
-            // specific rule first, which is the best sample to show.
             let max = alerts
                 .iter()
                 .filter(|a| a.detection == s.detection && a.severity >= s.expected)

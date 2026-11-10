@@ -1,6 +1,3 @@
-//! `hermian audit` and the start-up audit: gather what's on the host for
-//! [`hermian_core::audit`] and ask the package manager who owns what.
-
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -12,13 +9,11 @@ use hermian_core::events::Severity;
 use crate::cli::AuditArgs;
 use crate::ui::Style;
 
-/// Bounds, so a hostile host can't make the audit slow or huge.
 const MAX_PROCESSES: usize = 4_000;
 const MAX_MAPPED_PER_PROCESS: usize = 512;
 const MAX_AUTOSTART_FILES: usize = 500;
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 
-/// Crontabs and shell profiles: files that start programs on their own.
 const AUTOSTART_FILES: &[&str] = &[
     "/etc/crontab",
     "/etc/profile",
@@ -43,7 +38,6 @@ const AUTOSTART_DIRS: &[&str] = &[
 ];
 const HOME_PROFILES: &[&str] = &[".profile", ".bashrc", ".bash_profile", ".zshrc"];
 
-/// Run the audit on this host.
 pub fn run_audit() -> Vec<Sign> {
     let input = gather();
     let owners = Owners::query(&audit::ownership_queries(&input));
@@ -121,10 +115,6 @@ pub fn cmd_audit(args: &AuditArgs) -> Result<()> {
     Ok(())
 }
 
-/// Hermian looking at itself: code mapped into the daemon from where it
-/// shouldn't come, that no package owns, or that /etc/ld.so.preload injects.
-/// `last` is the mapped set judged last time; the package database is only
-/// asked again when it changes. `None`: nothing changed.
 pub fn self_check(last: &mut Vec<String>) -> Option<Vec<Sign>> {
     let mapped = mapped_code(Path::new("/proc/self/maps"));
     if *last == mapped {
@@ -171,7 +161,6 @@ pub fn self_check(last: &mut Vec<String>) -> Option<Vec<Sign>> {
     Some(signs)
 }
 
-/// The alert for a failed self-check.
 pub fn self_finding(signs: &[Sign]) -> Option<hermian_core::Finding> {
     if signs.is_empty() {
         return None;
@@ -210,7 +199,6 @@ pub fn self_finding(signs: &[Sign]) -> Option<hermian_core::Finding> {
 
 fn gather() -> AuditInput {
     AuditInput {
-        // The host's copy: the unit hides this file from the daemon itself.
         preload: crate::procsrc::read_host_view("/etc/ld.so.preload"),
         processes: processes(),
         autostart: autostart_files(),
@@ -235,8 +223,6 @@ fn processes() -> Vec<ProcView> {
             continue;
         }
         let base = entry.path();
-        // Containers bring their own /usr; judging their files against the
-        // host's package database would be noise.
         if fs::read_link(base.join("root"))
             .map(|r| r != Path::new("/"))
             .unwrap_or(true)
@@ -244,7 +230,7 @@ fn processes() -> Vec<ProcView> {
             continue;
         }
         let Ok(exe) = fs::read_link(base.join("exe")) else {
-            continue; // kernel thread, or gone
+            continue;
         };
         let comm = fs::read_to_string(base.join("comm"))
             .map(|s| s.trim().to_string())
@@ -262,14 +248,12 @@ fn processes() -> Vec<ProcView> {
     out
 }
 
-/// File-backed executable mappings, deduplicated.
 fn mapped_code(maps: &Path) -> Vec<String> {
     let Ok(text) = fs::read_to_string(maps) else {
         return Vec::new();
     };
     let mut seen: Vec<String> = Vec::new();
     for line in text.lines() {
-        // address perms offset dev inode, then the path after padding.
         let mut f = line.split_whitespace();
         if !f.nth(1).is_some_and(|perms| perms.contains('x')) {
             continue;
@@ -307,7 +291,6 @@ fn autostart_files() -> Vec<(String, String)> {
     }
     let mut out = Vec::new();
     for p in paths {
-        // Regular files only, never through a symlink, and not huge.
         let Ok(meta) = fs::symlink_metadata(&p) else {
             continue;
         };
@@ -324,9 +307,7 @@ fn autostart_files() -> Vec<(String, String)> {
     out
 }
 
-/// Package ownership for a batch of paths, in one dpkg-query call.
 struct Owners {
-    /// None: no package manager could answer.
     owned: Option<HashSet<String>>,
 }
 
@@ -337,11 +318,8 @@ impl Owners {
                 owned: Some(HashSet::new()),
             };
         }
-        // Merged /usr: dpkg may record /lib/x/libc.so.6 while the kernel
-        // reports /usr/lib/x/libc.so.6, or the other way round. Ask both.
         let mut ask: Vec<String> = Vec::new();
         for p in paths {
-            // dpkg-query -S takes globs (see procsrc::file_in_package_database).
             if p.contains(['*', '?', '[', ']', '\\']) {
                 continue;
             }
@@ -357,7 +335,6 @@ impl Owners {
             .stderr(std::process::Stdio::null())
             .output();
         match out {
-            // 0: all found; 1: some weren't. Both list what was.
             Ok(o) if matches!(o.status.code(), Some(0) | Some(1)) => Owners {
                 owned: Some(parse_dpkg_search(&String::from_utf8_lossy(&o.stdout))),
             },
@@ -374,10 +351,6 @@ impl Owners {
         if path.contains(['*', '?', '[', ']', '\\']) {
             return None;
         }
-        // Only files that are there. A library replaced by an upgrade while
-        // a process still maps it (not always marked "(deleted)"), or a
-        // program a cron line only tests for (`test -x /usr/sbin/anacron`),
-        // isn't evidence of anything.
         if !exists(path) {
             return None;
         }
@@ -385,7 +358,6 @@ impl Owners {
     }
 }
 
-/// /usr/lib/x <-> /lib/x, /usr/bin/x <-> /bin/x, and so on.
 fn usr_alias(p: &str) -> Option<String> {
     for d in ["bin", "sbin", "lib", "lib64"] {
         if let Some(rest) = p.strip_prefix(&format!("/usr/{}/", d)) {
@@ -398,8 +370,6 @@ fn usr_alias(p: &str) -> Option<String> {
     None
 }
 
-/// `dpkg-query -S` lines: "pkg1, pkg2: /path" and
-/// "diversion by pkg from: /path".
 fn parse_dpkg_search(stdout: &str) -> HashSet<String> {
     stdout
         .lines()
@@ -438,7 +408,6 @@ mod tests {
             owners.owned_if("/usr/lib/libfsnldev.so", there),
             Some(false)
         );
-        // Gone (upgraded, or only tested for in a cron line): no verdict.
         assert_eq!(owners.owned_if("/usr/lib/libfsnldev.so", |_| false), None);
         assert_eq!(Owners { owned: None }.owned_if("/usr/bin/x", there), None);
         assert_eq!(usr_alias("/usr/bin/perfcc").as_deref(), Some("/bin/perfcc"));

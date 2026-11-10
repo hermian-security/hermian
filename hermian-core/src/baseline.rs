@@ -10,56 +10,27 @@ pub struct Baseline {
     pub started_at: Option<DateTime<Utc>>,
     pub duration_hours: u32,
     pub complete: bool,
-    /// Successful SSH login sources, recorded for the lifetime of the install.
-    /// The learning window only gates when novelty is judged; learning keeps
-    /// going afterwards so a source is "new" exactly once, not every time it
-    /// appears after the window closed.
     pub known_ssh_sources: HashSet<IpAddr>,
-    /// Destinations of outbound connections, recorded lifetime-wide like
-    /// `known_ssh_sources`.
     pub known_dests: HashSet<IpAddr>,
-    /// The networks of `known_dests` (see [`dest_net`]). Derived, not saved:
-    /// rebuilt by [`Baseline::index_dests`] when a baseline is loaded.
     #[serde(skip)]
     pub known_dest_nets: HashSet<IpAddr>,
-    /// Connecting programs (see `connector_key`), recorded lifetime-wide.
     pub known_connectors: HashSet<String>,
-    /// Sources that have successfully logged in as root. Separate from
-    /// `known_ssh_sources` so the root rule can ask "has this source ever
-    /// logged in as root", not just "is this source normal".
     #[serde(default)]
     pub root_sources: HashSet<IpAddr>,
-    /// How `known_connectors` keys were built. Baselines written before the
-    /// scheme existed (0) keyed on the chain's root, which was nearly always
-    /// systemd, so they're relearned rather than trusted.
     #[serde(default)]
     pub connector_scheme: u8,
-    /// While set, connectors are being relearned after a scheme change and
-    /// connector novelty isn't judged.
     #[serde(default)]
     pub connectors_relearn_until: Option<DateTime<Utc>>,
-    /// Keys that have logged in, as "<user> SHA256:<fingerprint>",
-    /// lifetime-wide. A login with one of these from a new address on a
-    /// network the account already logs in from is routine (dynamic IPs).
     #[serde(default)]
     pub known_keys: HashSet<String>,
-    /// Hidden sshd key sources already reported, as "<Setting> <path>".
     #[serde(default)]
     pub reported_sshd_key_sources: HashSet<String>,
 }
 
-/// Current `known_connectors` key scheme: the connecting process's own exe.
 pub const CONNECTOR_SCHEME: u8 = 1;
 
-/// Most entries learned per set. A busy host (or a hostile one, during the
-/// learning window) could otherwise grow these, and baseline.json, without
-/// limit. Past the cap, unseen values are simply novel.
 pub const MAX_LEARNED: usize = 50_000;
 
-/// The network a login source is judged by when the key is already known:
-/// its /16 (IPv4, including v4-mapped IPv6) or /32 (IPv6). Home and mobile
-/// connections change address inside their provider's block; a different
-/// provider or country is a different network.
 pub fn source_net(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & 0xffff_0000).into()),
@@ -70,9 +41,6 @@ pub fn source_net(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// The network a destination is judged by: its /24 (IPv4, including
-/// v4-mapped IPv6) or /64 (IPv6). APIs and CDNs rotate addresses inside a
-/// block, and each new address used to page "new external destination".
 pub fn dest_net(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(v4) => IpAddr::V4((u32::from(v4) & 0xffff_ff00).into()),
@@ -122,18 +90,12 @@ impl Baseline {
         }
     }
 
-    /// No learning period: novelty is judged from `now` on, against an empty
-    /// baseline (`hermian enable --no-baseline`, for freshly provisioned
-    /// hosts). Unlike `new(false, ..)`, novelty rules stay on.
     pub fn judging_from(now: DateTime<Utc>, duration_hours: u32) -> Self {
         let mut b = Baseline::new(true, duration_hours, now);
         b.complete = true;
         b
     }
 
-    /// Drop connector keys built with an older scheme. A finished baseline
-    /// relearns connectors for another `duration_hours` instead of flagging
-    /// every program as new.
     pub fn migrate_connectors(&mut self, now: DateTime<Utc>) {
         if self.connector_scheme >= CONNECTOR_SCHEME {
             return;
@@ -152,7 +114,6 @@ impl Baseline {
             .unwrap_or(false)
     }
 
-    /// Record a successful root login; returns true if the source was new.
     pub fn observe_root_source(&mut self, ip: IpAddr) -> bool {
         if self.root_sources.len() >= MAX_LEARNED {
             return false;
@@ -164,13 +125,11 @@ impl Baseline {
         self.root_sources.contains(&ip)
     }
 
-    /// Whether root has logged in from `ip`'s network (see [`source_net`]).
     pub fn root_net_is_known(&self, ip: IpAddr) -> bool {
         let net = source_net(ip);
         self.root_sources.iter().any(|s| source_net(*s) == net)
     }
 
-    /// Whether anyone has logged in from `ip`'s network.
     pub fn ssh_net_is_known(&self, ip: IpAddr) -> bool {
         let net = source_net(ip);
         self.known_ssh_sources.iter().any(|s| source_net(*s) == net)
@@ -182,7 +141,6 @@ impl Baseline {
         }
     }
 
-    /// Record a hidden sshd key source; true the first time it's seen.
     pub fn observe_sshd_key_source(&mut self, setting: &str, path: &str) -> bool {
         if self.reported_sshd_key_sources.len() >= MAX_LEARNED {
             return false;
@@ -196,9 +154,6 @@ impl Baseline {
             .contains(&format!("{} {}", user, fingerprint))
     }
 
-    /// True once the baseline has finished learning and novelty judgements are
-    /// meaningful. A disabled baseline never learned anything, so treating all
-    /// traffic as "novel" would be pure noise; it returns `false` here.
     pub fn can_judge_novelty(&self) -> bool {
         self.enabled && self.complete
     }
@@ -208,8 +163,6 @@ impl Baseline {
             return None;
         }
         let started = self.started_at?;
-        // duration_hours comes from baseline.json too, which isn't validated:
-        // clamp it rather than let chrono panic on overflow.
         let hours = self.duration_hours.min(crate::config::MAX_BASELINE_HOURS) as i64;
         let deadline = started.checked_add_signed(Duration::hours(hours))?;
         let rem = deadline - now;
@@ -240,7 +193,6 @@ impl Baseline {
 
     pub fn observe_dest(&mut self, ip: IpAddr, now: DateTime<Utc>) {
         self.check_completion(now);
-        // Not destinations anyone calls out to; they only fill the set.
         if ip.is_unspecified() || ip.is_loopback() {
             return;
         }
@@ -252,7 +204,6 @@ impl Baseline {
         }
     }
 
-    /// Rebuild the derived network set after loading from disk.
     pub fn index_dests(&mut self) {
         let nets: Vec<IpAddr> = self.known_dests.iter().map(|ip| dest_net(*ip)).collect();
         for net in nets {
@@ -263,8 +214,6 @@ impl Baseline {
         }
     }
 
-    /// The relearn window only suppresses judging (see `can_judge_connectors`);
-    /// observation itself is lifetime-wide like the other sets.
     pub fn observe_connector(&mut self, key: &str, now: DateTime<Utc>) {
         self.check_completion(now);
         if self.known_connectors.len() < MAX_LEARNED {
@@ -272,7 +221,6 @@ impl Baseline {
         }
     }
 
-    /// Whether connector novelty can be judged at `now`.
     pub fn can_judge_connectors(&self, now: DateTime<Utc>) -> bool {
         self.can_judge_novelty() && !self.relearning_connectors(now)
     }
@@ -281,7 +229,6 @@ impl Baseline {
         self.known_ssh_sources.contains(&ip)
     }
 
-    /// Known if this address, or another in its network, was seen before.
     pub fn dest_is_known(&self, ip: IpAddr) -> bool {
         self.known_dests.contains(&ip) || self.known_dest_nets.contains(&dest_net(ip))
     }
@@ -311,18 +258,15 @@ mod tests {
         let mut b = Baseline::new(true, 24, t0);
         b.observe_dest("198.51.100.7".parse().unwrap(), t0);
         b.observe_dest("2001:db8:1:2::5".parse().unwrap(), t0);
-        // Same /24 or /64: a rotated address isn't new.
         assert!(b.dest_is_known("198.51.100.200".parse().unwrap()));
         assert!(b.dest_is_known("::ffff:198.51.100.9".parse().unwrap()));
         assert!(b.dest_is_known("2001:db8:1:2:ffff::1".parse().unwrap()));
-        // Next block over is.
         assert!(!b.dest_is_known("198.51.101.7".parse().unwrap()));
         assert!(!b.dest_is_known("2001:db8:1:3::5".parse().unwrap()));
     }
 
     #[test]
     fn dest_networks_are_rebuilt_after_loading() {
-        // baseline.json keeps plain addresses; the network set isn't saved.
         let mut b: Baseline = serde_json::from_str(
             r#"{"enabled":true,"complete":true,"known_dests":["203.0.113.5"]}"#,
         )
@@ -366,7 +310,6 @@ mod tests {
     #[test]
     fn legacy_connector_keys_are_relearned() {
         let t0 = now();
-        // A pre-scheme baseline.json: finished, keyed on "systemd|uid".
         let mut b: Baseline = serde_json::from_str(
             r#"{"enabled":true,"complete":true,"duration_hours":24,
                 "known_connectors":["/usr/lib/systemd/systemd|0"]}"#,
@@ -382,18 +325,11 @@ mod tests {
         assert!(b.can_judge_connectors(later));
         assert!(b.connector_is_known("/usr/sbin/nginx|33"));
         b.observe_connector("/tmp/x|33", later);
-        // Observation keeps recording after the window, so a reconnect from
-        // this program is known and won't be judged novel again.
         assert!(b.connector_is_known("/tmp/x|33"));
-        // Idempotent for current-scheme baselines.
         b.migrate_connectors(later);
         assert!(b.connector_is_known("/usr/sbin/nginx|33"));
     }
 
-    /// The sets used to freeze when the learning window closed, so anything
-    /// first seen afterwards re-alerted on every later occurrence (a login
-    /// from one IP paged "new source" indefinitely). They now learn for the
-    /// lifetime of the install; only judgement waits for the window.
     #[test]
     fn known_sets_keep_learning_after_the_window() {
         let t0 = now();
@@ -411,12 +347,9 @@ mod tests {
         assert!(b.ssh_source_is_known(src));
         assert!(b.dest_is_known(dst));
         assert!(b.connector_is_known("/usr/bin/curl|0"));
-        // A value never observed is still novel.
         assert!(!b.ssh_source_is_known("192.0.2.99".parse().unwrap()));
     }
 
-    /// `--no-baseline` used to write a disabled baseline: every novelty rule
-    /// went quiet for good. It now means "judge from now on".
     #[test]
     fn judging_from_now_keeps_novelty_on() {
         let b = Baseline::judging_from(now(), 24);

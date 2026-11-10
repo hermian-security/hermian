@@ -1,24 +1,3 @@
-//! `pam_hermian.so` - a passive PAM module that reports authentication
-//! outcomes to the Hermian daemon over a local datagram socket.
-//!
-//! It never influences the authentication decision (always returns
-//! `PAM_IGNORE`), never reads credentials, and fails silently when the daemon
-//! is not running so it can never lock anyone out.
-//!
-//! It runs inside sshd and login, and the workspace builds with
-//! `panic = "abort"` (a profile setting that can't differ per crate), so a
-//! panic here would kill the login process. The code is kept free of panic
-//! paths: no indexing, no unwrap, no JSON library, just bounded string
-//! building and three syscalls.
-//!
-//! `/etc/pam.d/sshd` lines (installed by `hermian enable --with-pam`). Use the
-//! absolute path: a bare `pam_hermian.so` is looked up in libpam's own
-//! directory, not `/usr/lib/security`, and silently never loads.
-//! ```text
-//! auth    optional    /usr/lib/security/pam_hermian.so
-//! session optional    /usr/lib/security/pam_hermian.so
-//! ```
-
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,8 +16,6 @@ extern "C" {
     fn pam_get_item(pamh: *const c_void, item_type: c_int, item: *mut *const c_void) -> c_int;
 }
 
-/// Longest value sent per field. PAM_USER comes from the remote client, and
-/// the whole datagram must fit the daemon's receive buffer.
 const MAX_FIELD_CHARS: usize = 512;
 
 unsafe fn get_item(pamh: *const c_void, item_type: c_int) -> String {
@@ -50,7 +27,6 @@ unsafe fn get_item(pamh: *const c_void, item_type: c_int) -> String {
     clip(&s)
 }
 
-/// Cut to [`MAX_FIELD_CHARS`] on a char boundary, marking the cut.
 fn clip(s: &str) -> String {
     if s.chars().count() <= MAX_FIELD_CHARS {
         return s.to_string();
@@ -61,7 +37,6 @@ fn clip(s: &str) -> String {
 }
 
 fn report(pamh: *const c_void, result: &str) {
-    // SAFETY: pamh is a live handle supplied by libpam for the duration of the call.
     let (user, rhost, service, tty) = unsafe {
         (
             get_item(pamh, PAM_USER),
@@ -77,7 +52,6 @@ fn report(pamh: *const c_void, result: &str) {
     send_datagram(&payload(ts, result, &user, &rhost, &service, &tty));
 }
 
-/// The datagram: one flat JSON object the daemon's parser expects.
 fn payload(ts: u64, result: &str, user: &str, rhost: &str, service: &str, tty: &str) -> String {
     let mut out =
         String::with_capacity(64 + 6 * (user.len() + rhost.len() + service.len() + tty.len()));
@@ -100,8 +74,6 @@ fn payload(ts: u64, result: &str, user: &str, rhost: &str, service: &str, tty: &
     out
 }
 
-/// JSON string escaping (RFC 8259): quotes, backslashes and control
-/// characters. Everything else is valid UTF-8 already.
 fn json_escape_into(out: &mut String, s: &str) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     for c in s.chars() {
@@ -114,7 +86,6 @@ fn json_escape_into(out: &mut String, s: &str) {
             c if (c as u32) < 0x20 => {
                 let b = c as u32;
                 out.push_str("\\u00");
-                // b < 0x20, so both nibbles index within HEX.
                 for nib in [(b >> 4) & 0xf, b & 0xf] {
                     if let Some(h) = HEX.get(nib as usize) {
                         out.push(char::from(*h));
@@ -127,8 +98,6 @@ fn json_escape_into(out: &mut String, s: &str) {
 }
 
 fn send_datagram(payload: &str) {
-    // SAFETY: plain socket/sendto/close on a freshly created fd; sockaddr_un is
-    // zero-initialised and the path is NUL-terminated and shorter than sun_path.
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
         if fd < 0 {
@@ -138,7 +107,6 @@ fn send_datagram(payload: &str) {
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
         let n = SOCKET_PATH.len().min(addr.sun_path.len());
         for (dst, src) in addr.sun_path.iter_mut().zip(SOCKET_PATH.iter().take(n)) {
-            // c_char is i8 on x86_64 and u8 on aarch64; this writes the byte either way.
             *dst = libc::c_char::from_ne_bytes([*src]);
         }
         let len = (std::mem::size_of::<libc::sa_family_t>() + n) as libc::socklen_t;
@@ -154,7 +122,6 @@ fn send_datagram(payload: &str) {
     }
 }
 
-/// Called for every authentication attempt, before the outcome is known.
 #[no_mangle]
 pub extern "C" fn pam_sm_authenticate(
     pamh: *mut c_void,
@@ -166,7 +133,6 @@ pub extern "C" fn pam_sm_authenticate(
     PAM_IGNORE
 }
 
-/// `setcred` runs on both success and failure paths, so it carries no signal.
 #[no_mangle]
 pub extern "C" fn pam_sm_setcred(
     _pamh: *mut c_void,
@@ -177,7 +143,6 @@ pub extern "C" fn pam_sm_setcred(
     PAM_IGNORE
 }
 
-/// A session only opens after successful authentication - the reliable signal.
 #[no_mangle]
 pub extern "C" fn pam_sm_open_session(
     pamh: *mut c_void,
@@ -217,7 +182,6 @@ mod tests {
     fn payload_is_valid_json_with_hostile_fields() {
         let user = "eve\"},\"result\":\"success\\\n\u{1}x";
         let p = payload(1700000000, "attempt", user, "198.51.100.7", "sshd", "ssh");
-        // The parser the daemon uses must read back exactly what was sent.
         let v: serde_json::Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["ts"], 1700000000);
         assert_eq!(v["result"], "attempt");

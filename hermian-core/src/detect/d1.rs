@@ -1,5 +1,3 @@
-//! D1 - Suspicious process chains.
-
 use crate::alert::Finding;
 use crate::detect::Ctx;
 use crate::events::{is_suspicious_exec_dir, DetectionId, ExecEvent, ProcInfo, Severity};
@@ -10,10 +8,6 @@ pub fn evaluate(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     let chain = ctx.tree.chain_of(ev.pid);
     let roles: Vec<Role> = chain.iter().map(|p| role_of(&p.comm, &p.exe)).collect();
 
-    // (A container entrypoint's `sh -c` has the runtime's shim as its parent,
-    // not a web server, so it never matches these. The old "ppid == 1 in a
-    // container" check compared a host ppid with a namespace one and never
-    // fired.)
     findings.extend(service_to_shell(ev, ctx, &roles, Role::WebServer));
     findings.extend(service_to_shell(ev, ctx, &roles, Role::Database));
     findings.extend(web_shell_downloader_exec(ev, ctx, &roles));
@@ -24,9 +18,6 @@ pub fn evaluate(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     findings
 }
 
-/// Programs that only set something up and then exec the real command.
-/// `env sh`, `setsid bash`, `nohup sh -c` (or Java's Runtime.exec through
-/// `/usr/bin/env`) put one of these between the service and the shell.
 const WRAPPERS: &[&str] = &[
     "env", "setsid", "nohup", "timeout", "nice", "ionice", "stdbuf", "chrt", "taskset", "xargs",
     "script", "unbuffer", "flock",
@@ -37,22 +28,11 @@ fn is_wrapper(p: &ProcInfo) -> bool {
     WRAPPERS.contains(&p.comm.as_str()) || WRAPPERS.contains(&base)
 }
 
-/// Where the service sits relative to the process being judged.
 struct ServiceLink {
-    /// Index of the service in the chain.
     idx: usize,
-    /// Non-wrapper processes between the service and the judged process
-    /// (`nginx -> perl -> sh` has one: perl). Empty for a direct child.
     via: Vec<usize>,
 }
 
-/// The nearest `service` ancestor of `chain[last]`.
-///
-/// Only the effective parent used to count, so any program in between
-/// (`nginx -> perl -> sh`, `nginx -> awk 'BEGIN{system("sh")}'`) hid a web
-/// shell completely. Now the closest service up the chain counts, unless a
-/// shell already sits in between: that shell was the one reported, and its
-/// descendants are judged by the download/exec rules instead.
 fn service_link(
     chain: &[ProcInfo],
     roles: &[Role],
@@ -69,9 +49,6 @@ fn service_link(
     Some(ServiceLink { idx, via })
 }
 
-/// Whether the allowlist covers this pair, either as service -> child or as
-/// the immediate (non-wrapper) parent -> child, so an expected CGI wrapper
-/// (`fcgiwrap -> sh`) can be allowed without allowing every nginx shell.
 fn link_allowed(ev: &ExecEvent, ctx: &Ctx, chain: &[ProcInfo], link: &ServiceLink) -> bool {
     let user = ctx.user_name(ev.uid);
     let mut parents = vec![&chain[link.idx]];
@@ -84,7 +61,6 @@ fn link_allowed(ev: &ExecEvent, ctx: &Ctx, chain: &[ProcInfo], link: &ServiceLin
     })
 }
 
-/// " (via perl, awk)" for an indirect link, "" for a direct child.
 fn via_label(chain: &[ProcInfo], link: &ServiceLink) -> String {
     if link.via.is_empty() {
         return String::new();
@@ -93,7 +69,6 @@ fn via_label(chain: &[ProcInfo], link: &ServiceLink) -> String {
     format!(" (via {})", names.join(", "))
 }
 
-/// Tools that open a raw network channel: reverse/bind shells, relays.
 const NETCAT_LIKE: &[&str] = &["nc", "ncat", "netcat", "socat", "openssl", "telnet"];
 
 fn is_netcat(ev: &ExecEvent) -> bool {
@@ -107,9 +82,6 @@ fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) ->
     }
     let last = roles.len() - 1;
     let chain = ctx.tree.chain_of(ev.pid);
-    // Shells always; downloaders and netcat-style tools are the next most
-    // common first step. General interpreters are logged, since apps do run
-    // `php artisan` or `python manage.py` legitimately.
     let netcat = is_netcat(ev);
     if roles[last] != Role::Shell {
         return service_to_tool(ev, ctx, &chain, roles, netcat, service);
@@ -148,8 +120,6 @@ fn service_to_shell(ev: &ExecEvent, ctx: &Ctx, roles: &[Role], service: Role) ->
         Role::WebServer => "Web server spawned a shell",
         _ => "Database server spawned a shell",
     };
-    // Keyed on the service, not the shell: `bash -c '... sh ...'` is one
-    // incident, not two.
     Some(
         Finding::new(
             DetectionId::D1,
@@ -184,8 +154,6 @@ fn service_to_tool(
     let last = roles.len() - 1;
     let role = roles[last];
     let link = if netcat {
-        // A relay anywhere under a service is a reverse/bind shell, shell in
-        // between or not; nothing else reports it.
         let idx = (0..last).rev().find(|i| roles[*i] == service)?;
         let via = (idx + 1..last)
             .filter(|i| !is_wrapper(&chain[*i]))
@@ -197,8 +165,6 @@ fn service_to_tool(
     let severity = if netcat || role == Role::Downloader {
         Severity::High
     } else if role == Role::Interpreter && link.via.is_empty() {
-        // An interpreter under another program is that program's business;
-        // only a direct one is logged.
         Severity::Low
     } else {
         return None;
@@ -259,9 +225,6 @@ fn service_to_tool(
     )
 }
 
-/// A downloader that ran recently from the web-shell part of this chain:
-/// `curl ... | sh` and `curl -o x; ./x` make the payload the downloader's
-/// *sibling*, not its child.
 fn recent_sibling_download<'a>(
     ctx: &'a Ctx,
     chain: &[ProcInfo],
@@ -314,8 +277,6 @@ fn web_shell_downloader_exec(ev: &ExecEvent, ctx: &Ctx, roles: &[Role]) -> Optio
     }
 
     let parent_is_downloader = last >= 1 && roles[last - 1] == Role::Downloader;
-    // The payload: a shell/interpreter or a binary outside system dirs, run
-    // after a download from the same web-shell chain.
     let payload_like = matches!(roles[last], Role::Shell | Role::Interpreter)
         || !crate::proctree::is_system_exe_path(&ev.exe);
     let sibling = if parent_is_downloader || !payload_like || last <= shell_idx {
@@ -386,7 +347,6 @@ fn exec_from_transient_dir(ev: &ExecEvent, ctx: &Ctx) -> Option<Finding> {
         )
     }) && ctx.tool_exemption_applies(ev.pid);
 
-    // Severity ladder: flagged chain > unattended > interactive/installer.
     let (severity, title) = if in_flagged {
         (
             Severity::Critical,
@@ -441,9 +401,6 @@ fn exec_from_deleted_inode(ev: &ExecEvent, ctx: &Ctx) -> Option<Finding> {
     if !ev.deleted_exe {
         return None;
     }
-    // Package upgrades replace binaries under running processes; that shows as a
-    // deleted exe for the *already running* process, not for a fresh exec. A fresh
-    // exec from a deleted inode or a memfd is the fileless pattern.
     let is_memfd = ev.exe.contains("memfd:") || ev.argv0.contains("/fd/");
     let parent = ctx.tree.get(ev.ppid);
     let loader = parent
@@ -540,8 +497,6 @@ mod tests {
         eng.process(exec(t, 100, 1, "nginx", "/usr/sbin/nginx"));
     }
 
-    /// cron running a script through sh (sysstat's debian-sa1 every ten
-    /// minutes) was 82% of the test VPS's alert store. It records nothing.
     #[test]
     fn cron_running_a_script_is_not_an_alert() {
         let mut eng = engine(Config::default());
@@ -567,7 +522,6 @@ mod tests {
 
     #[test]
     fn web_shell_behind_an_unknown_program_is_high() {
-        // awk 'BEGIN{system("sh")}': awk has no role of its own.
         let mut eng = engine(Config::default());
         let t = Utc::now();
         base(&mut eng, t);

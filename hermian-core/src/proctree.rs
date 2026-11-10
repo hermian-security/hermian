@@ -160,8 +160,6 @@ const CONTAINER_RUNTIMES: &[&str] = &[
     "systemd-nspawn",
 ];
 
-/// Tools that are scripts, so their exe is the interpreter and only comm
-/// names them. (Debian's adduser is Perl; dnf, ansible and friends are Python.)
 const SCRIPT_TOOLS: &[&str] = &[
     "adduser",
     "deluser",
@@ -178,8 +176,6 @@ const SCRIPT_TOOLS: &[&str] = &[
     "puppet",
     "chef-client",
     "chef-solo",
-    // Build drivers (D4's LD_PRELOAD context): Debian's fakeroot is a shell
-    // script, dpkg-buildpackage is Perl.
     "fakeroot",
     "dpkg-buildpackage",
 ];
@@ -192,8 +188,6 @@ const CRON_DAEMONS: &[&str] = &["cron", "crond", "anacron", "atd"];
 const INIT: &[&str] = &["systemd", "init"];
 const KERNEL_THREADS: &[&str] = &["kthreadd", "rcu_sched", "migration"];
 
-/// Root-owned install locations. Only a binary installed here can claim a
-/// role that exempts it from detection.
 const TRUSTED_EXE_DIRS: &[&str] = &[
     "/usr/bin/",
     "/usr/sbin/",
@@ -212,7 +206,6 @@ const TRUSTED_EXE_DIRS: &[&str] = &[
     "/nix/store/",
 ];
 
-/// Whether `exe` is an intact binary in a root-owned install location.
 pub fn is_trusted_exe(exe: &str) -> bool {
     !exe.ends_with(" (deleted)")
         && !exe.contains("/../")
@@ -228,14 +221,6 @@ fn exe_basename(exe: &str) -> &str {
         .unwrap_or("")
 }
 
-/// Is this process one of the tools in `names`, judged in a way a local user
-/// can't fake?
-///
-/// `comm` is just the binary's file name (or whatever `prctl` set), so a copy
-/// of anything at `/tmp/dpkg` has comm "dpkg". When the exe is known it must
-/// sit in a root-owned directory and either be named like the tool or be a
-/// script interpreter running a known script tool. With no exe (the process
-/// vanished before /proc was read) we fall back to comm.
 pub fn is_system_tool(comm: &str, exe: &str, names: &[&str]) -> bool {
     let c = comm.trim();
     if exe.is_empty() {
@@ -253,19 +238,8 @@ pub fn is_system_tool(comm: &str, exe: &str, names: &[&str]) -> bool {
         && comm_matches(c, SCRIPT_TOOLS)
 }
 
-/// Highest uid of a system account (Debian/RHEL convention). Service
-/// accounts (www-data, postgres, nginx) sit below it; login users above.
 pub const SYSTEM_UID_MAX: u32 = 999;
 
-/// Whether a process that looks like a web server or database really is
-/// one, for decisions an unprivileged user mustn't be able to trigger.
-///
-/// The role itself comes from the name, so a trusted path isn't enough on
-/// its own: `python3 -c 'prctl(PR_SET_NAME, "nginx")'` runs from
-/// `/usr/bin/python3`. Genuine means either the installed binary is named
-/// like the service (`/usr/sbin/nginx`, `/usr/sbin/php-fpm8.2`), or it's a
-/// trusted interpreter hosting one (gunicorn, puma, tomcat) under a system
-/// account rather than a login user.
 pub fn genuine_service(exe: &str, uid: u32) -> bool {
     if !is_trusted_exe(exe) {
         return false;
@@ -277,33 +251,17 @@ pub fn genuine_service(exe: &str, uid: u32) -> bool {
         || uid <= SYSTEM_UID_MAX
 }
 
-/// The exe to record for a process that may be a script tool.
-///
-/// `dnf` or Debian's `adduser` run as `/usr/bin/python3` or `/usr/bin/perl`,
-/// so [`is_system_tool`] trusts them by comm under a system interpreter. But
-/// comm is just the script's file name (or whatever `prctl` set), so
-/// `/tmp/dnf` with a `#!/bin/sh` line, or python renaming itself to `dnf`,
-/// passed as the real package manager.
-///
-/// Given the process's argv, this returns the script's path in place of the
-/// interpreter when comm names a script tool, so the trust check applies to
-/// the script itself. If no argument names the script, it returns a marked
-/// value that no trusted-dir check accepts. Anything else gets `exe` back
-/// unchanged. Callers in the daemon use it wherever they read an exe.
 pub fn script_tool_exe(comm: &str, exe: &str, argv: &[&str]) -> String {
     let c = comm.trim();
     let interp = exe_basename(exe);
     if !comm_matches(c, SCRIPT_TOOLS) || !comm_matches(interp, SCRIPT_INTERPRETERS) {
         return exe.to_string();
     }
-    // argv[0] is the interpreter; the script is a later argument whose file
-    // name is the comm (the kernel truncates comm to 15 bytes).
     let script = argv.iter().skip(1).find(|a| {
         let base = exe_basename(a);
         !base.is_empty() && (base == c || (c.len() == 15 && base.starts_with(c)))
     });
     match script {
-        // A relative path can't be judged; it won't start with a trusted dir.
         Some(s) => s.to_string(),
         None => format!("(unverified script) {}", exe),
     }
@@ -312,10 +270,7 @@ pub fn script_tool_exe(comm: &str, exe: &str, argv: &[&str]) -> String {
 pub fn role_of(comm: &str, exe: &str) -> Role {
     let c = comm.trim();
     let base = exe_basename(exe);
-    // Roles that add suspicion match comm *or* exe name: renaming a copied
-    // shell mustn't hide it.
     let named = |set: &[&str]| comm_matches(c, set) || comm_matches(base, set);
-    // Roles that exempt a process from detection need a trusted exe.
     let tool = |set: &[&str]| is_system_tool(c, exe, set);
     if named(WEB_SERVERS) || exe_contains(exe, &["php-fpm"]) {
         return Role::WebServer;
@@ -326,7 +281,6 @@ pub fn role_of(comm: &str, exe: &str) -> Role {
     if tool(&["sshd", "sshd-session"]) {
         return Role::Sshd;
     }
-    // Tools before shells/interpreters: dnf or adduser's exe *is* python/perl.
     if tool(PACKAGE_MANAGERS) {
         return Role::PackageManager;
     }
@@ -342,7 +296,6 @@ pub fn role_of(comm: &str, exe: &str) -> Role {
     if tool(CRON_DAEMONS) {
         return Role::Cron;
     }
-    // Kernel threads have no exe at all.
     if tool(INIT) || (exe.is_empty() && comm_matches(c, KERNEL_THREADS)) {
         return Role::System;
     }
@@ -358,9 +311,6 @@ pub fn role_of(comm: &str, exe: &str) -> Role {
     Role::Unknown
 }
 
-/// Match `comm` against a set, tolerating versioned or annotated names such as
-/// `python3.11`, `nginx: worker`, `php-fpm8.2`, and the kernel's 15-char comm
-/// truncation (`unattended-upgr`).
 fn comm_matches(c: &str, set: &[&str]) -> bool {
     if c.is_empty() {
         return false;
@@ -408,8 +358,6 @@ const EDITORS: &[&str] = &[
     "vigr",
 ];
 
-/// Text editors, by comm or exe name. Not a trust decision (nothing is
-/// exempted because of it), so the name is enough.
 pub fn is_editor(comm: &str, exe: &str) -> bool {
     comm_matches(comm.trim(), EDITORS) || comm_matches(exe_basename(exe), EDITORS)
 }
@@ -426,8 +374,6 @@ pub fn is_user_mgmt_tool(comm: &str, exe: &str) -> bool {
     is_system_tool(comm, exe, USER_MGMT)
 }
 
-/// Whether `exe` is under a directory where installed software lives, as
-/// opposed to somewhere a payload would be dropped.
 pub fn is_system_exe_path(exe: &str) -> bool {
     const DIRS: &[&str] = &[
         "/usr/",
@@ -441,19 +387,12 @@ pub fn is_system_exe_path(exe: &str) -> bool {
     !exe.contains("/../") && DIRS.iter().any(|d| exe.starts_with(d))
 }
 
-/// How long an exited process stays in the tree: long enough to attribute a
-/// write that inotify reports after the writer is gone, and to keep ancestry
-/// for alerts on its children.
 pub const EXIT_GRACE_SECS: i64 = 300;
 
 #[derive(Debug, Default)]
 pub struct ProcessTree {
     procs: HashMap<u32, ProcInfo>,
-    /// When a tracked pid was seen to exit. Exited processes don't count as
-    /// live sessions, and a new exec on the pid is a new process.
     exited: HashMap<u32, DateTime<Utc>>,
-    /// When the current image was exec'd, for processes we saw start.
-    /// (`ProcInfo::start` mixes units: exec time vs. /proc clock ticks.)
     exec_at: HashMap<u32, DateTime<Utc>>,
 }
 
@@ -471,10 +410,6 @@ impl ProcessTree {
         self.exited.contains_key(&pid)
     }
 
-    /// Reconcile with the set of pids that exist right now: mark the missing
-    /// ones as exited and drop those that exited more than
-    /// [`EXIT_GRACE_SECS`] ago, unless a live process still descends from
-    /// them (its chain would lose them otherwise).
     pub fn reap(&mut self, alive: &std::collections::HashSet<u32>, now: DateTime<Utc>) {
         for pid in self.procs.keys() {
             if !alive.contains(pid) {
@@ -483,10 +418,6 @@ impl ProcessTree {
         }
         self.exited.retain(|pid, _| !alive.contains(pid));
         let cutoff = now - chrono::Duration::seconds(EXIT_GRACE_SECS);
-        // Every ancestor of a live process is kept, not just its parent: a
-        // web shell's own parent exiting (double fork, `setsid`) used to drop
-        // the grandparent, and with it the web server from the chain that
-        // later rules (and exemptions) look at.
         let mut ancestors_of_live: std::collections::HashSet<u32> =
             std::collections::HashSet::new();
         for p in self
@@ -512,20 +443,13 @@ impl ProcessTree {
         }
     }
 
-    /// Maximum re-exec history retained per PID.
     const MAX_PREVIOUS: usize = 4;
 
     pub fn upsert_exec(&mut self, ev: &ExecEvent) {
-        // Same PID re-exec'ing (exec in a shell, wrappers, `env`, setuid
-        // helpers): keep the prior image so the chain still shows the shell.
-        // The old holder of this pid exited: this is a new process (PID
-        // reuse), not a re-exec, so it inherits nothing.
         let reused = self.exited.remove(&ev.pid).is_some();
         let previous = match self.procs.get(&ev.pid) {
             _ if reused => Vec::new(),
-            // Different parent = PID reuse by an unrelated process: start fresh.
             Some(old) if old.ppid != ev.ppid => Vec::new(),
-            // Same image again (re-running the same binary): keep history as is.
             Some(old) if old.comm == ev.comm && old.exe == ev.exe => old.previous.clone(),
             Some(old) => {
                 let mut prev = Vec::with_capacity(Self::MAX_PREVIOUS);
@@ -559,7 +483,6 @@ impl ProcessTree {
         self.exec_at.insert(ev.pid, ev.ts);
     }
 
-    /// Refresh `seen_at` for a live process so pruning does not drop it.
     pub fn touch(&mut self, pid: u32, now: DateTime<Utc>) {
         if let Some(p) = self.procs.get_mut(&pid) {
             p.seen_at = now;
@@ -584,7 +507,6 @@ impl ProcessTree {
         self.procs.is_empty()
     }
 
-    /// Ancestors of `pid`, nearest first. Does not include `pid` itself.
     pub fn ancestors_of(&self, pid: u32) -> Vec<ProcInfo> {
         let mut out = Vec::new();
         let mut current = match self.procs.get(&pid) {
@@ -608,11 +530,6 @@ impl ProcessTree {
         out
     }
 
-    /// Full chain root-first, ending with `pid` (if known).
-    ///
-    /// A PID that re-exec'd is expanded into one node per image (oldest
-    /// first), so `bash -c 'exec /tmp/x'` yields `... -> bash -> x` even
-    /// though both share a PID. Expanded nodes carry the real PID.
     pub fn chain_of(&self, pid: u32) -> Vec<ProcInfo> {
         let mut chain = Vec::new();
         let mut ancestors = self.ancestors_of(pid);
@@ -641,13 +558,6 @@ impl ProcessTree {
         });
     }
 
-    /// True when `pid` (or any ancestor) has a controlling TTY or descends from a
-    /// session daemon (sshd, login, sudo, tmux...).
-    ///
-    /// Not when a web server, database or cron daemon sits in the ancestry: a
-    /// TTY is trivial to get (`python -c 'import pty; pty.spawn("sh")'`,
-    /// `script`), and a web shell that upgrades to a pty, or runs `sudo`, isn't
-    /// an operator at a terminal.
     pub fn has_interactive_session(&self, pid: u32, own_tty_nr: i64) -> bool {
         let ancestors = self.ancestors_of(pid);
         let me = self.procs.get(&pid);
@@ -673,17 +583,6 @@ impl ProcessTree {
             .any(|p| p.tty_nr != 0 || is_session_daemon(&p.comm, &p.exe))
     }
 
-    /// Whether an operator looks active *right now*: a program started from
-    /// an interactive session within `window` of `now` (a `sed -i`, `tee`,
-    /// `crontab`, even if it already exited), or an editor that is running
-    /// in one (vim sessions last for minutes before `:w`).
-    ///
-    /// This is the fallback when a file's writer is gone before it can be
-    /// identified. Asking "is anyone logged in at all?" instead made every
-    /// unattended write look operator-driven while an idle SSH or tmux
-    /// session sat open, which is most of the time on a real server.
-    /// Session daemons themselves (a new sshd, sudo) don't count: logging
-    /// in isn't editing a file.
     pub fn recent_interactive_activity(
         &self,
         now: DateTime<Utc>,
@@ -715,13 +614,6 @@ impl ProcessTree {
         }
     }
 
-    /// Any process matching `pred` that was exec'd or exited within `window`
-    /// of `now`. Used to attribute atomic-rename writes, where the writer has
-    /// already closed the file, to the tool that just ran.
-    ///
-    /// Not `seen_at`: that's refreshed by every connect, so a long-running
-    /// daemon with a matching role (snapd, nix-daemon) would look "recent"
-    /// forever and excuse any write.
     pub fn recent_process(
         &self,
         now: DateTime<Utc>,
@@ -783,22 +675,17 @@ mod tests {
         assert_eq!(role_of("sshd", ""), Role::Sshd);
         assert_eq!(role_of("sshd-session", ""), Role::Sshd);
         assert_eq!(role_of("totally-unknown-binary", ""), Role::Unknown);
-        // No false prefix matches.
         assert_eq!(role_of("shred", ""), Role::Unknown);
         assert_eq!(role_of("nodemon", ""), Role::Unknown);
     }
 
     #[test]
     fn genuine_services_need_more_than_a_name() {
-        // The real binaries.
         assert!(genuine_service("/usr/sbin/nginx", 0));
         assert!(genuine_service("/usr/sbin/php-fpm8.2", 33));
         assert!(genuine_service("/usr/sbin/mysqld", 111));
-        // A login user's python renamed to "nginx" with prctl.
         assert!(!genuine_service("/usr/bin/python3.12", 1000));
-        // A copy in a home dir.
         assert!(!genuine_service("/home/eve/nginx", 33));
-        // gunicorn/puma/tomcat: an interpreter under a service account.
         assert!(genuine_service("/usr/bin/python3.12", 33));
         assert!(genuine_service("/usr/lib/jvm/java-17/bin/java", 998));
     }
@@ -812,24 +699,19 @@ mod tests {
         );
         assert_eq!(real, "/usr/bin/dnf");
         assert_eq!(role_of("dnf", &real), Role::PackageManager);
-        // `#!/bin/sh` script at /tmp/dnf.
         let fake = script_tool_exe("dnf", "/usr/bin/dash", &["/bin/sh", "/tmp/dnf"]);
         assert_eq!(fake, "/tmp/dnf");
         assert_ne!(role_of("dnf", &fake), Role::PackageManager);
-        // Relative path, can't be judged.
         let rel = script_tool_exe("adduser", "/usr/bin/perl", &["/usr/bin/perl", "./adduser"]);
         assert_ne!(role_of("adduser", &rel), Role::UserMgmt);
-        // python renamed itself with prctl: no argument names the script.
         let renamed = script_tool_exe("dnf", "/usr/bin/python3", &["python3", "-c", "..."]);
         assert_ne!(role_of("dnf", &renamed), Role::PackageManager);
-        // Truncated comm.
         let ua = script_tool_exe(
             "unattended-upgr",
             "/usr/bin/python3.12",
             &["/usr/bin/python3", "/usr/bin/unattended-upgrade"],
         );
         assert_eq!(role_of("unattended-upgr", &ua), Role::PackageManager);
-        // Not a script tool: unchanged.
         assert_eq!(
             script_tool_exe("bash", "/usr/bin/bash", &["bash"]),
             "/usr/bin/bash"
@@ -854,7 +736,6 @@ mod tests {
         sudo.exe = "/usr/bin/sudo".into();
         t.upsert(sudo);
         assert!(!t.has_interactive_session(301, 0));
-        // An SSH login with a TTY still is.
         t.upsert(info(50, 1, "sshd"));
         let mut login = info(60, 50, "bash");
         login.exe = "/usr/bin/bash".into();
@@ -865,7 +746,6 @@ mod tests {
 
     #[test]
     fn exempt_roles_need_a_trusted_exe() {
-        // A copy at /tmp/dpkg has comm "dpkg" but isn't a package manager.
         assert_eq!(role_of("dpkg", "/tmp/dpkg"), Role::Unknown);
         assert_eq!(role_of("dpkg", "/usr/bin/dpkg"), Role::PackageManager);
         assert_eq!(role_of("gdb", "/dev/shm/gdb"), Role::Unknown);
@@ -873,19 +753,15 @@ mod tests {
         assert_eq!(role_of("usermod", "/home/x/usermod"), Role::Unknown);
         assert_eq!(role_of("sshd", "/var/tmp/sshd"), Role::Unknown);
         assert_eq!(role_of("systemd", "/tmp/systemd"), Role::Unknown);
-        // Deleted or path-trick binaries aren't trusted either.
         assert_eq!(role_of("dpkg", "/usr/bin/dpkg (deleted)"), Role::Unknown);
         assert_eq!(role_of("dpkg", "/usr/bin/../../tmp/dpkg"), Role::Unknown);
-        // Script tools: exe is the interpreter.
         assert_eq!(role_of("dnf", "/usr/bin/python3.9"), Role::PackageManager);
         assert_eq!(
             role_of("unattended-upgr", "/usr/bin/python3.12"),
             Role::PackageManager
         );
         assert_eq!(role_of("adduser", "/usr/bin/perl"), Role::UserMgmt);
-        // ...but only known script tools.
         assert_eq!(role_of("dpkg", "/usr/bin/python3"), Role::Interpreter);
-        // Kernel threads have no exe.
         assert_eq!(role_of("kthreadd", ""), Role::System);
         assert_eq!(role_of("kthreadd", "/tmp/kthreadd"), Role::Unknown);
     }
@@ -955,10 +831,8 @@ mod tests {
         let comms: Vec<String> = t.chain_of(200).iter().map(|p| p.comm.clone()).collect();
         assert_eq!(comms, vec!["systemd", "nginx", "bash", ".x.sh"]);
         assert!(t.chain_of(200).iter().all(|p| p.previous.is_empty()));
-        // A re-exec to the same image (e.g. re-running the same binary) adds nothing.
         t.upsert_exec(&mk(".x.sh", "/tmp/.x.sh"));
         assert_eq!(t.chain_of(200).len(), 4);
-        // New PID under a different parent: no history carried over.
         let mut fresh = mk("bash", "/usr/bin/bash");
         fresh.ppid = 1;
         t.upsert_exec(&fresh);
@@ -991,12 +865,9 @@ mod tests {
         t.upsert(info(100, 1, "sshd"));
         t.upsert(info(200, 100, "sshd"));
         t.upsert(info(300, 200, "bash"));
-        // The session's processes exit; only systemd and the listener remain.
         let alive: std::collections::HashSet<u32> = [1, 100].into_iter().collect();
         t.reap(&alive, now);
-        // Still in the tree during the grace period...
         assert!(t.get(300).is_some());
-        // ...and gone after it.
         t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
         assert!(t.get(300).is_none() && t.get(200).is_none());
         assert!(t.get(100).is_some());
@@ -1010,7 +881,6 @@ mod tests {
         t.upsert(info(100, 1, "nginx"));
         t.upsert(info(200, 100, "bash"));
         t.upsert(info(300, 200, "implant"));
-        // The shell exited but its child keeps running.
         let alive: std::collections::HashSet<u32> = [1, 100, 300].into_iter().collect();
         t.reap(&alive, now);
         t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
@@ -1027,7 +897,6 @@ mod tests {
         t.upsert(info(200, 100, "sh"));
         t.upsert(info(250, 200, "setsid"));
         t.upsert(info(300, 250, "implant"));
-        // Both the shell and setsid exited; only the implant remains.
         let alive: std::collections::HashSet<u32> = [1, 300].into_iter().collect();
         t.reap(&alive, now);
         t.reap(&alive, now + chrono::Duration::seconds(EXIT_GRACE_SECS + 1));
@@ -1042,7 +911,6 @@ mod tests {
         t.upsert(info(1, 0, "systemd"));
         t.upsert_exec(&exec_ev(500, 1, "bash", now));
         t.reap(&[1].into_iter().collect(), now);
-        // Same pid, same parent, different program: reuse, not re-exec.
         t.upsert_exec(&exec_ev(500, 1, "cron", now));
         let comms: Vec<String> = t.chain_of(500).iter().map(|p| p.comm.clone()).collect();
         assert_eq!(comms, vec!["systemd", "cron"]);
@@ -1053,14 +921,12 @@ mod tests {
     fn a_busy_daemon_is_not_a_recent_process() {
         let mut t = ProcessTree::new();
         let now = Utc::now();
-        // snapd was already running at startup and keeps making connections.
         t.upsert(info(700, 1, "snapd"));
         t.touch(700, now);
         let is_pm = |p: &ProcInfo| p.comm == "snapd" || p.comm == "useradd";
         assert!(t
             .recent_process(now, chrono::Duration::seconds(8), is_pm)
             .is_none());
-        // A tool that just ran does count, including right after it exits.
         t.upsert_exec(&exec_ev(701, 1, "useradd", now));
         assert!(t
             .recent_process(now, chrono::Duration::seconds(8), is_pm)

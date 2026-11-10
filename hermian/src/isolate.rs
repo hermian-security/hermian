@@ -1,13 +1,3 @@
-//! Network isolation via an nftables table owned by Hermian.
-//!
-//! Isolation is never automatic unless `response.auto_isolate = true` *and*
-//! `response.management_cidrs` is non-empty; those CIDRs (and loopback) stay
-//! reachable so the operator can still get in. Connections already open to
-//! anywhere else are cut, not grandfathered in.
-//! DHCP, IPv6 neighbour discovery, the configured DNS resolvers and the
-//! notification endpoints stay open too, so the link survives and alerts
-//! still go out.
-
 use std::net::IpAddr;
 
 use anyhow::{Context, Result};
@@ -42,14 +32,9 @@ pub fn is_isolated() -> bool {
         .unwrap_or(false)
 }
 
-/// What an isolated host may still reach besides the management CIDRs.
 #[derive(Debug, Default, Clone)]
 pub struct Egress {
-    /// Configured DNS resolvers (not "any host on port 53": that's an
-    /// exfiltration and C2 channel).
     pub resolvers: Vec<IpAddr>,
-    /// Notification endpoints, so the alert that triggered isolation (and
-    /// any after it) can still be delivered.
     pub notify: Vec<(IpAddr, u16)>,
 }
 
@@ -61,9 +46,6 @@ fn fam(ip: &IpAddr) -> &'static str {
     }
 }
 
-/// A management CIDR as nft should see it: parsed (never the raw config
-/// string) and with host bits cleared, so `203.0.113.5/24` loads as
-/// `203.0.113.0/24` instead of being rejected.
 fn normalize_cidr(cidr: &str) -> Option<String> {
     let (ip, prefix) = hermian_core::allowlist::parse_cidr(cidr)?;
     let net = match ip {
@@ -79,19 +61,10 @@ fn normalize_cidr(cidr: &str) -> Option<String> {
     Some(format!("{}/{}", net, prefix))
 }
 
-/// Cloud instance metadata. GCE OS Login and similar agents need it for SSH
-/// itself, so cutting it can lock the operator out. It's link-local to the
-/// hypervisor, not a route to the internet.
 const METADATA: &[(&str, &str)] = &[("ip", "169.254.169.254"), ("ip6", "fd00:ec2::254")];
 
-/// ICMP errors tied to a tracked flow (path MTU, unreachable). They carry no
-/// payload, and without them a management SSH session can stall on large
-/// packets.
 const RELATED_ICMP: &str = "    ct state related meta l4proto { icmp, ipv6-icmp } accept\n";
 
-/// Build the complete ruleset as one `nft -f -` script. It creates, deletes
-/// and recreates the table in a single transaction, so there's no window
-/// with the old rules gone and the new ones not yet loaded.
 fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
     let cidrs: Vec<(String, &'static str)> = management_cidrs
         .iter()
@@ -107,8 +80,6 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
         t = TABLE
     ));
     s.push_str(&format!("table inet {t} {{\n", t = TABLE));
-    // Routed traffic (containers, VMs, a host that forwards) never passes the
-    // input/output hooks, so without this chain it wasn't isolated at all.
     s.push_str("  chain forward {\n");
     s.push_str("    type filter hook forward priority -10; policy drop;\n");
     s.push_str(RELATED_ICMP);
@@ -127,10 +98,6 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
             hook
         ));
         s.push_str(&format!("    {} lo accept\n", iface));
-        // No blanket `ct state established accept`: it kept every connection
-        // open at isolation time alive, a reverse shell included. Management
-        // CIDRs are accepted both ways below, so their sessions survive;
-        // the other exceptions only get their replies back.
         s.push_str(RELATED_ICMP);
         for (cidr, fam) in &cidrs {
             s.push_str(&format!("    {} {} {} accept\n", fam, dir, cidr));
@@ -162,9 +129,6 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
                 ));
             }
         }
-        // Keep the link itself alive: IPv6 neighbour/router discovery and
-        // DHCP lease renewal. Without them IPv6 management access breaks at
-        // once and an IPv4 lease eventually expires, locking the operator out.
         s.push_str(
             "    icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, \
              nd-router-advert } accept\n",
@@ -194,8 +158,6 @@ fn ruleset(management_cidrs: &[String], egress: &Egress) -> String {
     s
 }
 
-/// Non-loopback nameservers from resolv.conf. With systemd-resolved the stub
-/// (127.0.0.53) is loopback, so its real upstreams are read too.
 fn resolvers() -> Vec<IpAddr> {
     let mut out: Vec<IpAddr> = ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"]
         .iter()
@@ -212,13 +174,11 @@ fn parse_resolv_conf(content: &str) -> Vec<IpAddr> {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("nameserver"))
         .filter_map(|v| v.split_whitespace().next())
-        // Drop a zone suffix such as fe80::1%eth0.
         .filter_map(|v| v.split('%').next()?.parse::<IpAddr>().ok())
         .filter(|ip| !ip.is_loopback())
         .collect()
 }
 
-/// `host:port` pairs the enabled notifying channels connect to.
 fn notify_targets(n: &NotificationsCfg) -> Vec<(String, u16)> {
     let mut out = Vec::new();
     if n.has_channel("telegram") {
@@ -258,8 +218,6 @@ fn url_host_port(url: &str) -> Option<(String, u16)> {
     }
 }
 
-/// Resolve what isolation must keep reachable. Runs before the ruleset is
-/// applied, while DNS still works.
 pub fn egress_for(n: &NotificationsCfg) -> Egress {
     use std::net::ToSocketAddrs;
     let mut notify: Vec<(IpAddr, u16)> = notify_targets(n)
@@ -279,7 +237,6 @@ pub fn egress_for(n: &NotificationsCfg) -> Egress {
     }
 }
 
-/// Whether this process can change nftables (CAP_NET_ADMIN, bit 12).
 fn has_net_admin() -> bool {
     std::fs::read_to_string("/proc/self/status")
         .ok()
@@ -296,8 +253,6 @@ pub fn apply_isolation(management_cidrs: &[String], egress: &Egress) -> Result<(
     if management_cidrs.is_empty() {
         anyhow::bail!("isolation requires response.management_cidrs in /etc/hermian/config.toml");
     }
-    // Re-checked here: the CLI may run with a config the daemon never
-    // validated, and an unusable CIDR would mean no way back in.
     for c in management_cidrs {
         match hermian_core::allowlist::parse_cidr(c) {
             None => anyhow::bail!("management CIDR '{}' is invalid", c),
@@ -338,7 +293,6 @@ pub fn remove_isolation() -> Result<()> {
     run_nft(&["delete", "table", "inet", TABLE])
 }
 
-/// Transient systemd timer that lifts isolation on its own.
 const REVERT_UNIT: &str = "hermian-unisolate";
 
 fn find_nft() -> Option<&'static str> {
@@ -347,7 +301,6 @@ fn find_nft() -> Option<&'static str> {
         .find(|p| std::path::Path::new(p).is_file())
 }
 
-/// Arguments for `systemd-run` scheduling the revert.
 fn revert_args(minutes: u32, nft: &str) -> Vec<String> {
     vec![
         format!("--unit={}", REVERT_UNIT),
@@ -362,8 +315,6 @@ fn revert_args(minutes: u32, nft: &str) -> Vec<String> {
     ]
 }
 
-/// Lift isolation after `minutes`, via a systemd timer, so it happens even
-/// if the daemon is dead and nobody can log in to undo a wrong CIDR.
 pub fn schedule_revert(minutes: u32) -> Result<()> {
     cancel_revert();
     let nft = find_nft().context("nft not found")?;
@@ -437,7 +388,6 @@ pub fn auto_isolate_if_enabled(cfg: &hermian_core::Config) {
     let cidrs = cfg.response.management_cidrs.clone();
     let notifications = cfg.notifications.clone();
     let revert_mins = cfg.response.auto_isolate_revert_mins;
-    // Everything here shells out or resolves names: keep it off the event loop.
     tokio::task::spawn_blocking(move || {
         if is_isolated() {
             return;
@@ -534,7 +484,6 @@ mod tests {
             input
         );
         assert!(!s.contains("203.0.113.77"));
-        // Garbage never reaches nft.
         let s = ruleset(&["1.2.3.4/24; flush ruleset".into()], &egress());
         assert!(!s.contains("flush"), "{}", s);
     }
@@ -545,8 +494,6 @@ mod tests {
         assert!(e.to_string().contains("matches everything"), "{}", e);
     }
 
-    /// A blanket established-accept kept a reverse shell opened before the
-    /// alert working through isolation.
     #[test]
     fn open_connections_outside_the_exceptions_are_cut() {
         let s = ruleset(&["203.0.113.0/24".into()], &egress());
@@ -606,8 +553,6 @@ mod tests {
         assert!(s.contains("ip daddr 149.154.167.220 tcp dport 443 accept"));
     }
 
-    /// `nft -c` parses and validates without applying. Needs root and nft;
-    /// CI runs it with sudo.
     #[test]
     #[ignore]
     fn nft_accepts_the_ruleset() {

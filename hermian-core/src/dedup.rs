@@ -1,16 +1,3 @@
-//! Signature-based deduplication.
-//!
-//! The first occurrence of a signature is emitted immediately. Repeats inside the
-//! window are counted, and when the window closes a single summary finding is
-//! produced so the operator learns "this kept happening" without N notifications.
-//!
-//! One incident, one page: rules keep per-event detail (a destination, an
-//! executable) out of the signature and name it with [`Finding::varies`]; the
-//! summary lists the values it folded. An incident still recurring when its
-//! window closes gets a longer one next time (5, 15, 45 minutes, then hourly
-//! with the default window), so a miner that keeps calling out pages a few
-//! times an hour instead of every five minutes. A quiet window resets it.
-
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
 
@@ -29,11 +16,8 @@ struct DedupEntry {
     detection: DetectionId,
     severity: Severity,
     title: String,
-    /// Consecutive windows that ended with repeats; lengthens the window.
     streak: u32,
-    /// The last window closed with repeats (a summary went out).
     recurring: bool,
-    /// Distinct `varies` values seen since the last emit, in order.
     varies_label: Option<String>,
     varies_seen: Vec<String>,
     varies_overflow: bool,
@@ -68,17 +52,11 @@ pub enum Decision {
     Suppressed,
 }
 
-/// Entries idle for this many windows are dropped to bound memory.
 const RETENTION_WINDOWS: i32 = 12;
-/// Hard cap on remembered signatures.
 pub const MAX_ENTRIES: usize = 20_000;
-/// Distinct varying values remembered per incident (for the summary).
 const MAX_VARIES: usize = 64;
-/// Values printed in a summary; the rest are counted.
 const SHOWN_VARIES: usize = 5;
-/// Each recurring window is this many times the previous one...
 const STREAK_FACTOR: i32 = 3;
-/// ...up to this long (or the configured window, if that's longer).
 const MAX_STREAK_WINDOW_SECS: i64 = 3_600;
 
 impl Deduper {
@@ -95,7 +73,6 @@ impl Deduper {
             Some(entry) => {
                 let window = window_for(base, entry.streak);
                 entry.last_seen = now;
-                // Escalation always breaks through the window.
                 if finding.severity > entry.severity {
                     entry.severity = finding.severity;
                     entry.title = finding.title.clone();
@@ -107,7 +84,6 @@ impl Deduper {
                     entry.note_varies(finding);
                     Decision::Suppressed
                 } else {
-                    // Still going since the last window: stretch the next one.
                     entry.streak = if entry.recurring || entry.repeats > 0 {
                         entry.streak.saturating_add(1).min(16)
                     } else {
@@ -119,8 +95,6 @@ impl Deduper {
                 }
             }
             None => {
-                // Signatures carry attacker-influenced text (paths, comms):
-                // bound the map by forgetting the longest-idle entry.
                 if self.entries.len() >= MAX_ENTRIES {
                     let idle = self
                         .entries
@@ -151,8 +125,6 @@ impl Deduper {
         }
     }
 
-    /// Close expired windows: emit one summary per signature that repeated, and
-    /// prune long-idle entries.
     pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<Finding> {
         let base = self.window;
         let mut summaries = Vec::new();
@@ -162,14 +134,10 @@ impl Deduper {
                 continue;
             }
             if e.repeats == 0 {
-                // A quiet window: the incident is over, start afresh next time.
                 e.recurring = false;
                 continue;
             }
             e.recurring = true;
-            // Only actionable patterns earn a summary: knowing a HIGH kept
-            // recurring matters, knowing an INFO did is noise. Summaries are
-            // LOW so they are logged distinctly but never page.
             if !e.severity.is_actionable() {
                 e.repeats = 0;
                 continue;
@@ -218,7 +186,6 @@ impl Deduper {
     }
 }
 
-/// The window for an incident that recurred through `streak` windows.
 fn window_for(base: Duration, streak: u32) -> Duration {
     let cap = Duration::seconds(MAX_STREAK_WINDOW_SECS).max(base);
     let mut w = base;
@@ -231,7 +198,6 @@ fn window_for(base: Duration, streak: u32) -> Duration {
     w
 }
 
-/// "a, b, c, d, e, ... (17 distinct)"; "64+" once the list is full.
 fn varies_text(seen: &[String], overflow: bool) -> String {
     let shown = seen
         .iter()
@@ -319,7 +285,6 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].severity, Severity::Low);
         assert!(summaries[0].what.contains("2 more times"));
-        // Second tick has nothing new.
         assert!(d.tick(t0 + Duration::seconds(302)).is_empty());
     }
 
@@ -334,7 +299,6 @@ mod tests {
         let s = d.tick(t0 + Duration::seconds(301));
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].facts[0].label, "Destinations");
-        // The first, emitted value is listed too: the summary covers the incident.
         assert_eq!(s[0].facts[0].value, "10.0.0.0, 10.0.0.1, 10.0.0.2");
     }
 
@@ -353,8 +317,6 @@ mod tests {
         );
     }
 
-    /// The fake httpd on buki spawned a shell every ~5 minutes, just past the
-    /// window, so each one paged. A recurring incident gets a longer window.
     #[test]
     fn recurring_incident_stretches_the_window() {
         let t0 = Utc::now();
@@ -364,15 +326,12 @@ mod tests {
         assert_eq!(d.record("a", at(0), &f), Decision::Emit);
         assert_eq!(d.record("a", at(150), &f), Decision::Suppressed);
         assert_eq!(d.tick(at(300)).len(), 1);
-        // Still going after a window with repeats: pages, then 15 minutes.
         assert_eq!(d.record("a", at(310), &f), Decision::Emit);
         assert_eq!(d.record("a", at(310 + 600), &f), Decision::Suppressed);
         assert_eq!(d.tick(at(310 + 900)).len(), 1);
-        // Then 45 minutes.
         assert_eq!(d.record("a", at(1300), &f), Decision::Emit);
         assert_eq!(d.record("a", at(1300 + 2600), &f), Decision::Suppressed);
         assert_eq!(d.tick(at(1300 + 2700)).len(), 1);
-        // Then capped at an hour.
         assert_eq!(d.record("a", at(4100), &f), Decision::Emit);
         assert_eq!(d.record("a", at(4100 + 3599), &f), Decision::Suppressed);
         assert_eq!(d.record("a", at(4100 + 3600), &f), Decision::Emit);
@@ -387,10 +346,9 @@ mod tests {
         d.record("a", at(0), &f);
         d.record("a", at(100), &f);
         d.tick(at(300));
-        assert_eq!(d.record("a", at(310), &f), Decision::Emit); // 15 min window now
-        d.tick(at(310 + 900)); // nothing happened in it
+        assert_eq!(d.record("a", at(310), &f), Decision::Emit);
+        d.tick(at(310 + 900));
         assert_eq!(d.record("a", at(1300), &f), Decision::Emit);
-        // Back to five minutes.
         assert_eq!(d.record("a", at(1300 + 301), &f), Decision::Emit);
     }
 

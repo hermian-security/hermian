@@ -1,5 +1,3 @@
-//! `hermian uninstall`: remove the unit, state, logs, PAM hook and binary.
-
 use std::fs;
 use std::io::Write;
 
@@ -25,16 +23,11 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         }
     }
 
-    // Stop the daemon first: lifting isolation while it still runs left a
-    // window for it to isolate the host again. The watchdog timer goes too,
-    // or it would point at a binary that is about to disappear.
     for unit in ["hermian-watchdog.timer", "hermian"] {
         let _ = crate::procsrc::system_command("systemctl")
             .args(["disable", "--now", unit])
             .output();
     }
-    // Never leave a host isolated by a tool that is about to disappear, and
-    // drop the blocks made with the Telegram buttons too.
     let _ = isolate::remove_isolation();
     crate::blocklist::remove_table();
 
@@ -59,7 +52,6 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
             );
             continue;
         }
-        // symlink_metadata: never follow a symlink into somewhere else.
         match fs::symlink_metadata(p) {
             Ok(m) if m.is_dir() => {
                 fs::remove_dir_all(p).ok();
@@ -71,15 +63,12 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
         }
     }
     if let Some(cfg_dir) = paths::config_path().parent() {
-        let _ = fs::remove_dir(cfg_dir); // only if empty
+        let _ = fs::remove_dir(cfg_dir);
     }
     let _ = crate::procsrc::system_command("systemctl")
         .args(["daemon-reload"])
         .output();
 
-    // The empty mount point systemd made for the unit's preload bind mount.
-    // Only if it's still empty: content would be someone else's (or a
-    // rootkit's, which is evidence).
     if fs::metadata("/etc/ld.so.preload").is_ok_and(|m| m.is_file() && m.len() == 0) {
         let _ = fs::remove_file("/etc/ld.so.preload");
     }
@@ -89,9 +78,6 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     let _ = fs::remove_file(paths::APT_SOURCES_PATH);
     let _ = fs::remove_file(paths::APT_KEYRING_PATH);
 
-    // Installed from the .deb: let dpkg remove its own files and forget the
-    // package. Deleting the binary by hand left `dpkg -l` showing
-    // "ii hermian", so apt still thought it was installed.
     let purged = package_installed() && purge_package();
     if !purged {
         if package_installed() {
@@ -113,7 +99,6 @@ pub fn run(args: &UninstallArgs) -> Result<()> {
     Ok(())
 }
 
-/// Whether dpkg has the hermian package installed.
 fn package_installed() -> bool {
     crate::procsrc::system_command("dpkg-query")
         .args(["-W", "-f=${Status}", "hermian"])
@@ -122,14 +107,10 @@ fn package_installed() -> bool {
         .unwrap_or(false)
 }
 
-/// "install ok installed" is installed; "half-installed", "config-files"
-/// and "not-installed" aren't, nor is a missing status.
 fn dpkg_status_installed(status: &str) -> bool {
     status.split_whitespace().last() == Some("installed")
 }
 
-/// `dpkg --purge hermian`. The maintainer scripts only redo what uninstall
-/// already did (units, PAM lines, state), so missing files are fine.
 fn purge_package() -> bool {
     crate::procsrc::system_command("dpkg")
         .args(["--purge", "hermian"])
@@ -141,11 +122,6 @@ fn purge_package() -> bool {
         && !package_installed()
 }
 
-/// Only delete absolute paths with a `hermian` component, without `..`.
-///
-/// The state, log and run dirs can be overridden through environment
-/// variables, and `remove_dir_all` runs as root: `HERMIAN_STATE_DIR=/`
-/// would have wiped the system.
 fn safe_to_remove(p: &std::path::Path) -> bool {
     use std::path::Component;
     p.is_absolute()

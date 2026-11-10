@@ -1,9 +1,3 @@
-//! D3 - Persistence modification.
-//!
-//! Every rule here follows the same shape: identify the persistence surface,
-//! decide whether the change looks operator-driven (see [`Ctx::attribute`]), and
-//! emit INFO for interactive edits or HIGH/CRITICAL for unattended ones.
-
 use crate::alert::Finding;
 use crate::detect::{content_tag, writer_label, Ctx};
 use crate::events::{
@@ -34,7 +28,6 @@ pub fn evaluate(ev: &FileEvent, ctx: &Ctx) -> Vec<Finding> {
     findings
 }
 
-/// Persistence and login surfaces beyond cron, profiles and units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Surface {
     Pam,
@@ -65,7 +58,6 @@ fn surface_of(path: &str) -> Option<Surface> {
     }
 }
 
-/// Content that makes a change on this surface clearly dangerous.
 fn surface_red_flag(surface: Surface, content: &str) -> Option<String> {
     let lines = content
         .lines()
@@ -74,10 +66,7 @@ fn surface_red_flag(surface: Surface, content: &str) -> Option<String> {
     let mut hits: Vec<&str> = Vec::new();
     for l in lines {
         let hit = match surface {
-            // A preload for every login session.
             Surface::Environment => l.contains("LD_PRELOAD") || l.contains("LD_AUDIT"),
-            // pam_exec runs a program on every login; a module given by a
-            // path outside the system library dirs is someone's own code.
             Surface::Pam => {
                 l.contains("pam_exec")
                     || l.split_whitespace().any(|w| {
@@ -87,7 +76,6 @@ fn surface_red_flag(surface: Surface, content: &str) -> Option<String> {
                             && !w.starts_with("/usr/lib")
                     })
             }
-            // RUN+= executes a program whenever the device event fires.
             Surface::Udev => l.contains("RUN+=") || l.contains("RUN="),
             Surface::RcLocal => looks_like_staging(l),
             Surface::Modules => false,
@@ -187,8 +175,6 @@ fn other_surfaces(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
-/// Writer belongs to a package/config manager - those legitimately touch every
-/// persistence surface on the system.
 fn writer_is_installer(ev: &FileEvent, ctx: &Ctx) -> bool {
     let Some(w) = &ev.writer else { return false };
     if !ctx.tool_exemption_applies(w.pid) {
@@ -221,8 +207,6 @@ fn ld_preload(ev: &FileEvent, _ctx: &Ctx) -> Option<Finding> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(str::to_string)
         .collect();
-    // An empty file preloads nothing. Hermian's own unit has systemd create
-    // one to mount over, so an empty one is neither news nor a threat.
     if libs.is_empty() && ev.kind != FileKind::Removed {
         return None;
     }
@@ -321,11 +305,6 @@ fn ld_conf(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
-/// A loader config line that only names standard library directories.
-///
-/// Prefix checks let `/libevil`, `/usr/../tmp` and `include /tmp/x.conf`
-/// through. Now a path has to be one of the standard directories or under
-/// one, written plainly, and an include must point back into ld.so.conf.d.
 fn is_standard_ld_line(line: &str) -> bool {
     const DIRS: &[&str] = &["/usr", "/lib", "/lib32", "/lib64", "/libx32", "/opt"];
     let plain = |p: &str| {
@@ -339,7 +318,6 @@ fn is_standard_ld_line(line: &str) -> bool {
         let target = target.trim();
         return plain(target) && target.starts_with("/etc/ld.so.conf.d/");
     }
-    // A line may hold several paths separated by spaces, commas or colons.
     let mut paths = line
         .split(|c: char| c.is_whitespace() || c == ',' || c == ':')
         .filter(|p| !p.is_empty())
@@ -437,7 +415,6 @@ const CRON_PATHS: &[&str] = &[
     "/var/spool/cron/crontabs",
     "/etc/anacrontab",
     "/var/spool/anacron",
-    // at jobs: Debian keeps them under the cron spool, RHEL in /var/spool/at.
     "/var/spool/at",
 ];
 
@@ -458,7 +435,6 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         return None;
     }
     let at_job = is_at_job(&ev.path);
-    // at's own bookkeeping (.SEQ, spool dirs) isn't a job.
     if !at_job
         && (ev.path.starts_with("/var/spool/cron/atjobs") || ev.path.starts_with("/var/spool/at"))
     {
@@ -466,7 +442,6 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     }
     let system_table = ev.path == "/etc/crontab" || ev.path.starts_with("/etc/cron.d/");
     let content = ev.content.as_deref().unwrap_or("");
-    // An at job is a shell script, not a table: every line is a command.
     let all_commands: Vec<String> = if at_job {
         content
             .lines()
@@ -478,11 +453,7 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         cron_commands(content, system_table)
     };
     let suspicious_cmd = all_commands.iter().any(|c| looks_like_staging(c));
-    // Content first: the real `crontab` installs whatever it's fed, so
-    // `(crontab -l; echo '* * * * * curl ...|sh') | crontab -` used to pass
-    // as an ordinary crontab edit. The exemptions only cover clean tables.
     if !suspicious_cmd {
-        // `crontab -e` writes via the crontab binary; anacron updates its own timestamps.
         if let Some(w) = &ev.writer {
             if (is_system_tool(&w.comm, &w.exe, &["crontab", "anacron", "at", "batch"])
                 || is_user_mgmt_tool(&w.comm, &w.exe))
@@ -496,7 +467,6 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         }
     }
     let attribution = ctx.attribute(ev);
-    // Show the staging lines first, and only a few lines in all.
     let mut commands: Vec<String> = all_commands
         .iter()
         .filter(|c| looks_like_staging(c))
@@ -570,21 +540,15 @@ fn cron_paths(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
-/// Extract the command part of each cron line. System tables (`/etc/crontab`,
-/// `/etc/cron.d/*`) carry a user field after the five time fields; per-user
-/// crontabs do not.
 fn cron_commands(content: &str, system_table: bool) -> Vec<String> {
     let skip_after_time = if system_table { 1 } else { 0 };
     content
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter(|l| {
-            // Skip VAR=value assignments (but not commands containing '=').
-            match l.split_once('=') {
-                Some((k, _)) => !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                None => true,
-            }
+        .filter(|l| match l.split_once('=') {
+            Some((k, _)) => !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            None => true,
         })
         .filter_map(|l| {
             let mut fields = l.split_whitespace();
@@ -604,13 +568,8 @@ fn cron_commands(content: &str, system_table: bool) -> Vec<String> {
         .collect()
 }
 
-/// Cron commands quoted in an alert. Every line is checked; only the
-/// display is capped (a fifth malicious line used to go unchecked).
 const MAX_SHOWN_COMMANDS: usize = 4;
 
-/// Split a command line into words, with `|` as a word of its own. Quotes,
-/// `;`, `&`, parentheses, backticks and redirections only separate words.
-/// Good enough to find "which programs run here", not a shell parser.
 fn shell_words(cmd: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -639,7 +598,6 @@ fn shell_words(cmd: &str) -> Vec<String> {
     out
 }
 
-/// The program name of a word: `/usr/bin/python3.11` -> `python3.11`.
 fn prog(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
@@ -669,22 +627,15 @@ fn is_transient_path(word: &str) -> bool {
         .any(|d| word.starts_with(d))
 }
 
-/// Heuristic for "download and execute" one-liners.
-///
-/// Word-based: substring checks matched `ssh ` and `flush ` as a shell and
-/// made e.g. `rsync -e ssh ... /tmp/` CRITICAL (which can auto-isolate).
 fn looks_like_staging(cmd: &str) -> bool {
     let words = shell_words(&cmd.to_lowercase());
     let fetches = words
         .iter()
         .any(|w| matches!(prog(w), "curl" | "wget" | "wget2" | "fetch" | "aria2c"));
     let decodes = words.iter().any(|w| prog(w) == "base64");
-    // Something piped straight into a shell or interpreter.
     let pipes_into_shell = words
         .windows(2)
         .any(|w| w[0] == "|" && is_shell_or_interpreter(&w[1]));
-    // A shell/interpreter running a script from a transient dir, or a program
-    // started straight from one.
     let runs_transient = words.first().is_some_and(|w| is_transient_path(w))
         || words
             .windows(2)
@@ -762,8 +713,6 @@ fn shell_profiles(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     )
 }
 
-/// Directories systemd loads units from that we watch: the admin dir, the
-/// vendor dirs (packages only, normally), and per-user unit dirs.
 fn systemd_unit_rest(path: &str) -> Option<&str> {
     for base in [
         "/etc/systemd/system/",
@@ -774,7 +723,6 @@ fn systemd_unit_rest(path: &str) -> Option<&str> {
             return Some(r);
         }
     }
-    // ~/.config/systemd/user/ (root's or a user's): started at login.
     path.split_once("/.config/systemd/user/")
         .filter(|(home, _)| home == &"/root" || home.starts_with("/home/"))
         .map(|(_, r)| r)
@@ -823,8 +771,6 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     .iter()
     .any(|s| ev.path.ends_with(s));
     let is_enable_link = ev.path.contains(".wants/") || ev.path.contains(".requires/");
-    // `x.service.d/override.conf` can replace ExecStart= of an existing,
-    // package-owned service: the quietest way to persist through systemd.
     let is_dropin = is_systemd_dropin(&ev.path);
     if !is_unit && !is_enable_link && !is_dropin {
         return None;
@@ -836,21 +782,15 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         return Some(f);
     }
     let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
-    // The program itself in a transient dir, or a staging one-liner. Any
-    // mention of /tmp used to count, so `--socket /tmp/app.sock` was CRITICAL.
-    // Show the suspicious command if there is one, else the first.
     let exec_line = execs
         .iter()
         .find(|e| looks_like_staging(e))
         .or(execs.first())
         .cloned();
     let suspicious_exec = execs.iter().any(|e| looks_like_staging(e));
-    // An installer writing a unit that runs from /tmp or pipes curl into a
-    // shell isn't a normal install; only clean units get the exemption.
     if !suspicious_exec && writer_is_installer(ev, ctx) {
         return None;
     }
-    // `systemctl enable` is performed by systemd itself (PID 1) creating the symlink.
     if is_enable_link {
         if let Some(w) = &ev.writer {
             if w.pid == 1 || is_system_tool(&w.comm, &w.exe, &["systemctl", "systemd"]) {
@@ -920,7 +860,6 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     Some(f)
 }
 
-/// `<unit dir>/<unit>.d/<name>.conf`
 pub fn is_systemd_dropin(path: &str) -> bool {
     let Some(rest) = systemd_unit_rest(path) else {
         return false;
@@ -931,9 +870,6 @@ pub fn is_systemd_dropin(path: &str) -> bool {
     }
 }
 
-/// Every command a unit or drop-in runs. An empty `ExecStart=` only resets
-/// the list (the usual first line of an override), so it's skipped. systemd
-/// prefixes (`-`, `@`, `+`, `!`, `:`) are stripped.
 fn unit_exec_lines(content: &str) -> Vec<String> {
     const KEYS: &[&str] = &[
         "ExecStart",
@@ -944,7 +880,6 @@ fn unit_exec_lines(content: &str) -> Vec<String> {
         "ExecReload",
         "ExecCondition",
     ];
-    // systemd allows spaces around '=' (`ExecStart = /tmp/x`).
     content
         .lines()
         .map(str::trim)
@@ -1210,12 +1145,10 @@ mod tests {
         assert!(!looks_like_staging(
             "curl -fsS https://healthcheck.example/ping"
         ));
-        // "ssh " and "flush " aren't shells.
         assert!(!looks_like_staging(
             "rsync -a -e ssh /srv/data/ backup:/tmp/x"
         ));
         assert!(!looks_like_staging("/usr/sbin/ip route flush cache /tmp/x"));
-        // A transient path as an option value isn't the program.
         assert!(!looks_like_staging("/usr/bin/app --socket /tmp/app.sock"));
         assert!(!looks_like_staging(
             "python3 /usr/bin/app --log /tmp/app.log"

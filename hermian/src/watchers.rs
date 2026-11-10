@@ -1,14 +1,3 @@
-//! inotify-based file watchers for persistence and account surfaces.
-//!
-//! Design notes:
-//! * Editors and atomic-write tools generate a burst of events per save
-//!   (CREATE tmp, MODIFY, MOVED_TO, ATTRIB...). Events are debounced per path
-//!   and a single [`FileEvent`] is emitted after the burst settles.
-//! * Writer attribution is attempted at the *first* event of a burst (while
-//!   the writer likely still holds the fd) and remembered; content and
-//!   metadata are read at the *last* event so they reflect the final state.
-//! * The daemon's own config file is watched so tampering is reported.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,8 +59,6 @@ const WATCH_DIRS: &[&str] = &[
     "/root/.config/systemd/user",
 ];
 
-/// Files under a watched directory that we care about. Anything else in e.g.
-/// `/etc` is ignored so the daemon does not react to every package upgrade.
 fn is_interesting(path: &str) -> bool {
     if WATCH_FILES.contains(&path) {
         return true;
@@ -82,7 +69,6 @@ fn is_interesting(path: &str) -> bool {
         "/etc" => WATCH_FILES.contains(&path),
         "/etc/ssh" => name == "sshd_config" || name == "ssh_config",
         "/etc/security" => name == "pam_env.conf",
-        // ~/.config/systemd/user/<unit> for root and users.
         p if p.ends_with("/.config/systemd/user") => true,
         "/root" => matches!(
             name,
@@ -99,7 +85,6 @@ fn is_interesting(path: &str) -> bool {
             name == "authorized_keys" || name == "authorized_keys2" || name == "config"
         }
         p if p.starts_with("/home/") => {
-            // /home/<user>/<dotfile>
             p.matches('/').count() == 2
                 && matches!(
                     name,
@@ -113,8 +98,6 @@ fn is_interesting(path: &str) -> bool {
                         | ".zlogin"
                 )
         }
-        // Enable links and drop-ins. These dirs were already watched, but
-        // their events were thrown away here.
         p if is_systemd_subdir(p) => true,
         _ => WATCH_DIRS.iter().any(|d| {
             *d != "/etc"
@@ -126,7 +109,6 @@ fn is_interesting(path: &str) -> bool {
     }
 }
 
-/// `/etc/systemd/system/<x>.wants`, `.requires` or `.d` (drop-ins).
 fn is_systemd_subdir(dir: &str) -> bool {
     dir.strip_prefix("/etc/systemd/system/")
         .map(|name| {
@@ -146,9 +128,7 @@ const MASK: WatchMask = WatchMask::MODIFY
     .union(WatchMask::CLOSE_WRITE)
     .union(WatchMask::MOVE_SELF);
 
-/// How long a path must be quiet before its burst is emitted.
 const SETTLE: Duration = Duration::from_millis(400);
-/// Hard cap so a continuously-written file still produces an event.
 const MAX_HOLD: Duration = Duration::from_millis(2500);
 
 pub fn spawn_watchers(
@@ -164,7 +144,6 @@ pub fn spawn_watchers(
     Ok(health)
 }
 
-/// Shared with the daemon so `status` can report watcher health.
 #[derive(Debug, Default, Clone)]
 pub struct WatchHealth {
     pub active: usize,
@@ -212,8 +191,6 @@ impl Watches {
         for p in direct_watch_files().chain(WATCH_DIRS.iter().copied()) {
             self.add(Path::new(p));
         }
-        // Vendor units on hosts where /lib isn't a symlink to /usr/lib (on
-        // merged-/usr hosts it's the same directory as /usr/lib/...).
         if std::fs::symlink_metadata("/lib")
             .map(|m| m.is_dir())
             .unwrap_or(false)
@@ -223,12 +200,10 @@ impl Watches {
         for p in systemd_target_dirs() {
             self.add(&p);
         }
-        // /home itself, so a new home directory is noticed right away.
         self.add(Path::new("/home"));
         for p in user_home_watches() {
             self.add(&p);
         }
-        // Watch the config's directory so atomic replaces are seen too.
         let config_path = self.config_path.clone();
         if let Some(dir) = config_path.parent() {
             self.add(dir);
@@ -237,11 +212,6 @@ impl Watches {
     }
 }
 
-/// Files watched directly, besides their directory. Not the ones hidden from
-/// the daemon: in its namespace /etc/ld.so.preload is /dev/null, so a watch
-/// on it fired on every write to /dev/null on the host, each one costing a
-/// scan of every process's fds. Their directory's watch still sees the
-/// host's file change.
 fn direct_watch_files() -> impl Iterator<Item = &'static str> {
     WATCH_FILES
         .iter()
@@ -249,19 +219,14 @@ fn direct_watch_files() -> impl Iterator<Item = &'static str> {
         .filter(|p| !procsrc::HIDDEN_FROM_DAEMON.contains(p))
 }
 
-/// Enough of a file's metadata to tell that it changed: inode, mtime, size.
 type Fingerprint = (u64, i64, i64, u64);
 
 fn fingerprint(path: &Path) -> Option<Fingerprint> {
     use std::os::unix::fs::MetadataExt;
-    // The host's copy for files hidden from the daemon (procsrc::host_view).
     let m = std::fs::symlink_metadata(&*procsrc::host_view(&path.to_string_lossy())).ok()?;
     Some((m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
 }
 
-/// Fingerprints of every interesting file under the current watches. Kept up
-/// to date as events are emitted, so after an inotify queue overflow the
-/// lost changes can be found by comparing against a fresh one.
 fn snapshot(w: &Watches) -> HashMap<String, Fingerprint> {
     let mut out = HashMap::new();
     let mut consider = |p: &Path| {
@@ -292,7 +257,6 @@ fn snapshot(w: &Watches) -> HashMap<String, Fingerprint> {
     out
 }
 
-/// What changed between two snapshots.
 fn snapshot_changes(
     old: &HashMap<String, Fingerprint>,
     new: &HashMap<String, Fingerprint>,
@@ -330,8 +294,6 @@ fn systemd_target_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// A real directory, not a symlink to one: a symlinked home or `~/.ssh`
-/// would point a root-owned watch (and root reads) somewhere else.
 fn real_dir(p: &Path) -> bool {
     std::fs::symlink_metadata(p)
         .map(|m| m.is_dir())
@@ -355,8 +317,6 @@ fn user_home_watches() -> Vec<PathBuf> {
             }
         }
     }
-    // Service accounts keep homes elsewhere (/var/www, /var/lib/postgresql):
-    // an authorized_keys there is as good a backdoor as one in /home.
     for home in procsrc::read_file("/etc/passwd")
         .map(|c| passwd_homes(&c))
         .unwrap_or_default()
@@ -369,8 +329,6 @@ fn user_home_watches() -> Vec<PathBuf> {
     out
 }
 
-/// Home directories from /etc/passwd outside /home and /root (those are
-/// covered already), skipping `/` and the usual non-homes.
 fn passwd_homes(passwd: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = passwd
         .lines()
@@ -401,13 +359,9 @@ struct Pending {
     kind: FileKind,
     writer: Option<WriterInfo>,
     is_config: bool,
-    /// The writer was looked up again after first sight.
     retried: bool,
 }
 
-/// Look for the writer once more if first sight found none. Only once: each
-/// lookup reads every fd of every process (hundreds of ms on a host with a
-/// JVM or a database), and a burst can carry hundreds of events.
 fn retry_writer_lookup(p: &Pending, kind: FileKind) -> bool {
     p.writer.is_none() && !p.retried && !matches!(kind, FileKind::Removed | FileKind::MovedFrom)
 }
@@ -456,7 +410,6 @@ fn watcher_loop(
             return;
         }
         let mut overflowed = false;
-        // Non-blocking read; inotify's fd is nonblocking by default in this crate.
         match w.inotify.read_events(&mut buffer) {
             Ok(events) => {
                 for event in events {
@@ -472,9 +425,6 @@ fn watcher_loop(
                         continue;
                     };
                     if event.mask.contains(EventMask::ISDIR) {
-                        // A new ~/.ssh, home or cron dir: watch it now, not at
-                        // the next 60s rescan, and pick up whatever was already
-                        // written into it (mkdir ~/.ssh && echo key > ...).
                         if event
                             .mask
                             .intersects(EventMask::CREATE | EventMask::MOVED_TO)
@@ -501,7 +451,6 @@ fn watcher_loop(
                         first: now,
                         last: now,
                         kind,
-                        // Attribute at first sight while the fd is likely open.
                         writer: lookup_writer(&full_s),
                         is_config,
                         retried: false,
@@ -518,8 +467,6 @@ fn watcher_loop(
             Err(_) => std::thread::sleep(Duration::from_millis(150)),
         }
 
-        // The kernel dropped events. Find what changed since the last
-        // snapshot and queue those, rather than silently missing them.
         if overflowed {
             overflows += 1;
             crate::health::INOTIFY_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
@@ -552,7 +499,6 @@ fn watcher_loop(
             w.publish();
         }
 
-        // Flush settled bursts.
         let now = Instant::now();
         let ready: Vec<String> = pending
             .iter()
@@ -575,7 +521,6 @@ fn watcher_loop(
         if last_rescan.elapsed() > Duration::from_secs(60) {
             w.refresh();
             w.publish();
-            // Pick up newly watched files without reporting them as changes.
             for (path, fp) in snapshot(&w) {
                 known.entry(path).or_insert(fp);
             }
@@ -585,31 +530,23 @@ fn watcher_loop(
     }
 }
 
-/// Directories the watcher keeps a watch on (besides the fixed lists, which
-/// `refresh` re-adds anyway).
 fn is_wanted_dir(path: &str) -> bool {
     if WATCH_DIRS.contains(&path) {
         return true;
     }
     let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     let name = path.rsplit('/').next().unwrap_or("");
-    // /home/<user>
     if parent == "/home" && !name.is_empty() {
         return true;
     }
-    // /root/.ssh, /home/<user>/.ssh
     if name == ".ssh"
         && (parent == "/root" || parent.starts_with("/home/") && parent.matches('/').count() == 2)
     {
         return true;
     }
-    // systemctl enable targets and drop-in dirs: `mkdir x.service.d` plus an
-    // override in one go was missed until the 60s rescan.
     is_systemd_subdir(path)
 }
 
-/// Watch a directory that just appeared and queue what's already inside.
-/// Depth-limited so a new home with a `.ssh` is covered in one go.
 fn adopt_new_dir(
     w: &mut Watches,
     dir: &Path,
@@ -621,7 +558,6 @@ fn adopt_new_dir(
     if depth > 1 || !is_wanted_dir(&dir_s) {
         return;
     }
-    // Only real directories: a symlinked ~/.ssh would point the watch elsewhere.
     if !std::fs::symlink_metadata(dir)
         .map(|m| m.is_dir())
         .unwrap_or(false)
@@ -670,12 +606,11 @@ fn classify(mask: EventMask) -> FileKind {
     }
 }
 
-/// Collapse a burst into the most meaningful single kind.
 fn merge_kind(prev: FileKind, next: FileKind) -> FileKind {
     use FileKind::*;
     match (prev, next) {
         (_, Removed) => Removed,
-        (Removed, k) => k, // deleted then recreated = the new thing
+        (Removed, k) => k,
         (Created, _) => Created,
         (MovedTo, Modified) | (MovedTo, MovedTo) => MovedTo,
         (_, MovedTo) => MovedTo,
@@ -731,8 +666,6 @@ fn build_file_event(path: &str, p: Pending) -> FileEvent {
         dev: 0,
         ino: 0,
         writer: p.writer,
-        // Left false here; the engine derives it from its process tree when the
-        // writer is unknown.
         session_present: false,
         is_suid,
         has_file_caps,
@@ -807,7 +740,6 @@ mod tests {
         assert!(!is_interesting("/etc/ssh/moduli"));
         assert!(!is_interesting("/root/notes.txt"));
         assert!(!is_interesting("/home/dev/project/.bashrc"));
-        // Surfaces added after review.
         assert!(is_interesting("/etc/pam.d/sshd"));
         assert!(is_interesting("/etc/environment"));
         assert!(is_interesting("/etc/rc.local"));
@@ -893,8 +825,6 @@ mod tests {
 
     #[test]
     fn files_hidden_from_the_daemon_are_watched_through_their_directory() {
-        // In the daemon's namespace these are /dev/null: a direct watch fires
-        // on every write to /dev/null on the host.
         for p in procsrc::HIDDEN_FROM_DAEMON {
             assert!(
                 !direct_watch_files().any(|f| f == *p),

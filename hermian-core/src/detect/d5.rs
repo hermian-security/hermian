@@ -1,18 +1,12 @@
-//! D5 - Anomalous network behaviour in context.
-
 use crate::alert::Finding;
 use crate::detect::{is_private_ip, Ctx};
 use crate::events::{ConnectEvent, DetectionId, ListenerEvent, Severity};
 use crate::proctree::{role_of, Role};
 
-/// Ports where a "first connection" is almost always benign (DNS, NTP, DHCP).
 const INFRA_PORTS: &[u16] = &[53, 123, 67, 68, 5353];
 
 pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
     let mut findings = Vec::new();
-    // chain.first() is PID 1 on a real host (the daemon seeds the tree from
-    // /proc), so it can't stand in for "who connected". Use the nearest web
-    // server in the chain, and the connecting process itself as the connector.
     let chain = ctx.tree.chain_of(ev.pid);
     let web_server = chain
         .iter()
@@ -38,8 +32,6 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
                 DetectionId::D5,
                 Severity::High,
                 "Outbound connection from a flagged process chain",
-                // Per program, not per address: a miner or proxy calling 40
-                // addresses is one incident, and the summary lists them.
                 &format!("d5|connect-flagged|{}", connector_key),
             )
             .varies("Destinations", &dest)
@@ -62,10 +54,6 @@ pub fn evaluate_connect(ev: &ConnectEvent, ctx: &Ctx) -> Vec<Finding> {
         return findings;
     }
 
-    // Only skip infra ports after the flagged-chain check: a web shell
-    // calling out to attacker:53 is exactly the case we mustn't drop. And
-    // only to the LAN or to servers seen while learning: "port 53 to
-    // anywhere" was a free pass for DNS-port C2 to a fresh address.
     if INFRA_PORTS.contains(&ev.dport)
         && (!is_external
             || !ctx.baseline.can_judge_novelty()
@@ -144,8 +132,6 @@ pub fn connector_key(exe: &str, uid: u32) -> String {
     format!("{}|{}", exe, uid)
 }
 
-/// The connecting process's own executable, or its comm if the tree doesn't
-/// know it. See [`crate::baseline::CONNECTOR_SCHEME`].
 pub fn connector_exe(tree: &crate::proctree::ProcessTree, pid: u32, comm: &str) -> String {
     tree.get(pid)
         .map(|p| p.exe.as_str())
