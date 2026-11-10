@@ -635,6 +635,10 @@ fn lookup_writer(path: &str) -> Option<WriterInfo> {
 
 fn build_file_event(path: &str, p: Pending) -> FileEvent {
     let gone = matches!(p.kind, FileKind::Removed | FileKind::MovedFrom);
+    let snap_verified = !gone
+        && path.starts_with("/etc/systemd/system/")
+        && path.ends_with(".mount")
+        && crate::snapd::store_signed_mount(path);
     let (is_suid, has_file_caps, content, managed_by_package) = if gone {
         (false, false, None, None)
     } else {
@@ -668,6 +672,7 @@ fn build_file_event(path: &str, p: Pending) -> FileEvent {
         content,
         container,
         managed_by_package,
+        snap_verified,
     }
 }
 

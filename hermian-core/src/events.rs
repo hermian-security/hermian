@@ -208,6 +208,7 @@ pub struct FileEvent {
     pub content: Option<String>,
     pub container: bool,
     pub managed_by_package: Option<bool>,
+    pub snap_verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

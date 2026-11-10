@@ -71,6 +71,7 @@ Each family can be switched off in `[detections]`
 | systemd drop-in added with no session present | D3 | `HIGH` |
 | systemd unit enabled outside of systemctl | D3 | `HIGH` |
 | systemd unit edited during a session | D3 | `INFO` |
+| snapd mount unit for a store-signed snap | D3 | `INFO` |
 | PAM now runs a program or a non-system module | D3 | `HIGH` / `CRITICAL` |
 | Global environment sets LD_PRELOAD | D3 | `HIGH` / `CRITICAL` |
 | udev rule runs a program | D3 | `HIGH` / `CRITICAL` |

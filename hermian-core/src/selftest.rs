@@ -65,6 +65,7 @@ fn file(path: &str, kind: FileKind, writer: Option<WriterInfo>, content: Option<
         content: content.map(str::to_string),
         container: false,
         managed_by_package: None,
+        snap_verified: false,
     })
 }
 
@@ -206,6 +207,7 @@ fn scenario_suid_drop() -> Vec<Alert> {
         content: None,
         container: false,
         managed_by_package: None,
+        snap_verified: false,
     };
     ev.is_suid = true;
     eng.process(Event::File(ev))
