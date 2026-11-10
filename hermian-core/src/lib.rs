@@ -16,6 +16,7 @@ pub mod events;
 pub mod proctree;
 pub mod response;
 pub mod selftest;
+pub mod snapmount;
 
 pub use alert::{
     escape_untrusted, render, render_alert, Alert, ChainNode, Fact, Finding, RefGen, Theme,

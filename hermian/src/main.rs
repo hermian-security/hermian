@@ -26,6 +26,7 @@ mod report;
 mod retention;
 mod selfprotect;
 mod sessions;
+mod snapd;
 mod sshkeys;
 mod status;
 mod tgbot;

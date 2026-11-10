@@ -68,6 +68,7 @@ pub fn privileged_file_event(
         content: None,
         container: false,
         managed_by_package: None,
+        snap_verified: false,
         path,
     })
 }

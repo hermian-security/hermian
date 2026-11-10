@@ -6,6 +6,13 @@ Earlier release information remains in the repository's GitHub Releases and Git 
 
 ## Unreleased
 
+### Fixed
+
+- snapd refreshes no longer page as a new systemd unit (#113). A `snap-*.mount`
+  unit or its enable link is only logged when it's exactly what snapd writes
+  and the `.snap` file's SHA3-384 matches a store snap-revision assertion.
+  Anything else, `--dangerous` snaps included, still alerts.
+
 ## 0.1.0 - 2026-10-30
 
 The first release. Hermian checks a host for an earlier compromise before it

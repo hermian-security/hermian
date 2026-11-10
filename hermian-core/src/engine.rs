@@ -644,6 +644,7 @@ mod tests {
             content: content.map(str::to_string),
             container: false,
             managed_by_package: None,
+            snap_verified: false,
         }
     }
 
@@ -1752,6 +1753,78 @@ mod tests {
         );
         ev.managed_by_package = Some(true);
         assert!(eng.process(Event::File(ev)).is_empty());
+    }
+
+    const SNAPD_UNIT: &str = "[Unit]\nDescription=Mount unit for snapd, revision 28332\nAfter=snapd.mounts-pre.target\nBefore=snapd.mounts.target\n\n[Mount]\nWhat=/var/lib/snapd/snaps/snapd_28332.snap\nWhere=/snap/snapd/28332\nType=squashfs\nOptions=nodev,ro,x-gdu.hide,x-gvfs-hide\nLazyUnmount=yes\n\n[Install]\nWantedBy=snapd.mounts.target\nWantedBy=multi-user.target\n";
+
+    fn snap_unit_alerts(path: &str, content: &str, verified: bool) -> Vec<Alert> {
+        let mut eng = engine_without_baseline();
+        let mut ev = file(Utc::now(), path, FileKind::Created, None, Some(content));
+        ev.snap_verified = verified;
+        eng.process(Event::File(ev))
+    }
+
+    #[test]
+    fn verified_snapd_refresh_units_only_log() {
+        for path in [
+            "/etc/systemd/system/snap-snapd-28332.mount",
+            "/etc/systemd/system/multi-user.target.wants/snap-snapd-28332.mount",
+            "/etc/systemd/system/snapd.mounts.target.wants/snap-snapd-28332.mount",
+        ] {
+            let alerts = snap_unit_alerts(path, SNAPD_UNIT, true);
+            assert_eq!(
+                max_sev(&alerts),
+                Some(Severity::Info),
+                "{}: {:?}",
+                path,
+                alerts
+            );
+        }
+    }
+
+    #[test]
+    fn snap_lookalike_units_still_alert() {
+        let unit = "/etc/systemd/system/snap-snapd-28332.mount";
+        let high = |path: &str, content: &str, verified: bool| {
+            let alerts = snap_unit_alerts(path, content, verified);
+            assert!(
+                max_sev(&alerts) >= Some(Severity::High),
+                "{} {:?}",
+                path,
+                alerts
+            );
+        };
+        high(unit, SNAPD_UNIT, false);
+        high(
+            "/etc/systemd/system/multi-user.target.wants/snap-snapd-28332.mount",
+            SNAPD_UNIT,
+            false,
+        );
+        high(
+            unit,
+            &SNAPD_UNIT.replace("Where=/snap/snapd/28332", "Where=/usr/sbin"),
+            true,
+        );
+        high(
+            unit,
+            &format!("{}[Service]\nExecStart=/tmp/x\n", SNAPD_UNIT),
+            true,
+        );
+        high(
+            "/etc/systemd/system/snap-snapd-28332.service",
+            SNAPD_UNIT,
+            true,
+        );
+        high(
+            "/etc/systemd/system/getty.target.wants/snap-snapd-28332.mount",
+            SNAPD_UNIT,
+            true,
+        );
+        high(
+            "/etc/systemd/system/snap-snapd-28332.mount.d/override.conf",
+            SNAPD_UNIT,
+            true,
+        );
     }
 
     #[test]

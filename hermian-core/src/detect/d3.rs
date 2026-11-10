@@ -780,6 +780,35 @@ fn systemd_unit_rest(path: &str) -> Option<&str> {
         .map(|(_, r)| r)
 }
 
+fn verified_snap_mount(ev: &FileEvent) -> Option<Finding> {
+    if !ev.snap_verified {
+        return None;
+    }
+    let rest = ev.path.strip_prefix("/etc/systemd/system/")?;
+    let name = match rest.split_once('/') {
+        Some(("multi-user.target.wants" | "snapd.mounts.target.wants", n)) => n,
+        Some(_) => return None,
+        None => rest,
+    };
+    let m = crate::snapmount::parse(name, ev.content.as_deref()?)?;
+    Some(
+        Finding::new(
+            DetectionId::D3,
+            Severity::Info,
+            "snapd mount unit for a store-signed snap",
+            &format!("d3|snap-mount|{}", ev.path),
+        )
+        .what(format!(
+            "{} mounts {} revision {}, read-only. The file's hash matches a \
+             store-signed snap-revision assertion.",
+            ev.path, m.instance, m.revision
+        ))
+        .fact("Path", &ev.path)
+        .fact("Snap file", m.snap_file)
+        .why("Logged for context. snapd writes these units on every refresh."),
+    )
+}
+
 fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     systemd_unit_rest(&ev.path)?;
     let is_unit = [
@@ -802,6 +831,9 @@ fn systemd_units(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     }
     if ev.managed_by_package == Some(true) {
         return None;
+    }
+    if let Some(f) = verified_snap_mount(ev) {
+        return Some(f);
     }
     let execs = unit_exec_lines(ev.content.as_deref().unwrap_or(""));
     // The program itself in a transient dir, or a staging one-liner. Any
@@ -1025,6 +1057,7 @@ mod tests {
                 content: Some(content.into()),
                 container: false,
                 managed_by_package: None,
+                snap_verified: false,
             })
         }
 

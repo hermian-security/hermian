@@ -502,6 +502,7 @@ mod tests {
             content: content.map(str::to_string),
             container: false,
             managed_by_package: None,
+            snap_verified: false,
         })
     }
 
