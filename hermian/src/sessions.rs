@@ -1,25 +1,18 @@
-//! SSH session control and sshd settings, for the Telegram responses.
-
 use std::net::IpAddr;
 
 use anyhow::Result;
 
 use crate::procsrc;
 
-/// What `disconnect` did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Disconnected {
     pub connections: usize,
     pub processes: Vec<u32>,
 }
 
-/// Why `disconnect` didn't end anything, so a button press can be answered
-/// with what that means (see `actions`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectError {
-    /// No established connection from that source: nothing to end.
     NotConnected,
-    /// The connection is there, but no sshd process holds it.
     NoSshd,
 }
 
@@ -34,13 +27,10 @@ impl std::fmt::Display for DisconnectError {
 
 impl std::error::Error for DisconnectError {}
 
-/// Names sshd's per-connection processes go by.
 fn is_sshd(comm: &str) -> bool {
     comm == "sshd" || comm == "sshd-session" || comm.starts_with("sshd:")
 }
 
-/// Established TCP connections from `source` (and `port`, when known) that
-/// end at one of this host's sockets: the inodes of the SSH sessions to cut.
 pub fn session_inodes(rows: &[procsrc::TcpEntry], source: IpAddr, port: Option<u16>) -> Vec<u64> {
     let same = |a: IpAddr, b: IpAddr| match (a, b) {
         (IpAddr::V6(v6), IpAddr::V4(v4)) | (IpAddr::V4(v4), IpAddr::V6(v6)) => {
@@ -55,7 +45,6 @@ pub fn session_inodes(rows: &[procsrc::TcpEntry], source: IpAddr, port: Option<u
         .filter(|r| same(r.remote_addr, source))
         .filter(|r| port.is_none_or(|p| r.remote_port == p))
     {
-        // /proc/net/tcp can list a socket twice if read while it changes.
         if !out.contains(&r.inode) {
             out.push(r.inode);
         }
@@ -63,11 +52,6 @@ pub fn session_inodes(rows: &[procsrc::TcpEntry], source: IpAddr, port: Option<u
     out
 }
 
-/// End the SSH session(s) from `source` (`port` narrows it to one login).
-///
-/// Kills the sshd processes holding that connection. That closes the
-/// session and its terminal; programs the user started get SIGHUP. Only
-/// sshd processes are touched, so the same user's other sessions survive.
 pub fn disconnect(source: IpAddr, port: Option<u16>) -> Result<Disconnected> {
     let rows = procsrc::read_tcp_tables();
     let inodes = session_inodes(&rows, source, port);
@@ -80,7 +64,6 @@ pub fn disconnect(source: IpAddr, port: Option<u16>) -> Result<Disconnected> {
         if !is_sshd(&comm) {
             continue;
         }
-        // SAFETY: kill(2) on a pid we just read; failure is reported below.
         if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } == 0 {
             killed.push(pid);
         }
@@ -94,20 +77,13 @@ pub fn disconnect(source: IpAddr, port: Option<u16>) -> Result<Disconnected> {
     })
 }
 
-/// What sshd accepts, from its effective configuration (`sshd -T` resolves
-/// includes and defaults).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SshdAuth {
-    /// Some account can log in with a password (or keyboard-interactive).
     pub password: bool,
-    /// Root can.
     pub root_password: bool,
-    /// The config has `Match` blocks, which can change both per user or
-    /// address: `sshd -T` only shows the global settings.
     pub per_match: bool,
 }
 
-/// `None` if sshd couldn't be asked.
 pub fn sshd_auth() -> Option<SshdAuth> {
     let sshd = ["/usr/sbin/sshd", "/sbin/sshd", "/usr/bin/sshd"]
         .into_iter()
@@ -132,10 +108,8 @@ pub fn sshd_auth() -> Option<SshdAuth> {
     ))
 }
 
-/// Last `sshd -T` answer: bit 0 known, 1 password, 2 root password, 3 Match.
 static SSHD_AUTH: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Ask sshd again and cache the answer (runs on a blocking thread).
 pub fn refresh_sshd_auth() {
     if let Some(a) = sshd_auth() {
         let bits = 1
@@ -155,7 +129,6 @@ pub fn cached_sshd_auth() -> Option<SshdAuth> {
     })
 }
 
-/// From `sshd -T` output, and the config files' text for `Match` blocks.
 fn parse_sshd_auth(sshd_t: &str, config: &str) -> SshdAuth {
     let get = |key: &str| {
         sshd_t
@@ -234,8 +207,6 @@ mod tests {
         assert!(!parse_sshd_auth(no_pw, "# Match is commented\n").per_match);
     }
 
-    /// A process named `sshd` holding a connection from 127.0.0.1:<port> is
-    /// stopped; nothing else is touched. Uses python3 (skipped without it).
     #[test]
     fn disconnect_stops_the_sshd_holding_the_connection() {
         use std::io::{BufRead, BufReader};
@@ -260,7 +231,6 @@ mod tests {
         let server_port: u16 = line.trim().parse().unwrap();
         let client = std::net::TcpStream::connect(("127.0.0.1", server_port)).unwrap();
         let client_port = client.local_addr().unwrap().port();
-        // Wait until the fake sshd has accepted (the socket shows up as its).
         let src: IpAddr = "127.0.0.1".parse().unwrap();
         let mut result = None;
         for _ in 0..100 {
@@ -278,8 +248,6 @@ mod tests {
         assert!(!status.success(), "killed, not exited normally");
     }
 
-    /// A real loopback connection is found by source and port, and only the
-    /// process that's not sshd is left alone.
     #[test]
     fn finds_a_live_connection() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -291,7 +259,6 @@ mod tests {
         assert_eq!(inodes.len(), 1, "{:?}", inodes);
         let pids = procsrc::all_pids_for_inodes(&inodes);
         assert_eq!(pids, vec![std::process::id()]);
-        // We aren't sshd, so disconnect refuses to kill us.
         assert!(disconnect("127.0.0.1".parse().unwrap(), Some(port)).is_err());
     }
 }

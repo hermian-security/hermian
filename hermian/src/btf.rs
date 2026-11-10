@@ -1,9 +1,3 @@
-//! Minimal BTF reader: enough to find struct member offsets in the running
-//! kernel's `/sys/kernel/btf/vmlinux`. Used to hand `task_struct` offsets to the
-//! eBPF programs so one object works on every kernel version.
-//!
-//! Format reference: `include/uapi/linux/btf.h`.
-
 use std::fs;
 
 use anyhow::{anyhow, Context, Result};
@@ -75,8 +69,6 @@ impl Btf {
         Ok(Btf { types, strings })
     }
 
-    /// The string at `off`, or "" if the offset is out of range (a corrupt or
-    /// unexpected BTF blob must not panic the daemon).
     fn name(&self, off: u32) -> &str {
         let start = off as usize;
         let Some(tail) = self.strings.get(start..) else {
@@ -86,7 +78,6 @@ impl Btf {
         std::str::from_utf8(&tail[..end]).unwrap_or("")
     }
 
-    /// Byte offset of `member` within `struct name`, or None.
     pub fn struct_member_offset(&self, name: &str, member: &str) -> Option<u32> {
         let mut o = 0usize;
         while o + 12 <= self.types.len() {
@@ -109,7 +100,7 @@ impl Btf {
                 KIND_VAR => 4,
                 KIND_DATASEC => 12 * vlen,
                 KIND_DECL_TAG => 4,
-                _ => return None, // unknown kind: cannot continue safely
+                _ => return None,
             };
             if kind == KIND_STRUCT && self.name(name_off) == name {
                 let _ = size_or_type;
@@ -118,8 +109,6 @@ impl Btf {
                     let m_name = u32_at(&self.types, m)?;
                     let m_off = u32_at(&self.types, m + 8)?;
                     if self.name(m_name) == member {
-                        // With kflag the offset field packs bitfield size in the
-                        // top byte; the low 24 bits are the bit offset.
                         let bits = if kflag == 1 {
                             m_off & 0x00ff_ffff
                         } else {
@@ -136,7 +125,6 @@ impl Btf {
     }
 }
 
-/// `(real_parent offset, tgid offset)` in `task_struct`, if BTF is available.
 pub fn task_struct_offsets() -> Option<(u32, u32)> {
     let btf = Btf::from_sys_fs().ok()?;
     let parent = btf.struct_member_offset("task_struct", "real_parent")?;
@@ -144,8 +132,6 @@ pub fn task_struct_offsets() -> Option<(u32, u32)> {
     Some((parent, tgid))
 }
 
-/// Offsets for reaching the inode behind an fd or the working directory, in
-/// the order the eBPF program's FILE_OFFS expects. None if any is missing.
 pub fn file_offsets() -> Option<[u32; 12]> {
     let btf = Btf::from_sys_fs().ok()?;
     let m = |s: &str, f: &str| btf.struct_member_offset(s, f);
@@ -169,28 +155,26 @@ pub fn file_offsets() -> Option<[u32; 12]> {
 mod tests {
     use super::*;
 
-    /// A tiny BTF blob: one struct `s` with members `a` (offset 0) and
-    /// `b` (bit offset 64).
     fn blob(name_off_b: u32) -> Vec<u8> {
         let strings = b"\0s\0a\0b\0".to_vec();
         let mut types = Vec::new();
         let push = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
-        push(&mut types, 1); // name "s"
-        push(&mut types, (KIND_STRUCT << 24) | 2); // kind, vlen 2
-        push(&mut types, 16); // size
+        push(&mut types, 1);
+        push(&mut types, (KIND_STRUCT << 24) | 2);
+        push(&mut types, 16);
         for (name, off) in [(3u32, 0u32), (name_off_b, 64)] {
             push(&mut types, name);
-            push(&mut types, 0); // type
+            push(&mut types, 0);
             push(&mut types, off);
         }
         let mut d = Vec::new();
         d.extend_from_slice(&BTF_MAGIC.to_le_bytes());
-        d.extend_from_slice(&[1, 0]); // version, flags
+        d.extend_from_slice(&[1, 0]);
         let push_d = |v: &mut Vec<u8>, x: u32| v.extend_from_slice(&x.to_le_bytes());
-        push_d(&mut d, 24); // hdr_len
-        push_d(&mut d, 0); // type_off
+        push_d(&mut d, 24);
+        push_d(&mut d, 0);
         push_d(&mut d, types.len() as u32);
-        push_d(&mut d, types.len() as u32); // str_off
+        push_d(&mut d, types.len() as u32);
         push_d(&mut d, strings.len() as u32);
         d.extend_from_slice(&types);
         d.extend_from_slice(&strings);
@@ -207,10 +191,8 @@ mod tests {
 
     #[test]
     fn corrupt_input_does_not_panic() {
-        // A member name offset far past the string table.
         let btf = Btf::parse(&blob(0xFFFF_FF00)).unwrap();
         assert_eq!(btf.struct_member_offset("s", "b"), None);
-        // Section lengths that overflow or run past the end.
         let mut d = blob(5);
         d[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(Btf::parse(&d).is_err());

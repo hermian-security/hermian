@@ -1,11 +1,3 @@
-//! Which authorized_keys line a public-key login used.
-//!
-//! sshd logs the accepted key's fingerprint (`ssh2: ED25519 SHA256:...`).
-//! This finds that key in the user's authorized_keys files by fingerprinting
-//! every key there the way `ssh-keygen -l` does: SHA-256 of the decoded key
-//! blob, base64 without padding. No process is spawned per login; `sshd -T`
-//! (for `AuthorizedKeysFile`) is asked at most every ten minutes.
-
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -15,23 +7,16 @@ use std::time::{Duration, Instant};
 use hermian_core::SshKey;
 use sha2::{Digest, Sha256};
 
-/// Largest authorized_keys file read; bigger ones are skipped.
 const MAX_FILE: u64 = 1 << 20;
-/// Longest comment kept for alerts.
 const MAX_COMMENT: usize = 100;
 
-/// One key line of an authorized_keys file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Entry {
-    /// 1-based.
     pub line: usize,
     pub fingerprint: String,
     pub comment: Option<String>,
 }
 
-/// Fill in `key.file`, `key.line` and `key.comment` from `user`'s
-/// authorized_keys, if the fingerprint is there. Certificates are signed by
-/// a CA rather than listed, so they're left as they are.
 pub fn resolve(user: &str, key: &mut SshKey) {
     if key.kind.ends_with("-CERT") {
         return;
@@ -55,10 +40,6 @@ pub fn resolve(user: &str, key: &mut SshKey) {
     }
 }
 
-/// Every key line in `content`, fingerprinted. Options before the key
-/// (`command="..." ssh-ed25519 AAAA... comment`) are skipped by looking for
-/// a key-type word whose next word decodes to a blob of that same type, so
-/// a type name inside a quoted option can't be mistaken for the key.
 pub fn parse_authorized_keys(content: &str) -> Vec<Entry> {
     let mut out = Vec::new();
     for (i, raw) in content.lines().enumerate() {
@@ -89,7 +70,6 @@ pub fn parse_authorized_keys(content: &str) -> Vec<Entry> {
     out
 }
 
-/// "SHA256:<base64, no padding>", as `ssh-keygen -l` prints it.
 pub fn fingerprint(blob: &[u8]) -> String {
     format!("SHA256:{}", b64_encode_nopad(&Sha256::digest(blob)))
 }
@@ -108,7 +88,6 @@ fn is_key_type(w: &str) -> bool {
     )
 }
 
-/// A key blob starts with its own type as a length-prefixed string.
 fn blob_has_type(blob: &[u8], ty: &str) -> bool {
     if blob.len() < 4 {
         return false;
@@ -117,7 +96,6 @@ fn blob_has_type(blob: &[u8], ty: &str) -> bool {
     blob.get(4..4 + n) == Some(ty.as_bytes())
 }
 
-/// Printable, single-line, bounded: comments end up in chat messages.
 fn clean_comment(c: &str) -> Option<String> {
     let c: String = c
         .chars()
@@ -128,7 +106,6 @@ fn clean_comment(c: &str) -> Option<String> {
     (!c.is_empty()).then_some(c)
 }
 
-/// The user's home directory from /etc/passwd.
 fn home_of(user: &str) -> Option<PathBuf> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     home_in(&passwd, user)
@@ -141,13 +118,10 @@ fn home_in(passwd: &str, user: &str) -> Option<PathBuf> {
     })
 }
 
-/// The files sshd reads keys from for `user`, from `AuthorizedKeysFile`.
 fn key_files(user: &str, home: &Path) -> Vec<PathBuf> {
     expand_key_files(&authorized_keys_setting(), user, home)
 }
 
-/// `AuthorizedKeysFile` tokens: `%h` home, `%u` user, `%%` a percent sign;
-/// relative paths are relative to the home directory. `none` means none.
 fn expand_key_files(setting: &str, user: &str, home: &Path) -> Vec<PathBuf> {
     setting
         .split_whitespace()
@@ -165,7 +139,6 @@ fn expand_key_files(setting: &str, user: &str, home: &Path) -> Vec<PathBuf> {
                     Some('h') => out.push_str(&home.display().to_string()),
                     Some('u') => out.push_str(user),
                     Some('%') => out.push('%'),
-                    // Other tokens (%U, %f, ...) aren't worth guessing.
                     _ => return None,
                 }
             }
@@ -177,14 +150,9 @@ fn expand_key_files(setting: &str, user: &str, home: &Path) -> Vec<PathBuf> {
 
 const DEFAULT_KEY_FILES: &str = ".ssh/authorized_keys .ssh/authorized_keys2";
 
-/// sshd's effective configuration, and when it was read.
 static SSHD_T: Mutex<Option<(Instant, String)>> = Mutex::new(None);
-/// The last `refresh` result, not yet handed to the engine's audit.
 static FRESH: Mutex<Option<String>> = Mutex::new(None);
 
-/// Ask sshd for its effective configuration (`sshd -T`) and cache it; the
-/// next [`take_fresh`] hands it to the engine's audit. Blocking: run it on
-/// a blocking thread.
 pub fn refresh() {
     if let Some(t) = run_sshd_t() {
         *SSHD_T.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), t.clone()));
@@ -192,12 +160,10 @@ pub fn refresh() {
     }
 }
 
-/// The configuration from the last [`refresh`], once.
 pub fn take_fresh() -> Option<String> {
     FRESH.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
-/// The cached configuration, refreshed when older than ten minutes.
 fn sshd_t() -> Option<String> {
     {
         let c = SSHD_T.lock().unwrap_or_else(|e| e.into_inner());
@@ -215,7 +181,6 @@ fn sshd_t() -> Option<String> {
         .map(|(_, t)| t.clone())
 }
 
-/// `authorizedkeysfile` from `sshd -T`, or sshd's default.
 fn authorized_keys_setting() -> String {
     sshd_t()
         .and_then(|t| {
@@ -238,8 +203,6 @@ fn run_sshd_t() -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Read a regular file without ever blocking: the user owns this path, and
-/// a FIFO there must not stall the auth reader.
 fn read_regular(path: &Path) -> Option<String> {
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -274,7 +237,6 @@ fn b64_encode_nopad(data: &[u8]) -> String {
     out
 }
 
-/// Standard base64 with optional padding; `None` on anything else.
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim_end_matches('=');
     if s.is_empty() || s.len() % 4 == 1 {
@@ -300,8 +262,6 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    // `ssh-keygen -t ed25519 -C mohamed@laptop`, and what `ssh-keygen -lf`
-    // prints for it.
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICxgK1FBnWPQpbUiTaDLrWMKoqJSh/qj6dYN4vfuBeSX";
     const FP: &str = "SHA256:a/Uhk0KZ4L//wnF27P2IxjbktRYERimR+7gc99GB+8M";
@@ -321,7 +281,6 @@ mod tests {
         assert!(b64_decode("Zm9v!").is_none());
     }
 
-    // An RSA key (padding in its base64) and its `ssh-keygen -lf` output.
     const RSA: &str = "AAAAB3NzaC1yc2EAAAADAQABAAABAQCTQByryahUQV3SIspiectL89QQIsOWaoj0AF8eBlXWrwHXmfbkrjSwaUJ6W0qsdSFWtzK3tbORxf7zeXXoAsRW30yHHg68gte/XsyfLZf7XqeLIYJlWGaE4bON3cJhGI5uukRpxY9zAV/2dyKTI5mV5BWaHfamBcxj1gdnhcXHP3BqQct0PRuU3zTP9Jf52qP9K6tybMp6lAHUhv9RxMc/SOVXGe1UuoA7jECw6VI/p1HpnoVRNkjGDpWyEruhXMswnFB00pfQVh3z86f5VuLB2ftf0dBOyIrsVVNiY2vDBzzlg3AIRnFmaHBe8NsoIkPopwc2645LhRuR2yyDuNtH";
     const RSA_FP: &str = "SHA256:T2rIZudaMSj7sXDCrWRQuLXpXJNVuz9X3GY7DZTM1EM";
 
@@ -347,7 +306,6 @@ mod tests {
         let e = entries.iter().find(|e| e.fingerprint == FP).unwrap();
         assert_eq!(e.line, 4);
         assert_eq!(e.comment.as_deref(), Some("mohamed@laptop work"));
-        // The quoted "ssh-rsa" option and the corrupt blob aren't keys.
         assert_eq!(entries.len(), 1, "{:?}", entries);
     }
 
@@ -386,7 +344,6 @@ mod tests {
         let fifo = dir.join("authorized_keys");
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        // Would block forever with a plain open/read.
         assert!(read_regular(&fifo).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }

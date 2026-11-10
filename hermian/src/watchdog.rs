@@ -1,15 +1,3 @@
-//! `hermian watchdog`: the dead-man switch.
-//!
-//! A systemd timer runs this every minute. It checks the daemon's heartbeat
-//! and the unit state; if the daemon is wedged it pages, restarts it and
-//! leaves a note so the next start can explain the gap. If the unit failed
-//! (or is crash-looping) it pages and tries to start it. This is the one
-//! thing that still works when the daemon doesn't: it closes the "kill -9
-//! the security daemon and the host looks clean" hole.
-//!
-//! Alerts go straight out (persist + channels) because there is no daemon to
-//! hand them to, and repeats are rate-limited through a small state file.
-
 use std::fs;
 use std::time::{Duration, SystemTime};
 
@@ -22,19 +10,13 @@ use hermian_core::{Alert, DetectionId, Severity};
 use crate::status;
 use crate::{config, daemon, heartbeat, notify, paths, procsrc};
 
-/// Re-page at most this often while the problem persists.
 const REMIND_AFTER: Duration = Duration::from_secs(3600);
-/// A unit in `activating` this many times without a heartbeat is crash-looping.
 const CRASH_LOOP_RESTARTS: u64 = 5;
 
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
-    /// The daemon is fine, or intentionally stopped.
     Ok,
-    /// Unit is active but the heartbeat stopped; `age` is None when it never
-    /// appeared.
     Wedged { age: Option<Duration> },
-    /// systemd reports a failure or a crash loop.
     Failed,
 }
 
@@ -54,9 +36,6 @@ pub fn judge(
             },
         },
         "failed" => Verdict::Failed,
-        // Inactive is an intentional stop (systemctl stop, or uninstall in
-        // progress). Activating is systemd restarting the unit; only a
-        // sustained loop without a heartbeat is treated as a failure.
         "activating" if heartbeat_age.is_none() && restarts >= CRASH_LOOP_RESTARTS => {
             Verdict::Failed
         }
@@ -66,14 +45,12 @@ pub fn judge(
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct WatchdogState {
-    /// Heartbeat epoch-second stamp of the last alert (0: no heartbeat).
     #[serde(default)]
     last_stamp: u64,
     #[serde(default)]
     last_alert_at: Option<DateTime<Utc>>,
 }
 
-/// Page when the situation changed, or an hour has passed.
 fn should_alert(stamp: u64, prev: &WatchdogState, now: DateTime<Utc>) -> bool {
     if prev.last_stamp != stamp {
         return true;
@@ -172,8 +149,6 @@ fn respond(cfg: &NotificationsCfg, age: Option<Duration>, verdict: Verdict) -> R
         save_state(&st);
     }
 
-    // Restart even when the page was rate-limited; a wedged daemon that
-    // recovers must not wait out the reminder window.
     if matches!(verdict, Verdict::Wedged { .. }) {
         heartbeat::note_restart(&paths::watchdog_note_file(), &heartbeat_text(age));
     }
@@ -252,7 +227,6 @@ fn unit_restarts() -> u64 {
         .unwrap_or(0)
 }
 
-/// How long the unit has been active, from systemd's monotonic timestamp.
 fn unit_active_for() -> Option<Duration> {
     let micros: u64 = systemctl_show("ActiveEnterTimestampMonotonic")?
         .parse()
@@ -300,31 +274,23 @@ mod tests {
 
     #[test]
     fn judge_covers_the_unit_states() {
-        // Healthy: fresh heartbeat.
         assert_eq!(judge("active", secs(10), None, 0), Verdict::Ok);
-        // Wedged: heartbeat went quiet.
         assert_eq!(
             judge("active", secs(400), None, 0),
             Verdict::Wedged { age: secs(400) }
         );
-        // Just started: no heartbeat yet, still inside the grace period.
         assert_eq!(judge("active", None, secs(30), 0), Verdict::Ok);
-        // Started long ago but never wrote one.
         assert_eq!(
             judge("active", None, secs(600), 0),
             Verdict::Wedged { age: None }
         );
-        // If the start time can't be read, alert rather than stay quiet.
         assert_eq!(
             judge("active", None, None, 0),
             Verdict::Wedged { age: None }
         );
-        // Failed, and crash-looping without a heartbeat.
         assert_eq!(judge("failed", secs(5), None, 0), Verdict::Failed);
         assert_eq!(judge("activating", None, None, 12), Verdict::Failed);
-        // A normal restart cycle: activating, but not for long.
         assert_eq!(judge("activating", None, None, 1), Verdict::Ok);
-        // Intentional stops and unknown units stay silent.
         assert_eq!(judge("inactive", secs(9999), None, 0), Verdict::Ok);
         assert_eq!(judge("deactivating", None, None, 0), Verdict::Ok);
         assert_eq!(judge("unknown", None, None, 0), Verdict::Ok);
@@ -334,15 +300,11 @@ mod tests {
     fn alerts_change_with_the_situation_and_otherwise_remind_hourly() {
         let now = Utc::now();
         let mut st = WatchdogState::default();
-        // Never alerted: page.
         assert!(should_alert(100, &st, now));
         st.last_stamp = 100;
         st.last_alert_at = Some(now);
-        // Same situation again: quiet.
         assert!(!should_alert(100, &st, now + chrono::Duration::minutes(10)));
-        // A new heartbeat stamp means the situation changed: page.
         assert!(should_alert(200, &st, now + chrono::Duration::minutes(10)));
-        // Same situation after an hour: remind.
         assert!(should_alert(100, &st, now + chrono::Duration::minutes(61)));
     }
 }

@@ -1,8 +1,3 @@
-//! `hermian report`: a summary a beta tester can read, then choose to send.
-//!
-//! Counts and versions only. No host name, addresses, user names, paths or
-//! commands: the report is meant to be pasted into a public issue.
-
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -14,7 +9,6 @@ use crate::cli::ReportArgs;
 use crate::status::StatusState;
 use crate::ui::{humanize_secs, Style};
 
-/// Rules listed by name; the rest are summed in "other".
 const MAX_RULES: usize = 15;
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -23,9 +17,7 @@ pub struct Report {
     pub os: String,
     pub kernel: String,
     pub arch: String,
-    /// Days since the baseline started (the install), when known.
     pub installed_days: Option<i64>,
-    /// Seconds the daemon has been up, when it's running.
     pub daemon_uptime_secs: Option<i64>,
     pub ebpf: String,
     pub baseline: String,
@@ -52,16 +44,12 @@ pub struct RuleCount {
     pub count: u64,
 }
 
-/// What's known about the machine, gathered by the caller.
 pub struct HostFacts {
     pub os: String,
     pub kernel: String,
     pub arch: String,
 }
 
-/// An alert title safe to publish: dedup summaries fold into their rule,
-/// " via <process>" suffixes go, and a title that still carries a path or
-/// an address is withheld.
 fn public_title(title: &str) -> String {
     let t = title.strip_prefix("Repeated: ").unwrap_or(title);
     let t = t.split(" via ").next().unwrap_or(t).trim();
@@ -106,7 +94,6 @@ pub fn build(
             ))
             .or_default() += 1;
     }
-    // Most frequent first, then most severe.
     let mut rules: Vec<_> = rules.into_iter().collect();
     rules.sort_by(|a, b| b.1.cmp(&a.1).then(b.0 .1.cmp(&a.0 .1)).then(a.0.cmp(&b.0)));
     let other_rules = rules.iter().skip(MAX_RULES).map(|(_, n)| n).sum();
@@ -151,7 +138,6 @@ pub fn build(
     }
 }
 
-/// Names for the coverage keys `status` writes (d1..d5).
 fn coverage_name(key: &str) -> &str {
     match key {
         "d1" => "Process chains",
@@ -206,7 +192,6 @@ pub fn render(r: &Report, st: &Style) -> String {
     }
 
     out.push_str(&format!("\n{}\n", st.heading("ALERTS")));
-    // BTreeMap order is alphabetical; show most severe first.
     let order = ["CRITICAL", "HIGH", "LOW", "INFO"];
     let sev_line = order
         .iter()
@@ -295,7 +280,6 @@ fn os_name() -> String {
 }
 
 fn uname_field(f: fn(&libc::utsname) -> &[libc::c_char]) -> String {
-    // SAFETY: uname fills the struct; the fields are NUL-terminated.
     let mut u: libc::utsname = unsafe { std::mem::zeroed() };
     if unsafe { libc::uname(&mut u) } != 0 {
         return "unknown".to_string();

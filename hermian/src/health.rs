@@ -1,19 +1,9 @@
-//! Counters for telemetry the kernel or a collector had to drop.
-//!
-//! Collectors bump these; the daemon reads them every tick, pages when one
-//! grows, and shows the totals in `hermian status`. A fork/exec or file
-//! flood that overflows a buffer is a cheap way to go unseen, so a loss must
-//! reach the operator, not just the local log.
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// inotify queue overflows (each one is followed by a rescan).
 pub static INOTIFY_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
-/// Times the audit netlink socket reported ENOBUFS (records were lost).
 pub static AUDIT_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
-/// Totals since start, by source. Only non-zero ones are listed.
 pub fn snapshot() -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for (name, v) in [
@@ -38,7 +28,6 @@ pub fn snapshot() -> BTreeMap<String, u64> {
     out
 }
 
-/// Sources whose count grew between two snapshots, with the increase.
 pub fn grown(before: &BTreeMap<String, u64>, now: &BTreeMap<String, u64>) -> Vec<(String, u64)> {
     now.iter()
         .filter_map(|(k, v)| {

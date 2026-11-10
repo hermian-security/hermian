@@ -1,5 +1,3 @@
-//! D4 - Privilege escalation indicators.
-
 use crate::alert::Finding;
 use crate::detect::{content_tag, writer_label, Ctx};
 use crate::events::{
@@ -12,17 +10,12 @@ const PTRACE_ATTACH: u64 = 16;
 const PTRACE_SEIZE: u64 = 0x4206;
 
 pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
-    // Only attach/seize are interesting; TRACEME and the per-thread control
-    // requests that follow an attach are noise.
     if ev.request != PTRACE_ATTACH && ev.request != PTRACE_SEIZE {
         return Vec::new();
     }
     if ev.target_pid == ev.pid {
         return Vec::new();
     }
-    // Attaching to Hermian itself is how its memory gets rewritten or its
-    // events filtered. No exemption, debuggers included: nobody needs to
-    // debug the live daemon on a production host.
     if ctx.self_pid != 0 && ev.target_pid == ctx.self_pid {
         return vec![Finding::new(
             DetectionId::D4,
@@ -45,17 +38,12 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
             "Treat the host as compromised if the attach wasn't yours.",
         ])];
     }
-    // The exe comes from the tree: a binary merely named gdb isn't a debugger.
-    // With no exe at all (a forked child we never saw exec), the name alone
-    // would be trusted, and `prctl(PR_SET_NAME, "gdb")` costs nothing, so
-    // only a known exe can earn the exemption.
     let exe = ctx.tree.get(ev.pid).map(|p| p.exe.as_str()).unwrap_or("");
     let trusted_tool = !exe.is_empty()
         && (role_of(&ev.comm, exe) == Role::Debugger || is_container_runtime(&ev.comm, exe));
     if trusted_tool || ctx.allowlist.debugger_allowed(&ev.comm) {
         return Vec::new();
     }
-    // A parent tracing its own child (test harnesses, sandboxes, language runtimes).
     let target_is_descendant = ctx
         .tree
         .ancestors_of(ev.target_pid)
@@ -101,8 +89,6 @@ pub fn evaluate_ptrace(ev: &PtraceEvent, ctx: &Ctx) -> Vec<Finding> {
     ])]
 }
 
-/// Build drivers that set LD_PRELOAD for their children (fakeroot, sanitizer
-/// and test harnesses).
 const BUILD_TOOLS: &[&str] = &[
     "make",
     "cargo",
@@ -119,11 +105,8 @@ pub fn evaluate_exec(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
     if ctx.allowlist.binary_allowed(&ev.exe) {
         return Vec::new();
     }
-    // Developers and profilers set LD_PRELOAD interactively all the time
-    // (jemalloc, ASan, fakeroot, libeatmydata...). Escalate only when unattended.
     let interactive = ctx.tree.has_interactive_session(ev.pid, ev.tty_nr);
     let chain = ctx.tree.chain_of(ev.pid);
-    // By installed exe, not by name: anything can call itself `make`.
     let from_build_tool = chain
         .iter()
         .any(|p| is_system_tool(&p.comm, &p.exe, BUILD_TOOLS) && !p.exe.is_empty());
@@ -145,8 +128,6 @@ pub fn evaluate_exec(ev: &ExecEvent, ctx: &Ctx) -> Vec<Finding> {
         DetectionId::D4,
         Severity::High,
         "LD_PRELOAD injection in an unattended process",
-        // Per chain, not per program: one implant preloading into node,
-        // timeout and ls is one incident.
         &format!("d4|ld-preload-env|{}|{}", ctx.incident_root(ev.pid), ev.uid),
     )
     .varies("Executables", &ev.exe)
@@ -198,9 +179,6 @@ fn suid_in_transient(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !ev.is_suid || !is_user_owned_location(&ev.path) {
         return None;
     }
-    // Vendor software installs setuid helpers under /opt (Chrome's
-    // chrome-sandbox): still worth a page, but not a CRITICAL that can
-    // auto-isolate the host.
     let severity = if ev.path.starts_with("/opt/") {
         Severity::High
     } else {
@@ -294,7 +272,6 @@ fn sudoers(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     {
         return None;
     }
-    // Editor lock files (visudo's own `.tmp`, sudoers.tmp) never hold rules.
     if ev.path.ends_with(".tmp") {
         return None;
     }
@@ -363,22 +340,11 @@ fn is_installer_chain(pid: u32, ctx: &Ctx) -> bool {
     })
 }
 
-/// Whether a tool seen running recently may stand in for a writer we
-/// couldn't identify.
-///
-/// Running the real tool proves nothing about who wrote the file:
-/// `visudo -c` or `passwd -S root` and then a direct write to sudoers or
-/// shadow used to pass as the tool's own write. So the tool also has to have
-/// been started by an operator at a session or by a package/config manager,
-/// not by cron, a service or some other unattended process.
 fn recent_tool_counts(p: &crate::events::ProcInfo, ctx: &Ctx) -> bool {
     ctx.tool_exemption_applies(p.pid)
         && (ctx.tree.has_interactive_session(p.pid, p.tty_nr) || is_installer_chain(p.pid, ctx))
 }
 
-/// The standard tools write account files via temp+rename and exit at once,
-/// so the writer is usually gone by the time we look. A user-management tool
-/// (or a package manager) that ran in the last few seconds is the writer.
 fn recent_account_tool(ctx: &Ctx) -> bool {
     ctx.tree
         .recent_process(ctx.now, chrono::Duration::seconds(8), |p| {
@@ -398,7 +364,6 @@ fn account_files(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
     if !sensitive && !account {
         return None;
     }
-    // Lock files and backups the tools leave behind.
     if let Some(w) = &ev.writer {
         if (is_user_mgmt_tool(&w.comm, &w.exe) || is_installer_chain(w.pid, ctx))
             && ctx.tool_exemption_applies(w.pid)
@@ -409,8 +374,6 @@ fn account_files(ev: &FileEvent, ctx: &Ctx) -> Option<Finding> {
         return None;
     }
     let attribution = ctx.attribute(ev);
-    // `account` files are diffed by D2 which produces the actionable alert; here
-    // we only escalate the shadow files or clearly unattended direct writes.
     if account && attribution.is_interactive() {
         return None;
     }
@@ -551,7 +514,6 @@ mod tests {
         let mut eng = engine();
         let t = Utc::now();
         base(&mut eng, t);
-        // `visudo -c` from a cron job, then a direct write.
         eng.process(Event::Exec(exec(t, 402, 401, "visudo", "/usr/sbin/visudo")));
         let a = eng.process(file(
             t + Duration::seconds(1),
@@ -584,7 +546,6 @@ mod tests {
             Some("eve ALL=(ALL) ALL\nmallory ALL=(ALL) ALL\n"),
         ));
         assert!(d4_at_least(&second, Severity::High), "{:?}", second);
-        // The identical content again is.
         let again = eng.process(file(
             t + Duration::seconds(40),
             "/etc/sudoers.d/90-x",
@@ -656,7 +617,6 @@ mod tests {
             "systemd",
             "/usr/lib/systemd/systemd",
         )));
-        // A forked child we never saw exec: no exe in the tree.
         let a = eng.process(Event::Ptrace(PtraceEvent {
             ts: t,
             pid: 777,

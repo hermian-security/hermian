@@ -1,5 +1,3 @@
-//! Config/baseline persistence with secure, atomic writes.
-
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -11,7 +9,6 @@ use hermian_core::{Baseline, Config};
 use crate::paths;
 
 pub fn require_root() -> Result<()> {
-    // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         anyhow::bail!("this command requires root; re-run with sudo");
     }
@@ -49,12 +46,10 @@ pub fn save_default_config() -> Result<()> {
     write_secure(&path, hermian_core::DEFAULT_CONFIG_TOML)
 }
 
-/// Write `content` to `path` with mode 0600 atomically (temp file + rename).
 pub fn write_secure(path: &Path, content: &str) -> Result<()> {
     write_secure_bytes(path, content.as_bytes())
 }
 
-/// Byte version of [`write_secure`].
 pub fn write_secure_bytes(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
@@ -81,11 +76,6 @@ pub fn write_secure_bytes(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Replace an existing system file atomically, keeping its mode and owner.
-///
-/// For files other programs depend on, like `/etc/pam.d/sshd`: a crash or a
-/// full disk halfway through a plain `fs::write` left a truncated PAM stack,
-/// and that locks everyone out of SSH.
 pub fn replace_file_keep_mode(path: &Path, content: &str) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;

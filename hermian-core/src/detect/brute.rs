@@ -1,14 +1,3 @@
-//! Brute force against existing accounts: a weekly digest, and one alert
-//! when a single source is hammering an account that accepts a password.
-//!
-//! Failed logins for usernames that don't exist (admin, test, oracle...) are
-//! the internet's background noise and stay out of both. The digest is only
-//! produced when a period saw real attempts against accounts that can log in,
-//! lists sources with enough of them to matter, and is only *sent* when one
-//! of those accounts accepts a password: otherwise the attempts can't
-//! succeed and it's recorded, not sent. The fast alert is for the attack in
-//! progress, against an account a password could open.
-
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -18,17 +7,11 @@ use crate::alert::Finding;
 use crate::events::{DetectionId, Severity};
 use crate::response::ResponseAction;
 
-/// Most sources tracked per period (rotating IPv6 scanners mustn't grow it).
 const MAX_SOURCES: usize = 20_000;
-/// Usernames remembered per source.
 const MAX_USERS: usize = 8;
-/// Accounts counted per period (only existing login accounts get here).
 const MAX_ACCOUNTS: usize = 64;
-/// Sources listed in the digest's text.
 const TOP_LISTED: usize = 5;
-/// Sources its one "Block" button covers.
 const BLOCK_ALL_MAX: usize = 50;
-/// How long "Remind me later" silences the root-password warning.
 pub const ROOT_WARNING_SNOOZE_DAYS: u32 = 7;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,16 +21,12 @@ pub struct SourceStats {
     pub last: Option<DateTime<Utc>>,
 }
 
-/// A finished period: when it started, its sources (busiest first), and the
-/// attempts per account (busiest first).
 pub struct DigestPeriod {
     pub started: DateTime<Utc>,
     pub sources: Vec<(IpAddr, SourceStats)>,
     pub accounts: Vec<(String, u32)>,
 }
 
-/// The digest's running period. Saved by the daemon, so a week survives
-/// restarts.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BruteDigest {
     started: Option<DateTime<Utc>>,
@@ -57,7 +36,6 @@ pub struct BruteDigest {
 }
 
 impl BruteDigest {
-    /// One failed login against an existing account.
     pub fn record(&mut self, ip: IpAddr, user: &str, now: DateTime<Utc>) {
         self.started.get_or_insert(now);
         if self.accounts.contains_key(user) || self.accounts.len() < MAX_ACCOUNTS {
@@ -74,13 +52,10 @@ impl BruteDigest {
         }
     }
 
-    /// Forget a source (it was ignored or blocked).
     pub fn forget(&mut self, ip: &IpAddr) {
         self.sources.remove(ip);
     }
 
-    /// The period's data, if `period` has passed since its first failure.
-    /// Resets for the next period either way.
     pub fn take_if_due(&mut self, now: DateTime<Utc>, period: Duration) -> Option<DigestPeriod> {
         let started = self.started?;
         if now - started < period {
@@ -107,8 +82,6 @@ impl BruteDigest {
     }
 }
 
-/// Whether a password could open `user`'s account, from `sshd -T`
-/// (`(root, others)`; `None` until sshd answered, which counts as yes).
 pub fn password_could_work(user: &str, password_guessable: Option<(bool, bool)>) -> bool {
     match password_guessable {
         None => true,
@@ -122,7 +95,6 @@ pub fn password_could_work(user: &str, password_guessable: Option<(bool, bool)>)
     }
 }
 
-/// "1 240" style thousands, for counts in alert text.
 fn count(n: u32) -> String {
     let s = n.to_string();
     let mut out = String::new();
@@ -135,7 +107,6 @@ fn count(n: u32) -> String {
     out
 }
 
-/// Build the digest alert, or nothing if no source reached `min_attempts`.
 pub fn digest_finding(
     period: DigestPeriod,
     min_attempts: u32,
@@ -157,7 +128,6 @@ pub fn digest_finding(
         tried.extend(s.users.iter().map(String::as_str));
     }
     let root_targeted = tried.contains("root");
-    // Sent only if a password could open one of the accounts tried.
     let guessable: Vec<&str> = tried
         .iter()
         .copied()
@@ -194,7 +164,6 @@ pub fn digest_finding(
          is different from the constant scanning for 'admin' or 'test'. A strong password or \
          key-only login stops them; blocking the sources stops the noise."
     });
-    // Only worth saying while someone is actually trying.
     let warn_root = root_password_login && root_targeted;
     if warn_root {
         why.push_str(
@@ -239,7 +208,6 @@ pub fn digest_finding(
             "Block the sources if they keep coming back.",
         ])
     };
-    // One button: blocking them all. One per source made a wall of buttons.
     f = f.offer(ResponseAction::Block {
         sources: listed
             .iter()
@@ -250,10 +218,8 @@ pub fn digest_finding(
     Some(f)
 }
 
-/// Signature prefix of the fast alert, one per source.
 pub const LIVE_SIG: &str = "d2|brute-live|";
 
-/// A source hammering accounts that accept a password, right now.
 pub fn live_finding(ip: IpAddr, users: &[String], failures: usize, window_secs: u64) -> Finding {
     Finding::new(
         DetectionId::D2,
@@ -329,7 +295,6 @@ mod tests {
             })
         }
 
-        /// `n` failures, `gap` seconds apart; returns every alert raised.
         fn hammer_at(
             e: &mut Engine,
             t: DateTime<Utc>,
@@ -346,7 +311,6 @@ mod tests {
             out
         }
 
-        /// Slow enough never to trip the fast alert.
         fn hammer(e: &mut Engine, t: DateTime<Utc>, user: &str, ip: &str, n: i64) {
             hammer_at(e, t, user, ip, n, 30);
         }
@@ -365,8 +329,8 @@ mod tests {
         fn the_digest_is_weekly_and_counts_per_account() {
             let mut e = engine();
             let t = Utc::now();
-            hammer(&mut e, t, "admin", "198.51.100.1", 50); // doesn't exist
-            hammer(&mut e, t, "www-data", "198.51.100.2", 50); // no login shell
+            hammer(&mut e, t, "admin", "198.51.100.1", 50);
+            hammer(&mut e, t, "www-data", "198.51.100.2", 50);
             hammer(&mut e, t, "deploy", "198.51.100.3", 12);
             hammer(&mut e, t, "root", "198.51.100.4", 30);
             assert!(
@@ -381,7 +345,6 @@ mod tests {
             assert!(accounts.starts_with("root (30 tries"), "{}", accounts);
             assert!(accounts.contains("deploy (12 tries"), "{}", accounts);
             assert!(!accounts.contains("admin") && !accounts.contains("www-data"));
-            // One button: block them all.
             let labels: Vec<String> = d.offers.iter().map(|o| o.label()).collect();
             assert_eq!(labels, vec!["Block all (2)"]);
         }
@@ -429,7 +392,7 @@ mod tests {
         #[test]
         fn hammering_a_password_account_pages_at_once() {
             let mut e = engine();
-            e.set_sshd_auth(false, true, false); // deploy accepts passwords
+            e.set_sshd_auth(false, true, false);
             let t = Utc::now();
             let a = hammer_at(&mut e, t, "deploy", "198.51.100.9", 20, 2);
             let live: Vec<&Alert> = a
@@ -445,7 +408,6 @@ mod tests {
             );
             let labels: Vec<String> = live[0].offers.iter().map(|o| o.label()).collect();
             assert_eq!(labels, vec!["Block 198.51.100.9"]);
-            // Slower than the threshold: nothing.
             let slow = hammer_at(&mut e, t, "deploy", "198.51.100.10", 20, 5);
             assert!(!slow
                 .iter()
@@ -455,7 +417,7 @@ mod tests {
         #[test]
         fn hammering_a_keys_only_account_doesnt_page() {
             let mut e = engine();
-            e.set_sshd_auth(false, false, false); // keys only
+            e.set_sshd_auth(false, false, false);
             let t = Utc::now();
             let a = hammer_at(&mut e, t, "root", "198.51.100.9", 40, 1);
             assert!(!a.iter().any(|a| a.title == "SSH brute force in progress"));
@@ -530,8 +492,6 @@ mod tests {
         assert!(digest_finding(p, 10, 7, true, None).is_none());
     }
 
-    /// On a key-only host the same attempts are recorded, not sent: they
-    /// can't succeed. Unknown, or a Match block, keeps the page.
     #[test]
     fn attempts_that_cant_succeed_are_not_sent() {
         let period = |users: &[&str]| {

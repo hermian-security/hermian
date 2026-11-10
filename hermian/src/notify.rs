@@ -1,14 +1,3 @@
-//! Alert delivery.
-//!
-//! Every alert is persisted as JSON and written to the always-on channels
-//! (journald, file). Notifying channels (stdout, webhook) only receive alerts
-//! at or above `notifications.min_severity`. Each notifying channel has its own
-//! queue and backoff, so one broken channel doesn't hold up the others. Alerts
-//! a channel will never accept (HTTP 400/413, SMTP 5xx) are dropped for that
-//! channel; other failures are retried. If a channel keeps failing for 15
-//! minutes a CRITICAL is logged locally so the operator learns the alert path
-//! is broken.
-
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -31,20 +20,14 @@ pub struct NotifyState {
     pub failures: u64,
     #[serde(default)]
     pub pending: usize,
-    /// Most recent channel error, e.g. "telegram: HTTP 401 Unauthorized".
     #[serde(default)]
     pub last_error: String,
-    /// Successful deliveries per channel since the daemon started.
     #[serde(default)]
     pub per_channel: BTreeMap<String, u64>,
-    /// Alerts each notifying channel still owes.
     #[serde(default)]
     pub pending_by_channel: BTreeMap<String, usize>,
-    /// Alerts a channel gave up on: queue overflow or a permanent rejection.
     #[serde(default)]
     pub dropped_by_channel: BTreeMap<String, u64>,
-    /// Channels that just passed 15 minutes of failures, with their last
-    /// error, for the daemon to page about (see `take_failing`).
     #[serde(skip)]
     pub newly_failing: Vec<(String, String)>,
 }
@@ -54,12 +37,8 @@ pub struct Notifier {
     pub state: Arc<Mutex<NotifyState>>,
 }
 
-/// Alerts waiting to be persisted and fanned out. Bounded: if persistence
-/// stalls (a hung disk) during an alert flood, memory mustn't grow forever.
 const NOTIFIER_QUEUE: usize = 8192;
 
-// Both are sent by value on purpose: alerts are the hot path and stay
-// unboxed, and a reconfigure is rare enough that its size doesn't matter.
 #[allow(clippy::large_enum_variant)]
 enum Msg {
     Alert(Alert),
@@ -78,20 +57,16 @@ fn syslog_prio(severity: Severity) -> libc::c_int {
 }
 
 pub fn syslog_msg(severity: Severity, text: &str) -> bool {
-    OPENLOG.call_once(|| {
-        // SAFETY: static NUL-terminated ident; openlog keeps the pointer.
-        unsafe {
-            libc::openlog(
-                c"hermian".as_ptr(),
-                libc::LOG_PID | libc::LOG_NDELAY,
-                libc::LOG_DAEMON,
-            );
-        }
+    OPENLOG.call_once(|| unsafe {
+        libc::openlog(
+            c"hermian".as_ptr(),
+            libc::LOG_PID | libc::LOG_NDELAY,
+            libc::LOG_DAEMON,
+        );
     });
     let Ok(cstr) = std::ffi::CString::new(text) else {
         return false;
     };
-    // SAFETY: format string is a static "%s"; cstr outlives the call.
     unsafe {
         libc::syslog(syslog_prio(severity), c"%s".as_ptr(), cstr.as_ptr());
     }
@@ -113,7 +88,6 @@ impl Notifier {
         if let Err(mpsc::error::TrySendError::Full(Msg::Alert(a))) =
             self.tx.try_send(Msg::Alert(alert))
         {
-            // Still logged locally, so the alert isn't lost outright.
             syslog_msg(
                 a.severity,
                 &format!("hermian: alert queue full, not persisted: {}", a.headline()),
@@ -125,9 +99,6 @@ impl Notifier {
     }
 
     pub fn reconfigure(&self, cfg: NotificationsCfg) {
-        // In order with alerts when there's room (the reload notice must go
-        // to the new channels); config changes are rare and must not be lost,
-        // so wait for room otherwise.
         if let Err(mpsc::error::TrySendError::Full(m)) = self.tx.try_send(Msg::Reconfigure(cfg)) {
             let tx = self.tx.clone();
             tokio::spawn(async move {
@@ -136,7 +107,6 @@ impl Notifier {
         }
     }
 
-    /// Channels that started failing for good since the last call.
     pub fn take_failing(&self) -> Vec<(String, String)> {
         self.state
             .lock()
@@ -148,9 +118,6 @@ impl Notifier {
         self.state.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    /// Wait until `ref_id` has reached at least one notifying channel (or
-    /// was persisted locally, if it's below `min_severity` or no channel is
-    /// set up), up to `timeout`. Returns whether it got there.
     pub async fn wait_delivered(&self, ref_id: &str, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         let prefix = format!("{} ", ref_id);
@@ -171,18 +138,13 @@ impl Notifier {
     }
 }
 
-/// Alerts waiting for one notifying channel to accept them.
 const MAX_PENDING: usize = 500;
 
-/// Channels that deliver to a human (gated by `min_severity`, retried).
 pub const NOTIFYING_CHANNELS: &[&str] = &["telegram", "email", "webhook", "stdout"];
 
 const FIRST_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_BACKOFF: Duration = Duration::from_secs(120);
 
-/// A delivery failure. Permanent ones (a request the endpoint will never
-/// accept, e.g. HTTP 400/413 or an SMTP 5xx) drop the alert for that channel
-/// instead of blocking everything queued behind it.
 #[derive(Debug, Clone)]
 pub struct SendError {
     pub msg: String,
@@ -204,8 +166,6 @@ impl SendError {
         }
     }
 
-    /// Classify an HTTP error status. Auth, not-found and rate-limit errors
-    /// stay transient: fixing the config (or waiting) makes them succeed.
     pub fn http(code: u16, msg: impl Into<String>) -> Self {
         SendError {
             msg: msg.into(),
@@ -225,9 +185,6 @@ enum ChanMsg {
     Config(Box<NotificationsCfg>),
 }
 
-/// Persist every alert right away, then hand notifying channels their copy.
-/// Each channel runs as its own task with its own queue and backoff, so a
-/// broken or slow channel never delays the others (or local persistence).
 async fn worker(
     mut rx: mpsc::Receiver<Msg>,
     mut cfg: NotificationsCfg,
@@ -238,7 +195,6 @@ async fn worker(
     while let Some(msg) = rx.recv().await {
         match msg {
             Msg::Alert(alert) => {
-                // fsync'd file writes and syslog: off the async workers.
                 let (a, c) = (alert.clone(), cfg.clone());
                 let _ = tokio::task::spawn_blocking(move || {
                     let rendered_plain = hermian_core::render(&a, Theme::Plain);
@@ -261,8 +217,6 @@ async fn worker(
     }
 }
 
-/// Start tasks for newly enabled channels, stop removed ones (dropping the
-/// sender ends the task and its queue), and pass the new config to the rest.
 fn sync_channels(
     channels: &mut BTreeMap<&'static str, mpsc::UnboundedSender<ChanMsg>>,
     cfg: &NotificationsCfg,
@@ -289,9 +243,6 @@ fn sync_channels(
     }
 }
 
-/// One alert waiting for a channel, with its on-disk copy. The copy makes
-/// delivery survive a daemon restart (at-least-once: a crash mid-send can
-/// duplicate an alert, never lose one).
 struct Pending {
     alert: Alert,
     file: Option<PathBuf>,
@@ -300,20 +251,15 @@ struct Pending {
 struct ChannelQueue {
     name: &'static str,
     queue: VecDeque<Pending>,
-    /// Where queued alerts are persisted; `None` disables the disk copy.
     pending_dir: Option<PathBuf>,
     cfg: NotificationsCfg,
     backoff: Duration,
     failing_since: Option<DateTime<Utc>>,
     alarm_sent: bool,
-    /// Alerts given up on since start (overflow or permanent rejection).
     dropped: u64,
 }
 
 impl ChannelQueue {
-    /// Persist `alert` so it survives a restart, returning the file to
-    /// delete on delivery. Best-effort: without it, delivery still works
-    /// but a crash loses the alert.
     fn save(&self, alert: &Alert) -> Option<PathBuf> {
         let dir = self.pending_dir.as_ref()?;
         let result = (|| -> anyhow::Result<PathBuf> {
@@ -358,8 +304,6 @@ impl ChannelQueue {
         }
     }
 
-    /// Make room when the queue is full: drop the oldest alert below
-    /// CRITICAL, or the oldest overall if everything queued is CRITICAL.
     fn make_room(&mut self) {
         if self.queue.len() < MAX_PENDING {
             return;
@@ -377,7 +321,6 @@ impl ChannelQueue {
 
     fn note_drop(&mut self, alert: &Alert, why: &str) {
         self.dropped += 1;
-        // Every drop is logged locally, so the alert isn't lost outright.
         syslog_msg(
             Severity::High,
             &format!(
@@ -387,7 +330,6 @@ impl ChannelQueue {
         );
     }
 
-    /// Returns false once the channel has been removed.
     fn take(&mut self, msg: Option<ChanMsg>) -> bool {
         match msg {
             Some(ChanMsg::Alert(a)) => {
@@ -398,7 +340,6 @@ impl ChannelQueue {
             }
             Some(ChanMsg::Config(c)) => {
                 self.cfg = *c;
-                // New settings deserve a prompt retry.
                 self.backoff = FIRST_BACKOFF;
                 true
             }
@@ -447,8 +388,6 @@ impl ChannelQueue {
 
 type SendFn = fn(&str, &Alert, &NotificationsCfg) -> Result<(), SendError>;
 
-/// Alerts a previous run left on disk, oldest first. Files that don't parse
-/// are removed, not retried forever.
 fn load_pending(dir: &Path) -> VecDeque<Pending> {
     let Ok(entries) = fs::read_dir(dir) else {
         return VecDeque::new();
@@ -459,8 +398,6 @@ fn load_pending(dir: &Path) -> VecDeque<Pending> {
         .filter(|p| p.is_file())
         .collect();
     files.sort();
-    // Over the cap, the oldest go: they matter least, and the alert store
-    // still has them.
     while files.len() > MAX_PENDING {
         let _ = fs::remove_file(files.remove(0));
     }
@@ -519,7 +456,6 @@ async fn run_channel(
         dropped: 0,
     };
     loop {
-        // Pick up everything already queued without waiting.
         loop {
             match rx.try_recv() {
                 Ok(m) => {
@@ -540,8 +476,6 @@ async fn run_channel(
         let cfg = q.cfg.clone();
         let result = tokio::task::spawn_blocking(move || send(name, &alert, &cfg))
             .await
-            // A panicking send is a failure, not a delivery. (Release builds
-            // abort on panic instead; see Cargo.toml.)
             .unwrap_or_else(|e| Err(SendError::transient(format!("send panicked: {}", e))));
         match result {
             Ok(()) => {
@@ -568,8 +502,6 @@ async fn run_channel(
                 q.publish(&state);
                 let deadline = tokio::time::Instant::now() + q.backoff;
                 q.backoff = (q.backoff * 2).min(MAX_BACKOFF);
-                // New alerts join the queue but don't cut the backoff short;
-                // a config change does.
                 loop {
                     tokio::select! {
                         m = rx.recv() => {
@@ -598,14 +530,10 @@ fn notifying_channels(cfg: &NotificationsCfg) -> Vec<&'static str> {
         .collect()
 }
 
-/// Deliver one alert to one notifying channel.
 pub fn notify_one(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), String> {
     send_classified(channel, alert, cfg).map_err(|e| e.msg)
 }
 
-/// Record an alert and deliver it to every channel right now, synchronously.
-/// Used by `hermian watchdog`: with the daemon down there is no worker to
-/// hand this to. Returns the channels that failed.
 pub fn store_and_send(alert: &Alert, cfg: &NotificationsCfg) -> Vec<(String, String)> {
     persist(alert, &hermian_core::render(alert, Theme::Plain), cfg);
     let mut errors = Vec::new();
@@ -620,7 +548,6 @@ pub fn store_and_send(alert: &Alert, cfg: &NotificationsCfg) -> Vec<(String, Str
 }
 
 fn send_classified(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Result<(), SendError> {
-    // Minimal content: what leaves the host is the reference, not the story.
     let minimal;
     let alert = if cfg.content == "minimal" && leaves_host(channel) {
         minimal = alert.minimal();
@@ -640,7 +567,6 @@ fn send_classified(channel: &str, alert: &Alert, cfg: &NotificationsCfg) -> Resu
     }
 }
 
-/// Channels that send the alert to someone else's server.
 fn leaves_host(channel: &str) -> bool {
     matches!(channel, "webhook" | "telegram" | "email")
 }
@@ -652,12 +578,9 @@ fn mark_delivered(state: &Arc<Mutex<NotifyState>>, alert: &Alert) {
     }
 }
 
-/// Always-on: JSON record, journald, alerts.log.
 fn persist(alert: &Alert, rendered: &str, cfg: &NotificationsCfg) {
     save_alert_json(alert);
     if cfg.has_channel("journald") {
-        // journald gets the compact headline as the message and the full body
-        // so `journalctl -t hermian` stays scannable.
         syslog_msg(alert.severity, &alert.headline());
         syslog_msg(alert.severity, rendered);
     }
@@ -681,8 +604,6 @@ fn save_alert_json(alert: &Alert) {
     let result = (|| -> anyhow::Result<()> {
         fs::create_dir_all(&dir)?;
         let text = serde_json::to_string_pretty(alert)?;
-        // Never replace an existing record: if a ref id ever repeats (state
-        // lost, clock trouble), keep both.
         let mut path = dir.join(format!("{}.json", alert.ref_id));
         let mut n = 1;
         while path.exists() && n < 1000 {
@@ -692,7 +613,6 @@ fn save_alert_json(alert: &Alert) {
         config::write_secure(&path, &text)
     })();
     if let Err(e) = result {
-        // Was silent; `show`/`collect` would then say the alert doesn't exist.
         syslog_msg(
             Severity::High,
             &format!("hermian: could not store alert {}: {:#}", alert.ref_id, e),
@@ -720,11 +640,8 @@ pub mod webhook {
         }
     }
 
-    /// The mark, served from the site. Discord's servers fetch it, not the
-    /// host, so nothing about the host leaks.
     const AVATAR_URL: &str = "https://hermian.me/icon-192.png";
 
-    /// Severity colours from the identity's dark palette (Discord is dark).
     fn discord_colour(sev: Severity) -> u32 {
         match sev {
             Severity::Critical => 0xFF6B81,
@@ -734,7 +651,6 @@ pub mod webhook {
         }
     }
 
-    /// Cut to Discord's per-field limits, marking the cut.
     fn cut(s: &str, max: usize) -> String {
         if s.chars().count() <= max {
             return s.to_string();
@@ -744,14 +660,10 @@ pub mod webhook {
         out
     }
 
-    /// Inline code that a backtick in the value can't break out of.
     fn code(s: &str) -> String {
         format!("`{}`", s.replace('`', "'"))
     }
 
-    /// Author line with meter and detection, the title alone, the sentence
-    /// as a quote (the path in it as code), host and a live relative time,
-    /// then risk, steps and the command.
     fn discord(alert: &Alert) -> Value {
         let mut what = cut(&alert.what, 1500);
         if let Some(p) = alert.facts.iter().find(|f| f.label == "Path") {
@@ -794,8 +706,6 @@ pub mod webhook {
         json!({
             "username": "Hermian",
             "avatar_url": AVATAR_URL,
-            // Alert text carries attacker-controlled strings (an SSH user
-            // named "@everyone"); never let it ping anyone.
             "allowed_mentions": {"parse": []},
             "embeds": [{
                 "author": {"name": format!(
@@ -856,7 +766,6 @@ pub mod webhook {
                 })
             }
             "discord" => discord(alert),
-            // m.room.message; Matrix clients render formatted_body.
             "matrix" => json!({
                 "msgtype": "m.text",
                 "body": compact,
@@ -889,9 +798,6 @@ pub mod webhook {
         }
     }
 
-    /// `scheme://host[:port]` only. Slack/Discord/ntfy webhook URLs carry
-    /// their secret in the path or query, so the full URL must never be
-    /// shown in status, logs or errors.
     pub fn display_url(url: &str) -> String {
         match url.split_once("://") {
             Some((scheme, rest)) => {
@@ -903,8 +809,6 @@ pub mod webhook {
         }
     }
 
-    /// ureq errors include the request URL; replace it (and the bearer
-    /// token, should it ever appear) before the text goes anywhere.
     fn redact(cfg: &WebhookCfg, e: impl std::fmt::Display) -> String {
         let mut s = e.to_string();
         if !cfg.url.is_empty() {
@@ -913,13 +817,9 @@ pub mod webhook {
         if !cfg.token.is_empty() {
             s = s.replace(&cfg.token, "<token>");
         }
-        // The library may print the URL normalised (host case, escaping), so
-        // the literal replace above can miss it: cut every URL in the text
-        // down to scheme://host as well.
         strip_url_paths(&s)
     }
 
-    /// `... https://host/secret/path?q ...` -> `... https://host/… ...`.
     pub fn strip_url_paths(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut rest = s;
@@ -948,9 +848,6 @@ pub mod webhook {
             .replace('>', "&gt;")
     }
 
-    /// `https://ntfy.example/alerts` -> (`https://ntfy.example/`, `alerts`).
-    /// The topic is the URL's last path segment; a self-hosted server under a
-    /// sub-path (`https://host/ntfy/alerts`) keeps its prefix in the root.
     pub fn ntfy_target(url: &str) -> Option<(String, String)> {
         let (scheme, rest) = url.split_once("://")?;
         let rest = rest.split(['?', '#']).next().unwrap_or("");
@@ -969,8 +866,6 @@ pub mod webhook {
         ))
     }
 
-    /// Matrix sends are a PUT to `<room send endpoint>/<transaction id>`; the
-    /// id makes a retried delivery post once.
     pub fn matrix_url(base: &str, alert: &Alert) -> String {
         let txn: String = format!("hermian-{}-{}", alert.ref_id, alert.ts.timestamp_millis())
             .chars()
@@ -986,8 +881,6 @@ pub mod webhook {
         let mut req = if cfg.format == "matrix" {
             agent.put(&matrix_url(&cfg.url, alert))
         } else if cfg.format == "ntfy" {
-            // ntfy only reads a JSON body at the server root, with the topic
-            // inside it; posted to the topic URL, the JSON is shown as text.
             match ntfy_target(&cfg.url) {
                 Some((root, topic)) => {
                     body["topic"] = json!(topic);
@@ -1077,9 +970,6 @@ mod tests {
         assert_eq!(n["priority"], 4);
     }
 
-    /// Meter and detection in the author line, the title alone, the path
-    /// as code in the quoted sentence, the risk and steps as fields, and
-    /// alert text can never ping anyone.
     #[test]
     fn discord_embed_layout() {
         let f = Finding::new(
@@ -1189,7 +1079,6 @@ mod tests {
         q.take(Some(ChanMsg::Alert(Box::new(with_ref("HER-1")))));
         q.take(Some(ChanMsg::Alert(Box::new(with_ref("HER-2")))));
         assert_eq!(fs::read_dir(&d).unwrap().count(), 2);
-        // Overflow: the dropped alert's copy goes with it.
         for i in 0..MAX_PENDING {
             let mut a = alert();
             a.ref_id = format!("HER-CRIT-{}", i);
@@ -1197,7 +1086,6 @@ mod tests {
             q.take(Some(ChanMsg::Alert(Box::new(a))));
         }
         assert_eq!(fs::read_dir(&d).unwrap().count(), MAX_PENDING);
-        // Delivery removes the copy it was carrying.
         let delivered = q.queue.pop_front().unwrap();
         ChannelQueue::forget(&delivered.file);
         assert_eq!(fs::read_dir(&d).unwrap().count(), MAX_PENDING - 1);
@@ -1212,7 +1100,6 @@ mod tests {
             let name = format!("{}-{}.json", a.ts.timestamp_millis(), a.ref_id);
             fs::write(d.join(name), serde_json::to_string(&a).unwrap()).unwrap();
         }
-        // A file that doesn't parse is dropped, not retried forever.
         fs::write(d.join("junk.json"), "{not json").unwrap();
         let state = Arc::new(Mutex::new(NotifyState::default()));
         let (_tx, rx) = mpsc::unbounded_channel();

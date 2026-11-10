@@ -1,5 +1,3 @@
-//! `hermian alerts` and `hermian show`: read alerts back from the JSON store.
-
 use std::fs;
 
 use anyhow::{Context, Result};
@@ -10,7 +8,6 @@ use crate::cli::{severity_filter, AlertsArgs, ShowArgs};
 use crate::paths;
 use crate::ui::{ago, Style};
 
-/// Alerts are root-only; say so rather than "no alerts" or "no such alert".
 fn needs_root(e: &std::io::Error) -> Option<anyhow::Error> {
     (e.kind() == std::io::ErrorKind::PermissionDenied)
         .then(|| anyhow::anyhow!("alerts are root-only; re-run with sudo"))
@@ -32,11 +29,8 @@ pub fn load_all() -> Result<Vec<Alert>> {
         .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
         .filter_map(|e| fs::read_to_string(e.path()).ok())
         .filter_map(|t| serde_json::from_str::<Alert>(&t).ok())
-        // Files written before escaping existed may hold raw control chars.
         .map(Alert::sanitized)
         .collect();
-    // Newest first; the ref id is a monotonic per-day sequence so it breaks
-    // ties between alerts raised in the same instant.
     alerts.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.ref_id.cmp(&a.ref_id)));
     Ok(alerts)
 }
@@ -53,9 +47,6 @@ fn parse_detection(s: &str) -> Option<DetectionId> {
     }
 }
 
-/// The minimum severity listed: what `-s` says, everything with `--all`,
-/// otherwise LOW. INFO is context that's never notified; listing it by
-/// default buried the alerts that matter.
 fn listed_min(severity: Option<&str>, all: bool) -> Result<Option<Severity>> {
     if severity.is_some() {
         return severity_filter(severity);
@@ -63,7 +54,6 @@ fn listed_min(severity: Option<&str>, all: bool) -> Result<Option<Severity>> {
     Ok(if all { None } else { Some(Severity::Low) })
 }
 
-/// `hermian alerts 182` and `hermian alerts show 182` mean `hermian show 182`.
 fn show_target(words: &[String]) -> Option<&str> {
     match words {
         [] => None,
@@ -92,8 +82,6 @@ pub fn cmd_alerts(args: &AlertsArgs) -> Result<()> {
         None => None,
     };
     let all = load_all()?;
-    // What the default filter hides from the last day, so it's never a
-    // silent omission.
     let day_ago = Utc::now() - chrono::Duration::hours(24);
     let hidden = all
         .iter()
@@ -189,8 +177,6 @@ fn hidden_note(n: usize, filtered: bool) -> String {
     )
 }
 
-/// Accept a full ref or a bare sequence number for today. Anything else is
-/// rejected: the result becomes part of a file path.
 fn resolve_ref(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if let Ok(n) = trimmed.parse::<u32>() {
@@ -243,7 +229,6 @@ pub fn cmd_show(args: &ShowArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// INFO is listed only when asked for; `-s` still wins.
     #[test]
     fn info_is_hidden_unless_asked() {
         assert_eq!(listed_min(None, false).unwrap(), Some(Severity::Low));

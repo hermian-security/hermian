@@ -16,14 +16,8 @@ use crate::config::Config;
 use crate::events::{DetectionId, FileEvent, Severity, WriterInfo};
 use crate::proctree::ProcessTree;
 
-/// How long a D1 flag escalates related activity in its chain (connects,
-/// listeners, transient-dir execs). Two minutes was beaten by a `sleep 130`
-/// before the callback; flags no longer cover the service itself, so a
-/// longer window doesn't taint unrelated requests.
 pub const FLAG_WINDOW_SECS: i64 = 600;
 
-/// A process chain that a prior detection flagged; later detections use this to
-/// escalate related activity (e.g. a connect from a flagged web-shell chain).
 #[derive(Debug, Clone)]
 pub struct FlaggedChain {
     pub pids: Vec<u32>,
@@ -33,7 +27,6 @@ pub struct FlaggedChain {
     pub reason: String,
 }
 
-/// Read-only view of engine state handed to every detection rule.
 #[derive(Debug)]
 pub struct Ctx<'a> {
     pub tree: &'a ProcessTree,
@@ -42,22 +35,15 @@ pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub flags: &'a VecDeque<FlaggedChain>,
     pub user_names: &'a HashMap<u32, String>,
-    /// Hermian's own pid, or 0.
     pub self_pid: u32,
     pub now: DateTime<Utc>,
 }
 
-/// How confident we are that a file change was made by an operator sitting at a
-/// session, as opposed to by an unattended process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attribution {
-    /// Writer identified and it descends from an interactive session.
     Interactive,
-    /// Writer identified and it does NOT descend from any session.
     Unattended,
-    /// Writer unknown, but an interactive session was active on the host.
     LikelyInteractive,
-    /// Writer unknown and no interactive session was active anywhere.
     LikelyUnattended,
 }
 
@@ -89,12 +75,6 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Whether a trusted tool (crontab, usermod, visudo, systemctl, a package
-    /// manager...) running as `pid` may be exempted from file rules.
-    ///
-    /// The real `crontab` or `usermod` run from a web shell is still a web
-    /// shell planting persistence, so the exemption needs an ordinary origin:
-    /// no web server or database in the chain and no recent D1 flag on it.
     pub fn tool_exemption_applies(&self, pid: u32) -> bool {
         let service_origin = self.tree.chain_of(pid).iter().any(|p| {
             matches!(
@@ -105,11 +85,6 @@ impl<'a> Ctx<'a> {
         !service_origin && !self.has_recent_flag(pid, 600, Some(DetectionId::D1))
     }
 
-    /// Structured process chain for `pid`, focus on the last node.
-    /// The process an incident hangs from: the first one in `pid`'s chain
-    /// below init and the system daemons (sshd, cron), by executable. On buki,
-    /// systemd > javax64 > sh > node and systemd > javax64 > sh > timeout
-    /// both give javax64's.
     pub fn incident_root(&self, pid: u32) -> String {
         let chain = self.tree.chain_of(pid);
         chain
@@ -142,7 +117,6 @@ impl<'a> Ctx<'a> {
         self.user_names.get(&uid).map(|s| s.as_str())
     }
 
-    /// Decide whether a file change looks operator-driven.
     pub fn attribute(&self, ev: &FileEvent) -> Attribution {
         match &ev.writer {
             Some(w) => {
@@ -163,13 +137,6 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// Short, stable tag for some content, for dedup signatures.
-///
-/// A signature like `d4|sudoers|<path>` folded a second, different change to
-/// the same file within the dedup window into the first ("new user mallory",
-/// then "mallory added to sudo" a minute later was silent). Rules that
-/// report on content add this tag so only identical content is deduplicated.
-/// FNV-1a: not a security boundary, just a cheap fingerprint.
 pub fn content_tag(content: &str) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in content.as_bytes() {
@@ -186,13 +153,9 @@ pub fn writer_label(writer: Option<&WriterInfo>) -> String {
     }
 }
 
-/// Most auth sources tracked at once.
 pub const MAX_BURST_SOURCES: usize = 20_000;
-/// Most attempt timestamps kept per source: one past the largest allowed
-/// `ssh.failed_burst_count`, so the threshold can always be reached.
 const MAX_ATTEMPTS_PER_SOURCE: usize = 10_001;
 
-/// Sliding-window counter keyed by source address.
 #[derive(Debug, Default)]
 pub struct BurstTracker {
     counts: HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
@@ -211,8 +174,6 @@ impl BurstTracker {
         window_secs: i64,
         user: &str,
     ) -> usize {
-        // Sources are attacker-chosen (an IPv6 scanner can rotate through a
-        // /64): bound the map by dropping the quietest source.
         if !self.counts.contains_key(&ip) && self.counts.len() >= MAX_BURST_SOURCES {
             let oldest = self
                 .counts
@@ -230,8 +191,6 @@ impl BurstTracker {
         while q.front().map(|t| *t < cutoff).unwrap_or(false) {
             q.pop_front();
         }
-        // Only the count matters past the threshold; don't keep a timestamp
-        // per attempt of a flood.
         while q.len() > MAX_ATTEMPTS_PER_SOURCE {
             q.pop_front();
         }
@@ -259,7 +218,6 @@ impl BurstTracker {
         self.users.get(&ip).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Drop sources with no activity since `cutoff`.
     pub fn prune(&mut self, cutoff: DateTime<Utc>) {
         self.counts
             .retain(|_, q| q.back().map(|t| *t >= cutoff).unwrap_or(false));
@@ -275,7 +233,6 @@ impl BurstTracker {
     }
 }
 
-/// Last-seen content of a few account files, used to diff on change.
 #[derive(Debug, Default)]
 pub struct FileSnapshots {
     pub content: HashMap<String, String>,
@@ -301,16 +258,19 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.is_multicast()
                 || v4.is_broadcast()
-                || (o[0] == 100 && (64..=127).contains(&o[1])) // 100.64/10 CGNAT
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
         }
         IpAddr::V6(v6) => {
             let s = v6.segments();
-            (s[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
-                || (s[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
+            (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
                 || v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || v6.to_ipv4_mapped().map(|v4| is_private_ip(IpAddr::V4(v4))).unwrap_or(false)
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_private_ip(IpAddr::V4(v4)))
+                    .unwrap_or(false)
         }
     }
 }

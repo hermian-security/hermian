@@ -1,9 +1,3 @@
-//! Hermian detection engine.
-//!
-//! This crate is deliberately free of I/O and platform dependencies: it turns a
-//! stream of [`Event`]s into [`Alert`]s and nothing else. The `hermian` binary
-//! crate owns eBPF, `/proc`, inotify and delivery.
-
 pub mod alert;
 pub mod allowlist;
 pub mod audit;

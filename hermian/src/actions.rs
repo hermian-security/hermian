@@ -1,15 +1,3 @@
-//! Carrying out a response (a Telegram button, or its CLI twin) and saying
-//! exactly what happened.
-//!
-//! Every result is one line per target, each marked:
-//!   ✓  done: the change was made
-//!   ·  already: it was that way, since when and by whom
-//!   ⊘  refused: a safety rule stopped it, named
-//!   ✗  failed: the cause in a sentence and the next step as a command
-//! Short, plain sentences; never a raw error. The ledger remembers who did what, so a second press,
-//! an undo after a CLI unblock, or a block that's already in place can say
-//! so. See dist/RESPONSE-ACTIONS.md.
-
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -29,12 +17,10 @@ pub enum Mark {
     Already,
     Refused,
     Failed,
-    /// Not an outcome: what the person should know next.
     Note,
 }
 
 impl Mark {
-    /// The sign a result line starts with (none for a note).
     pub fn sign(self) -> &'static str {
         match self {
             Mark::Done => "✓",
@@ -61,7 +47,6 @@ impl Line {
     }
 }
 
-/// The host's side of an action: nft and sshd for real, a fake in tests.
 pub trait Host {
     fn blocked(&self) -> Result<Vec<Blocked>>;
     fn block(&self, ip: IpAddr, hours: u32, cfg: &Config) -> Result<String>;
@@ -86,28 +71,20 @@ impl Host for RealHost {
     }
 }
 
-/// One thing done, for "already" answers later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub at: DateTime<Utc>,
-    /// "@op (id 42)", or "the CLI".
     pub by: String,
-    /// The alert it answered, empty from the CLI.
     pub alert_ref: String,
-    /// "block", "unblock", "disconnect".
     pub what: String,
-    /// The blocked key (address or /64), or the source.
     pub target: String,
     #[serde(default)]
     pub until: Option<DateTime<Utc>>,
 }
 
-/// Most entries kept, and for how long.
 const LEDGER_MAX: usize = 500;
 const LEDGER_DAYS: i64 = 30;
 
-/// Who did what, kept in the state directory so the CLI and the daemon see
-/// the same history.
 pub struct Ledger {
     path: Option<PathBuf>,
     mem: Mutex<Vec<Entry>>,
@@ -140,8 +117,6 @@ impl Ledger {
     }
 
     pub fn record(&self, e: Entry) {
-        // Held for the file too, so two writers in this process don't lose
-        // each other's entry (load() of a file doesn't take it).
         let Ok(mut mem) = self.mem.lock() else {
             return;
         };
@@ -164,7 +139,6 @@ impl Ledger {
         }
     }
 
-    /// The latest `what` on `target`.
     pub fn last(&self, what: &str, target: &str) -> Option<Entry> {
         self.load()
             .into_iter()
@@ -173,13 +147,11 @@ impl Ledger {
     }
 }
 
-/// The ledger the daemon and the CLI share.
 pub fn ledger() -> &'static Ledger {
     static L: OnceLock<Ledger> = OnceLock::new();
     L.get_or_init(|| Ledger::at(crate::paths::state_dir().join("actions.json")))
 }
 
-/// Everything a decision needs.
 pub struct Ctx<'a> {
     pub host: &'a dyn Host,
     pub ledger: &'a Ledger,
@@ -202,7 +174,6 @@ impl Ctx<'_> {
     }
 }
 
-/// "14:02 UTC", with the date when it isn't today.
 pub fn at(now: DateTime<Utc>, t: DateTime<Utc>) -> String {
     if t.date_naive() == now.date_naive() {
         t.format("%H:%M UTC").to_string()
@@ -211,7 +182,6 @@ pub fn at(now: DateTime<Utc>, t: DateTime<Utc>) -> String {
     }
 }
 
-/// "until 14:02 UTC tomorrow".
 pub fn until(now: DateTime<Utc>, t: DateTime<Utc>) -> String {
     let days = (t.date_naive() - now.date_naive()).num_days();
     match days {
@@ -221,14 +191,10 @@ pub fn until(now: DateTime<Utc>, t: DateTime<Utc>) -> String {
     }
 }
 
-/// "@op (id 42)" -> "@op", for short labels.
 pub fn short(by: &str) -> &str {
     by.split(" (id ").next().unwrap_or(by)
 }
 
-/// A failure as a sentence and a next step. Known causes get their own
-/// wording; anything else gets its first line and where the details are.
-/// `verb` is what was tried: "block", "unblock", "disconnect".
 pub fn explain(e: &anyhow::Error, verb: &str) -> String {
     const DETAILS: &str = "Details: sudo journalctl -u hermian -n 50";
     if let Some(n) = e.downcast_ref::<NftError>() {
@@ -260,8 +226,6 @@ fn is_blocked(list: &[Blocked], key: &str) -> Option<String> {
         .map(|b| b.expires.clone())
 }
 
-/// Block one address. Already blocked: say since when and by whom, and leave
-/// the expiry alone (a second press is a duplicate, not a decision).
 pub fn block(ctx: &Ctx, ip: IpAddr) -> Line {
     if let Some(why) = blocklist::refusal(ip, ctx.cfg) {
         return Line::new(Mark::Refused, format!("Not blocked: {}", why));
@@ -307,7 +271,6 @@ pub fn block(ctx: &Ctx, ip: IpAddr) -> Line {
     }
 }
 
-/// Lift a block. Not blocked: say why not (lifted, by whom, or expired).
 pub fn unblock(ctx: &Ctx, ip: IpAddr) -> Line {
     let (_, key) = blocklist::block_key(ip);
     let list = match ctx.host.blocked() {
@@ -338,7 +301,6 @@ pub fn unblock(ctx: &Ctx, ip: IpAddr) -> Line {
     }
 }
 
-/// End the SSH session(s) from `source`.
 pub fn disconnect(ctx: &Ctx, source: IpAddr, port: Option<u16>, user: &str) -> Line {
     match ctx.host.disconnect(source, port) {
         Ok(d) => {
@@ -373,8 +335,6 @@ pub fn disconnect(ctx: &Ctx, source: IpAddr, port: Option<u16>, user: &str) -> L
     }
 }
 
-/// What still lets them in after a disconnect, so nobody mistakes it for a
-/// lockout.
 pub fn after_disconnect(blocked: bool) -> Line {
     Line::new(
         Mark::Note,
@@ -386,7 +346,6 @@ pub fn after_disconnect(blocked: bool) -> Line {
     )
 }
 
-/// The result message: one line per target, then where, who and when.
 pub fn render(host: &str, by: &str, lines: &[Line], now: DateTime<Utc>) -> String {
     let mut out = String::new();
     for l in lines {
@@ -406,7 +365,6 @@ pub fn render(host: &str, by: &str, lines: &[Line], now: DateTime<Utc>) -> Strin
     out
 }
 
-/// What the action did, in the past tense, for the label on the alert.
 fn done_as(a: &ResponseAction) -> String {
     use ResponseAction as A;
     match a {
@@ -424,7 +382,6 @@ fn done_as(a: &ResponseAction) -> String {
     }
 }
 
-/// The label a used button becomes: "✓ Blocked 203.0.113.24 · @op 14:02 UTC".
 pub fn summary(a: &ResponseAction, lines: &[Line], by: &str, now: DateTime<Utc>) -> String {
     let marks: Vec<Mark> = lines
         .iter()
@@ -448,17 +405,12 @@ pub fn summary(a: &ResponseAction, lines: &[Line], by: &str, now: DateTime<Utc>)
     format!("{} · {} {}", head, short(by), now.format("%H:%M UTC"))
 }
 
-/// Whether the result is worth its own message under the alert. The used
-/// button already shows the outcome ("✓ Blocked 203.0.113.24 · @op 14:02"),
-/// and pressing it shows the full result: a message only when something was
-/// refused or failed, which is when someone has to read it.
 pub fn needs_reply(_a: &ResponseAction, lines: &[Line]) -> bool {
     lines
         .iter()
         .any(|l| matches!(l.mark, Mark::Refused | Mark::Failed))
 }
 
-/// `hermian block <ip>...`: the CLI twin of the Block button.
 pub fn cmd_block(ips: &[String]) -> Result<()> {
     crate::config::require_root()?;
     let cfg = crate::config::load_config()?;
@@ -467,7 +419,6 @@ pub fn cmd_block(ips: &[String]) -> Result<()> {
     finish_cli(ips.iter().map(|ip| block(&ctx, *ip)).collect())
 }
 
-/// `hermian unblock <ip>`.
 pub fn cmd_unblock(ip: &str) -> Result<()> {
     crate::config::require_root()?;
     let cfg = crate::config::load_config()?;
@@ -476,7 +427,6 @@ pub fn cmd_unblock(ip: &str) -> Result<()> {
     finish_cli(vec![unblock(&ctx, ips[0])])
 }
 
-/// `hermian disconnect <ip>`: the CLI twin of Disconnect.
 pub fn cmd_disconnect(ip: &str) -> Result<()> {
     crate::config::require_root()?;
     let cfg = crate::config::load_config()?;
@@ -546,7 +496,6 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// A firewall and sshd in memory.
     #[derive(Default)]
     struct Fake {
         blocked: RefCell<Vec<Blocked>>,
@@ -734,7 +683,7 @@ mod tests {
             &ctx(&host, &ledger, &cfg, "@op (id 42)", t(1, 0)),
             ip("203.0.113.24"),
         );
-        host.blocked.borrow_mut().clear(); // the kernel's timeout ran out
+        host.blocked.borrow_mut().clear();
         let tomorrow = t(1, 0) + chrono::Duration::hours(30);
         let l = unblock(
             &ctx(&host, &ledger, &cfg, "@op (id 42)", tomorrow),

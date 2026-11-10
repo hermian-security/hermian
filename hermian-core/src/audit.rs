@@ -1,37 +1,19 @@
-//! Start-up audit: signs that a host was compromised before Hermian started.
-//!
-//! The rules judge what happens after Hermian starts. Persistence already in
-//! place, an implant already running, or a rootkit already preloaded stays
-//! unseen until it acts, and the baseline would learn its routine as normal.
-//! On a perfctl-infected host (2026-10-17) all of this held: a preload rootkit
-//! in /etc/ld.so.preload, unpackaged programs in /usr/bin and /usr/lib, an
-//! implant running from /tmp/.perf.c and hidden directories under /var.
-//!
-//! The daemon gathers what's on the host ([`AuditInput`]) and says which
-//! paths a package owns; this module only judges, so it can be tested.
-
 use crate::alert::Finding;
 use crate::detect::content_tag;
 use crate::events::{is_suspicious_exec_dir, DetectionId, Severity};
 
-/// A running process, as the audit sees it (host processes only).
 #[derive(Debug, Clone, Default)]
 pub struct ProcView {
     pub pid: u32,
     pub comm: String,
-    /// `/proc/<pid>/exe`, possibly ending in " (deleted)".
     pub exe: String,
-    /// File-backed executable mappings from `/proc/<pid>/maps`.
     pub mapped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AuditInput {
-    /// Content of /etc/ld.so.preload, if it exists.
     pub preload: Option<String>,
     pub processes: Vec<ProcView>,
-    /// Files that start programs on their own: crontabs, cron dirs, shell
-    /// profiles. (path, content).
     pub autostart: Vec<(String, String)>,
 }
 
@@ -47,13 +29,9 @@ pub struct Sign {
     pub kind: SignKind,
     pub severity: Severity,
     pub path: String,
-    /// One line, for the alert and `hermian audit`.
     pub what: String,
 }
 
-/// System directories where every program and library comes from a package.
-/// /usr/local and /opt are left out: that's where hand-installed software
-/// belongs.
 const PACKAGED_DIRS: &[&str] = &[
     "/usr/bin",
     "/usr/sbin",
@@ -66,20 +44,16 @@ const PACKAGED_DIRS: &[&str] = &[
     "/usr/libexec",
 ];
 
-/// Top-level directories where a hidden directory has no business holding
-/// code (/var/.i.ipr/, /usr/bin/.local/bin/, /dev/.cache/).
 const SYSTEM_ROOTS: &[&str] = &[
     "bin", "boot", "dev", "etc", "lib", "lib64", "opt", "sbin", "srv", "usr", "var",
 ];
 
-/// Most signs listed in one alert.
 const MAX_LISTED: usize = 8;
 
 fn strip_deleted(p: &str) -> &str {
     p.trim_end_matches(" (deleted)").trim()
 }
 
-/// Code under a hidden directory in a system tree.
 pub fn in_hidden_system_dir(path: &str) -> bool {
     let p = strip_deleted(path);
     let mut parts = p.trim_start_matches('/').split('/');
@@ -90,7 +64,6 @@ pub fn in_hidden_system_dir(path: &str) -> bool {
         return false;
     }
     let rest: Vec<&str> = parts.collect();
-    // The last part is the file itself: only directories count.
     rest.len() > 1
         && rest[..rest.len() - 1]
             .iter()
@@ -108,8 +81,6 @@ fn suspect_location(path: &str) -> bool {
     is_suspicious_exec_dir(path) || in_hidden_system_dir(path)
 }
 
-/// Paths the audit wants package ownership for (deduplicated): everything in
-/// a packaged directory that's still on disk.
 pub fn ownership_queries(input: &AuditInput) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut add = |p: &str| {
@@ -144,14 +115,12 @@ pub fn preload_entries(content: &str) -> Vec<String> {
         .collect()
 }
 
-/// Absolute paths in the non-comment lines of a crontab or profile.
 fn command_paths(content: &str) -> Vec<String> {
     content
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .flat_map(|l| {
-            // ':' too: PATH=/usr/libexec/sysstat:/usr/sbin:/usr/bin is a list.
             l.split(|c: char| {
                 c.is_whitespace()
                     || matches!(
@@ -166,8 +135,6 @@ fn command_paths(content: &str) -> Vec<String> {
         .collect()
 }
 
-/// Judge the host. `owned(path)` says whether a package owns `path`:
-/// `Some(false)` is "no package does", `None` is "couldn't tell".
 pub fn audit(input: &AuditInput, owned: &dyn Fn(&str) -> Option<bool>) -> Vec<Sign> {
     let mut signs: Vec<Sign> = Vec::new();
     let mut push = |s: Sign| {
@@ -176,7 +143,6 @@ pub fn audit(input: &AuditInput, owned: &dyn Fn(&str) -> Option<bool>) -> Vec<Si
         }
     };
 
-    // Every new dynamically linked process loads these first.
     for lib in preload_entries(input.preload.as_deref().unwrap_or("")) {
         let unowned = owned(&lib) == Some(false);
         let severity = if unowned || suspect_location(&lib) {
@@ -196,7 +162,6 @@ pub fn audit(input: &AuditInput, owned: &dyn Fn(&str) -> Option<bool>) -> Vec<Si
         });
     }
 
-    // Code running, or mapped, from where it shouldn't be.
     for p in &input.processes {
         let mut code: Vec<(&str, bool)> = vec![(p.exe.as_str(), true)];
         code.extend(p.mapped.iter().map(|m| (m.as_str(), false)));
@@ -206,10 +171,6 @@ pub fn audit(input: &AuditInput, owned: &dyn Fn(&str) -> Option<bool>) -> Vec<Si
             }
             let noun = if is_exe { "runs from" } else { "has loaded" };
             if suspect_location(path) {
-                // Libraries unpacked into /tmp are routine for some runtimes
-                // (Nx's native add-on, Netty, JNA, sqlite-jdbc): listed, not
-                // paged. A program running from there, or anything in a
-                // hidden system directory, is not.
                 let routine = !is_exe && !in_hidden_system_dir(path);
                 push(Sign {
                     kind: SignKind::Code,
@@ -238,7 +199,6 @@ pub fn audit(input: &AuditInput, owned: &dyn Fn(&str) -> Option<bool>) -> Vec<Si
         }
     }
 
-    // Persistence that starts such code.
     for (file, content) in &input.autostart {
         for path in command_paths(content) {
             let unowned = in_packaged_dir(&path) && owned(&path) == Some(false);
@@ -266,8 +226,6 @@ pub fn audit(input: &AuditInput, owned: &dyn Fn(&str) -> Option<bool>) -> Vec<Si
     signs
 }
 
-/// One alert for the whole audit, or none when the host looks clean. Signs
-/// of more than one kind (a preload and running code, say) make it CRITICAL.
 pub fn finding(signs: &[Sign], baseline_note: Option<&str>) -> Option<Finding> {
     let top = signs.iter().map(|s| s.severity).max()?;
     let mut kinds: Vec<SignKind> = signs.iter().map(|s| s.kind).collect();
@@ -332,7 +290,6 @@ mod tests {
         }
     }
 
-    /// Ownership as dpkg would answer on the infected host.
     fn owned(p: &str) -> Option<bool> {
         Some(!matches!(
             p,
@@ -344,7 +301,6 @@ mod tests {
         ))
     }
 
-    /// What perfctl left on buki, 2026-10-17.
     fn buki() -> AuditInput {
         AuditInput {
             preload: Some("/lib/libgcwrap.so\n".into()),
@@ -399,7 +355,6 @@ mod tests {
             SignKind::Autostart,
             "/root/.profile starts /bin/perfcc"
         ));
-        // A packaged binary replaced by an upgrade is routine.
         assert!(!signs.iter().any(|s| s.what.contains("agetty")));
         assert_eq!(signs[0].severity, Severity::Critical);
         let f = finding(&signs, Some("learning stopped")).unwrap();
@@ -437,8 +392,6 @@ mod tests {
         assert!(finding(&signs, None).is_none());
     }
 
-    /// Found on buki: Nx's native add-on is unpacked into /tmp and loaded by
-    /// node. Listed as LOW; it alone raises no alert.
     #[test]
     fn a_library_unpacked_into_tmp_is_low() {
         let input = AuditInput {
@@ -456,7 +409,6 @@ mod tests {
         assert_eq!(finding(&signs, None).unwrap().severity, Severity::Low);
     }
 
-    /// Found on a clean Debian: PATH lists in cron.d/sysstat.
     #[test]
     fn path_lists_are_split() {
         let input = AuditInput {
