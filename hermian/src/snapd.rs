@@ -10,18 +10,21 @@ const ASSERTS: &str = "/var/lib/snapd/assertions/asserts-v0";
 const LINK_DIRS: &[&str] = &["multi-user.target.wants", "snapd.mounts.target.wants"];
 
 pub fn store_signed_mount(path: &str) -> bool {
-    check(Path::new("/"), path, 0).is_some()
+    check(Path::new("/"), path, (0, 0)).is_some()
 }
 
 fn under(root: &Path, abs: &str) -> PathBuf {
     root.join(abs.trim_start_matches('/'))
 }
 
-fn trusted(meta: &fs::Metadata, owner: u32) -> bool {
-    meta.file_type().is_file() && meta.uid() == owner && meta.mode() & 0o022 == 0
+fn trusted(meta: &fs::Metadata, (uid, gid): (u32, u32)) -> bool {
+    meta.file_type().is_file()
+        && meta.uid() == uid
+        && meta.mode() & 0o002 == 0
+        && (meta.mode() & 0o020 == 0 || meta.gid() == gid)
 }
 
-fn check(root: &Path, path: &str, owner: u32) -> Option<()> {
+fn check(root: &Path, path: &str, owner: (u32, u32)) -> Option<()> {
     let rest = path.strip_prefix(UNIT_DIR)?.strip_prefix('/')?;
     let name = match rest.split_once('/') {
         Some((dir, n)) if LINK_DIRS.contains(&dir) => {
@@ -106,7 +109,7 @@ fn b64url(bytes: &[u8]) -> String {
     out
 }
 
-fn active(dir: &Path, owner: u32) -> Option<String> {
+fn active(dir: &Path, owner: (u32, u32)) -> Option<String> {
     let mut best: Option<(u32, PathBuf)> = None;
     for e in fs::read_dir(dir).ok()?.flatten() {
         let name = e.file_name();
@@ -155,7 +158,7 @@ mod tests {
 
     struct Host {
         root: PathBuf,
-        owner: u32,
+        owner: (u32, u32),
     }
 
     impl Host {
@@ -165,7 +168,7 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
             let h = Host {
                 root,
-                owner: unsafe { libc::geteuid() },
+                owner: unsafe { (libc::geteuid(), libc::getegid()) },
             };
             h.write("/etc/systemd/system/snap-snapd-28332.mount", UNIT);
             h.write(
@@ -324,7 +327,39 @@ mod tests {
     #[test]
     fn wrong_owner_is_not_trusted() {
         let h = Host::new("owner");
-        assert!(check(&h.root, UNIT_PATH, h.owner + 1).is_none());
+        assert!(check(&h.root, UNIT_PATH, (h.owner.0 + 1, h.owner.1)).is_none());
+    }
+
+    #[test]
+    fn group_write_only_from_the_owning_group() {
+        let h = Host::new("group");
+        let a = h.p(&format!("{}/snap-revision/{}/active", ASSERTS, h.digest()));
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(h.ok(UNIT_PATH));
+        assert!(check(&h.root, UNIT_PATH, (h.owner.0, h.owner.1 + 1)).is_none());
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o646)).unwrap();
+        assert!(!h.ok(UNIT_PATH));
+    }
+
+    #[test]
+    #[ignore]
+    fn this_hosts_snap_mounts_are_vouched() {
+        let mut seen = 0;
+        for dir in ["", "/multi-user.target.wants", "/snapd.mounts.target.wants"] {
+            let Ok(entries) = fs::read_dir(format!("{}{}", UNIT_DIR, dir)) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("snap-") && name.ends_with(".mount") {
+                    let path = format!("{}{}/{}", UNIT_DIR, dir, name);
+                    assert!(store_signed_mount(&path), "{} not vouched", path);
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 0, "no snap mount units on this host");
+        eprintln!("{} snap mount units vouched", seen);
     }
 
     #[test]
