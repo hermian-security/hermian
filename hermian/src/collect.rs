@@ -1,5 +1,3 @@
-//! `hermian collect <ref>`: assemble a forensic context bundle for an alert.
-
 use std::fs;
 
 use anyhow::Result;
@@ -10,7 +8,6 @@ use crate::cli::CollectArgs;
 use crate::ui::Style;
 use crate::{alerts, config, paths, procsrc};
 
-/// Files at or above this size are hashed but not copied into the bundle.
 const MAX_COPY: u64 = 4 * 1024 * 1024;
 
 fn sha256_reader(r: &mut impl std::io::Read) -> std::io::Result<String> {
@@ -101,7 +98,6 @@ pub fn run(args: &CollectArgs) -> Result<()> {
         {
             report.push_str(&format!("    cwd      {}\n", cwd));
         }
-        // Snapshot open sockets / files of interest.
         if let Ok(fds) = fs::read_dir(format!("/proc/{}/fd", p.pid)) {
             let targets: Vec<String> = fds
                 .flatten()
@@ -160,8 +156,6 @@ pub fn run(args: &CollectArgs) -> Result<()> {
     }
     for p in &paths_seen {
         let clean = p.trim_end_matches(" (deleted)");
-        // Paths come from alert facts, which can name attacker-controlled
-        // files: never follow a symlink or open a FIFO/device as root.
         if let Ok(link) = fs::symlink_metadata(clean) {
             if !link.is_file() {
                 let what = if link.file_type().is_symlink() {

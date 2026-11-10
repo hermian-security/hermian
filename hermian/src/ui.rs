@@ -1,8 +1,3 @@
-//! Terminal presentation helpers shared by the CLI commands.
-//!
-//! Colour is enabled only when stdout is a TTY and `NO_COLOR` is unset (or
-//! forced with `HERMIAN_COLOR=always`). Every helper degrades to plain text.
-
 use hermian_core::{Severity, Theme};
 
 pub const WIDTH: usize = 72;
@@ -63,8 +58,6 @@ impl Style {
         self.wrap("1;38;5;204", s)
     }
 
-    /// Severity in the identity's palette: CRITICAL in the brand red, HIGH
-    /// in the accent purple, LOW and INFO in quieter greys.
     pub fn sev(&self, s: Severity, text: &str) -> String {
         let code = match s {
             Severity::Critical => "1;38;5;204",
@@ -75,23 +68,18 @@ impl Style {
         self.wrap(code, text)
     }
 
-    /// A thin rule, indented like the text so it lines up with the
-    /// masthead and the rows (columns 3 to WIDTH).
     pub fn rule(&self) -> String {
         format!("  {}", self.dim(&"\u{2500}".repeat(WIDTH - 2)))
     }
 
-    /// Section heading, upper-cased and dimmed, indented like the rows.
     pub fn heading(&self, s: &str) -> String {
         format!("  {}", self.label(&s.to_uppercase()))
     }
 
-    /// A closing line under the last rule, dimmed and indented.
     pub fn footer(&self, s: &str) -> String {
         format!("  {}", self.dim(s))
     }
 
-    /// `label ........ value` row with dotted leader.
     pub fn row(&self, label: &str, value: &str) -> String {
         let indent = 2;
         let pad = WIDTH.saturating_sub(indent + label.chars().count() + value.chars().count() + 2);
@@ -105,15 +93,6 @@ impl Style {
         )
     }
 
-    /// The header every screen opens with, and the rule under it:
-    ///
-    /// ```text
-    ///   ╱╱╱●  hermian  v0.1.0-beta.11                     web-01 · up 6h
-    ///   ────────────────────────────────────────────────────────────────
-    /// ```
-    ///
-    /// `what` is a version ("v0.1.0") or the screen's name ("alerts");
-    /// `right` is context and may already carry colour.
     pub fn masthead(&self, what: &str, right: &str) -> String {
         let left_len =
             2 + BRAND_STROKES.chars().count() + 1 + 2 + "hermian".len() + 2 + what.chars().count();
@@ -134,8 +113,6 @@ impl Style {
         )
     }
 
-    /// The brand accent (the logo's signal dot). Truecolor when the terminal
-    /// says it supports it, the nearest 256-colour purple otherwise.
     pub fn accent(&self, s: &str) -> String {
         let truecolor = std::env::var("COLORTERM")
             .map(|v| v.contains("truecolor") || v.contains("24bit"))
@@ -150,10 +127,6 @@ impl Style {
         )
     }
 
-    /// The identity in two lines: the mark (three strokes and the signal
-    /// dot) beside the wordmark, then the tagline. As in the logo, only the
-    /// dot carries colour; the rest uses the terminal's own text colour, so
-    /// light themes work too.
     pub fn brand(&self, version: &str) -> String {
         format!(
             "  {}{}  {}  {}\n        {}",
@@ -166,12 +139,10 @@ impl Style {
     }
 }
 
-/// The logo's three strokes and its dot, as terminal glyphs.
 const BRAND_STROKES: &str = "\u{2571}\u{2571}\u{2571}";
 const BRAND_DOT: &str = "\u{25CF}";
 pub const TAGLINE: &str = "Silent by default. Loud when it matters.";
 
-/// Printed width of `s`: characters, not counting ANSI colour codes.
 pub fn visible_len(s: &str) -> usize {
     let mut n = 0;
     let mut in_esc = false;
@@ -187,7 +158,6 @@ pub fn visible_len(s: &str) -> usize {
 }
 
 fn stdout_is_tty() -> bool {
-    // SAFETY: isatty on a fixed, valid fd.
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
 
@@ -239,7 +209,6 @@ mod tests {
     #[test]
     fn only_the_dot_is_coloured() {
         let b = Style { color: true }.brand("1.2.3");
-        // The strokes are bare text; the dot is the one coloured glyph.
         assert!(
             b.starts_with("  \u{2571}\u{2571}\u{2571}\x1b[38;"),
             "{:?}",

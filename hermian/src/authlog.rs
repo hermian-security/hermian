@@ -1,10 +1,3 @@
-//! SSH authentication source without the PAM module.
-//!
-//! Prefers tailing a classic auth log; on journald-only hosts (Debian 12+,
-//! Ubuntu 22.04+, Fedora, Arch) it follows `journalctl -u ssh -u sshd -f`.
-//! Timestamps come from the log line so bursts are measured correctly even
-//! when the daemon catches up after a stall.
-
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::net::IpAddr;
@@ -27,9 +20,6 @@ pub enum AuthSource {
     None,
 }
 
-/// Prefer journald whenever it's running: its `_UID`/`_COMM` fields come from
-/// the kernel, while a text auth log accepts whatever `logger` writes. (A
-/// leftover auth.log on a journald-only host also goes stale.)
 pub fn detect_source() -> AuthSource {
     let journald = std::path::Path::new("/run/systemd/journal/socket").exists();
     if journald && which("journalctl") {
@@ -82,23 +72,16 @@ fn open_log() -> Option<(BufReader<File>, &'static str)> {
     })
 }
 
-/// Whether the log at `path` is no longer the file we have open: replaced
-/// (a new inode, the usual logrotate `create` mode) or truncated in place
-/// (`copytruncate`).
 fn rotated(path: &str, open_ino: u64, pos: u64) -> bool {
     use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(path) {
         Ok(m) => m.ino() != open_ino || m.len() < pos,
-        // Gone for now (between rename and create): keep the old one.
         Err(_) => false,
     }
 }
 
 fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     use std::os::unix::fs::MetadataExt;
-    // Only the very first open starts at the end (history isn't news). After
-    // a rotation the new file is read from the start: seeking to its end
-    // dropped whatever sshd logged between the rotation and our noticing.
     let mut from_start = false;
     while !shutdown.load(Ordering::Relaxed) {
         let Some((mut reader, path)) = open_log() else {
@@ -122,8 +105,6 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
                 Ok(0) => {
                     std::thread::sleep(Duration::from_millis(500));
                     idle_polls += 1;
-                    // Check for rotation every ~2s, only once the old file is
-                    // drained (we're at its EOF), so nothing in it is skipped.
                     if idle_polls >= 4 {
                         idle_polls = 0;
                         let pos = reader.stream_position().unwrap_or(0);
@@ -150,11 +131,6 @@ fn file_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-/// Anyone can write `sshd[<pid>]: Accepted ...` to syslog with `logger`, and
-/// a text log doesn't record the real sender. When the tagged pid is still
-/// alive we can at least check it's a root sshd; a live pid that isn't one is
-/// a forgery. (A dead pid can't be checked; journald's trusted fields are
-/// preferred for that reason.)
 fn sender_is_not_sshd(pid: u32) -> bool {
     let Some(comm) = crate::procsrc::comm_of(pid) else {
         return false;
@@ -163,9 +139,6 @@ fn sender_is_not_sshd(pid: u32) -> bool {
     !matches!(comm.as_str(), "sshd" | "sshd-session") || uid != Some(0)
 }
 
-/// Only trusted (kernel-supplied) fields: `SYSLOG_IDENTIFIER` is whatever
-/// the sender claims (`logger -t sshd`), and `_COMM` alone can be set by any
-/// process, so require it to run as root too.
 const JOURNAL_MATCHES: &[&str] = &["_UID=0", "_COMM=sshd", "+", "_UID=0", "_COMM=sshd-session"];
 
 fn spawn_journalctl() -> std::io::Result<Child> {
@@ -198,7 +171,7 @@ fn journal_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
             }
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) => break, // journalctl exited
+                Ok(0) => break,
                 Ok(_) => {
                     if let Some(ev) = parse_line(&line) {
                         if tx.blocking_send(Event::Auth(locate_key(ev))).is_err() {
@@ -215,15 +188,8 @@ fn journal_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-/// Split `<timestamp> <host> <tag>[<pid>]: <message>` and return the tag's
-/// pid and the message, only when the tag is sshd's own.
-///
-/// The message is split at the tag, never by searching for `"]: "`: a remote
-/// client controls the username sshd logs ("Invalid user x]: Accepted
-/// publickey for root from ..."), so anything after the tag is untrusted.
 fn split_sshd_line(line: &str) -> Option<(Option<DateTime<Utc>>, u32, &str)> {
     let ts = parse_timestamp(line);
-    // ISO/RFC 3339 timestamps are one token; classic syslog "Jan 15 10:20:30" is three.
     let skip = if ts.is_some() { 1 } else { 3 };
     let mut rest = line;
     for _ in 0..skip + 1 {
@@ -238,8 +204,6 @@ fn split_sshd_line(line: &str) -> Option<(Option<DateTime<Utc>>, u32, &str)> {
     Some((ts, pid, msg.trim_start()))
 }
 
-/// Add where the accepted key sits in the user's authorized_keys. Runs on
-/// the reader's blocking thread; a few small file reads per key login.
 fn locate_key(mut ev: AuthEvent) -> AuthEvent {
     let user = ev.user.clone();
     if let Some(k) = ev.key.as_mut() {
@@ -248,7 +212,6 @@ fn locate_key(mut ev: AuthEvent) -> AuthEvent {
     ev
 }
 
-/// Parse a syslog / journal `short-iso` sshd line into an [`AuthEvent`].
 pub fn parse_line(line: &str) -> Option<AuthEvent> {
     parse_line_with_pid(line).map(|(ev, _)| ev)
 }
@@ -262,7 +225,6 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
     let lower = msg.to_ascii_lowercase();
 
     if lower.starts_with("accepted ") {
-        // Accepted publickey for alice from 10.0.0.5 port 51234 ssh2: ED25519 SHA256:...
         let user = word_after(msg, " for ")?;
         let method = AuthMethod::from_ssh_word(msg.split_whitespace().nth(1).unwrap_or(""));
         return Some(AuthEvent {
@@ -309,9 +271,6 @@ fn parse_message(msg: &str, ts: DateTime<Utc>) -> Option<AuthEvent> {
     None
 }
 
-/// The key from "... ssh2: ED25519 SHA256:<b64>[ ID ... CA ...]". Taken
-/// after the last " ssh2: ": the client-controlled username comes before
-/// it, so a crafted name can't plant a fingerprint.
 fn extract_key(msg: &str) -> Option<SshKey> {
     let rest = &msg[msg.rfind(" ssh2: ")? + 7..];
     let mut words = rest.split_whitespace();
@@ -338,15 +297,12 @@ fn extract_key(msg: &str) -> Option<SshKey> {
 
 fn parse_timestamp(line: &str) -> Option<DateTime<Utc>> {
     let first = line.split_whitespace().next()?;
-    // journalctl -o short-iso: 2024-01-15T10:20:30+0000
     if let Ok(dt) = DateTime::parse_from_str(first, "%Y-%m-%dT%H:%M:%S%z") {
         return Some(dt.with_timezone(&Utc));
     }
-    // rsyslog RFC3339 (Debian/Ubuntu default): 2024-01-15T10:20:30.123456+00:00
     if let Ok(dt) = DateTime::parse_from_rfc3339(first) {
         return Some(dt.with_timezone(&Utc));
     }
-    // Classic "Jan 15 10:20:30" has no year/zone; use now.
     None
 }
 
@@ -366,8 +322,6 @@ fn word_after(msg: &str, pattern: &str) -> Option<String> {
     Some(word)
 }
 
-/// The client port from "... from <ip> port <n> ...", taken after the last
-/// " from " for the same reason as [`extract_rhost`].
 fn extract_port(msg: &str) -> Option<u16> {
     let from = msg.rfind(" from ")?;
     let after = &msg[from + 6..];
@@ -381,9 +335,6 @@ fn extract_port(msg: &str) -> Option<u16> {
 }
 
 fn extract_rhost(msg: &str) -> Option<IpAddr> {
-    // sshd puts "from <ip> port <n>" after the (client-chosen) username, so
-    // take the last one: a username like "a from 203.0.113.1" can't reframe
-    // the source.
     let from = msg.rfind(" from ")?;
     let token: String = msg[from + 6..]
         .chars()
@@ -407,10 +358,8 @@ mod tests {
         std::fs::write(&log, "line one\nline two\n").unwrap();
         let ino = std::fs::metadata(&log).unwrap().ino();
         assert!(!rotated(p, ino, 18));
-        // copytruncate
         std::fs::write(&log, "").unwrap();
         assert!(rotated(p, ino, 18));
-        // create: renamed away, new file in its place
         std::fs::write(&log, "x\n").unwrap();
         let ino = std::fs::metadata(&log).unwrap().ino();
         std::fs::rename(&log, dir.join("auth.log.1")).unwrap();
@@ -459,7 +408,6 @@ mod tests {
 
     #[test]
     fn username_cannot_forge_a_success() {
-        // Remote, pre-auth: sshd logs the client-chosen username verbatim.
         let line = "2024-01-15T10:20:30+0000 web sshd[1234]: Invalid user x]: Accepted \
                     publickey for root from 203.0.113.9 port 1 ssh2 from 198.51.100.7 port 4";
         let ev = parse_line(line).unwrap();
@@ -473,7 +421,6 @@ mod tests {
                     a from 203.0.113.1 from 198.51.100.7 port 4 ssh2";
         let ev = parse_line(line).unwrap();
         assert_eq!(ev.rhost, Some("198.51.100.7".parse().unwrap()));
-        // Same for the port: a username can't put a fake one in front.
         let line = "Jan 15 10:20:30 web sshd[1234]: Failed password for invalid user \
                     a port 1 from 198.51.100.7 port 4242 ssh2";
         assert_eq!(parse_line(line).unwrap().port, Some(4242));
@@ -481,7 +428,6 @@ mod tests {
 
     #[test]
     fn only_sshd_tags_are_accepted() {
-        // `logger "sshd[1]: Accepted ..."` is tagged with the user's name.
         assert!(parse_line(
             "Jan 15 10:20:30 web mallory: sshd[1]: Accepted publickey for root from 203.0.113.9 port 1 ssh2"
         )
@@ -490,7 +436,6 @@ mod tests {
             "Jan 15 10:20:30 web notsshd[9]: Accepted publickey for root from 203.0.113.9 port 1 ssh2"
         )
         .is_none());
-        // No pid: not sshd's format.
         assert!(parse_line(
             "Jan 15 10:20:30 web sshd: Accepted publickey for root from 203.0.113.9 port 1 ssh2"
         )
@@ -506,7 +451,6 @@ mod tests {
     #[test]
     fn journal_matches_use_trusted_fields_only() {
         assert!(!JOURNAL_MATCHES.iter().any(|m| m.starts_with("SYSLOG_")));
-        // Every OR-group pins _UID=0.
         for group in JOURNAL_MATCHES.split(|m| *m == "+") {
             assert!(group.contains(&"_UID=0"), "{:?}", group);
         }
@@ -514,14 +458,10 @@ mod tests {
 
     #[test]
     fn live_non_sshd_pid_is_a_forgery() {
-        // This test process is alive and isn't sshd.
         assert!(sender_is_not_sshd(std::process::id()));
-        // A pid that can't exist can't be checked.
         assert!(!sender_is_not_sshd(u32::MAX));
     }
 
-    /// The accepted key comes from sshd's own words after the last
-    /// " ssh2: ", so a crafted username can't plant one.
     #[test]
     fn accepted_key_is_parsed() {
         let a = parse_line(
@@ -544,7 +484,6 @@ mod tests {
         .unwrap();
         assert_eq!(c.key.unwrap().kind, "ED25519-CERT");
 
-        // A fake key earlier in the line (where a crafted name would sit).
         let f = parse_line(
             "Jan 15 10:20:30 web sshd[1]: Accepted publickey for x ssh2: RSA SHA256:fake from \
              10.0.0.1 port 2 ssh2: ED25519 SHA256:real",

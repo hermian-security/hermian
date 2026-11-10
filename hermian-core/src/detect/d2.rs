@@ -1,5 +1,3 @@
-//! D2 - SSH and authentication abuse.
-
 use std::collections::HashMap;
 
 use crate::alert::Finding;
@@ -31,7 +29,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
         AuthResult::Attempt | AuthResult::Failure => {
             let count = bursts.record_failure(rhost, ev.ts, window, &ev.user);
             if count == threshold {
-                // Internet scanners trip this all day. Log it; don't page.
                 findings.push(
                     Finding::new(
                         DetectionId::D2,
@@ -96,16 +93,10 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     ]),
                 );
             }
-            // A key that has logged in before, from a new address on a network
-            // the account already uses: a dynamic IP, not a new incident.
-            // Passwords and unknown keys don't get this; they're what an
-            // attacker who isn't the operator would be using.
             let key_known = ev
                 .key
                 .as_ref()
                 .is_some_and(|k| ctx.baseline.key_is_known(&ev.user, &k.fingerprint));
-            // An allowlisted key (CI runners, automation) is never "new",
-            // wherever it logs in from.
             let key_allowed = ev
                 .key
                 .as_ref()
@@ -115,14 +106,8 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                 .as_ref()
                 .map(|k| k.fingerprint.as_str())
                 .unwrap_or("");
-            // A known key from a new network is usually its owner on another
-            // connection (travel, mobile, VPN, a CI runner); with "log" it's
-            // recorded, not sent.
             let quiet_known_key = ctx.cfg.ssh.known_key_new_network == "log";
             if ev.user == "root" && !ctx.cfg.ssh.permit_root && !after_burst {
-                // A root login is a policy concern, not per se an anomaly. It is
-                // HIGH the first time a source is seen; the same operator logging
-                // in again from the same place is context, not a new incident.
                 let seen_before = ctx.baseline.root_source_is_known(rhost) || key_allowed;
                 let nearby = !seen_before && key_known && ctx.baseline.root_net_is_known(rhost);
                 let new_network = !seen_before && !nearby && key_known;
@@ -146,8 +131,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                         } else {
                             "Root login over SSH from a new source"
                         },
-                        // One key logging in from several new networks (a CI
-                        // runner) is one incident, not one per address.
                         &if new_network {
                             format!("d2|root-login-key|{}", fingerprint)
                         } else {
@@ -243,12 +226,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
                     ]),
                 );
             }
-            // One login, one alert. A root login from a never-seen source
-            // matches both rules above; keeping both sent two notifications
-            // for one event. The sharper finding wins (ties go to the root
-            // policy alert, which carries the novelty in its title anyway).
-            // A key from a hidden key file pages whatever the source: the
-            // file is the backdoor, and a familiar IP doesn't make it less so.
             let hidden = ev.key.as_ref().and_then(|k| {
                 let file = k.file.as_deref()?;
                 hidden_key_path(file).map(|why| (k, file, why))
@@ -298,9 +275,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
             }
         }
     }
-    // A suspicious login (after a burst, from a new source, root from a new
-    // place) gets Ignore / Disconnect / Disconnect-and-block. A routine
-    // repeat (INFO) doesn't.
     if ev.result == AuthResult::Success {
         findings = findings
             .into_iter()
@@ -316,8 +290,6 @@ pub fn evaluate_auth(ev: &AuthEvent, ctx: &Ctx, bursts: &mut BurstTracker) -> Ve
     findings
 }
 
-/// How the login authenticated, for alert text: " with key 'alice@laptop'",
-/// " with key ED25519 SHA256:abc…xyz", " (password)", or nothing.
 fn how(ev: &AuthEvent) -> String {
     match &ev.key {
         Some(k) => match &k.comment {
@@ -328,7 +300,6 @@ fn how(ev: &AuthEvent) -> String {
     }
 }
 
-/// Method, key and where the key sits in authorized_keys.
 fn key_facts(ev: &AuthEvent) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     match &ev.key {
@@ -349,10 +320,6 @@ fn key_facts(ev: &AuthEvent) -> Vec<(&'static str, String)> {
     out
 }
 
-/// sshd settings that decide which keys open the door. Each value is one or
-/// more paths (`AuthorizedKeysFile`) or a command and its arguments.
-/// Signature prefix of the hidden-key login alert. The engine checks it so a
-/// backdoor key is never learned as a known key.
 pub const HIDDEN_KEY_LOGIN_SIG: &str = "d2|hidden-key-login|";
 
 const KEY_SOURCE_SETTINGS: &[(&str, &str)] = &[
@@ -363,11 +330,6 @@ const KEY_SOURCE_SETTINGS: &[(&str, &str)] = &[
     ("trustedusercakeys", "TrustedUserCAKeys"),
 ];
 
-/// Why a path sshd reads keys (or runs a key command) from looks hidden, or
-/// `None` if it's an ordinary place. Relative paths and `%h/...` are inside
-/// the user's home, where only `.ssh` is expected. Volatile or pseudo
-/// filesystems and dot-directories are where a backdoor key file hides:
-/// nobody reviews them, and `ls ~/.ssh` shows nothing.
 pub fn hidden_key_path(path: &str) -> Option<&'static str> {
     if path.is_empty() || path == "none" {
         return None;
@@ -395,8 +357,6 @@ pub fn hidden_key_path(path: &str) -> Option<&'static str> {
     None
 }
 
-/// Key sources in sshd's effective configuration (`sshd -T` output) that
-/// point somewhere hidden, as (setting, value, reason).
 pub fn hidden_key_sources(sshd_t: &str) -> Vec<(&'static str, String, &'static str)> {
     let mut out = Vec::new();
     for line in sshd_t.lines() {
@@ -410,7 +370,6 @@ pub fn hidden_key_sources(sshd_t: &str) -> Vec<(&'static str, String, &'static s
             continue;
         };
         let is_command = name.ends_with("Command");
-        // A command is judged by its program; files by every path listed.
         let words: Vec<&str> = value.split_whitespace().collect();
         let paths = if is_command {
             words.into_iter().take(1).collect::<Vec<_>>()
@@ -426,7 +385,6 @@ pub fn hidden_key_sources(sshd_t: &str) -> Vec<(&'static str, String, &'static s
     out
 }
 
-/// One finding per hidden key source (the engine reports each only once).
 pub fn hidden_key_source_finding(setting: &str, path: &str, why: &str) -> Finding {
     let grants = if setting.contains("Principals") || setting == "TrustedUserCAKeys" {
         "decides which certificates and principals may log in"
@@ -553,8 +511,6 @@ pub fn check_account_changes(
             DetectionId::D2,
             severity,
             change.title,
-            // Keyed on what changed: a second, different change to the same
-            // file within the dedup window is its own alert.
             &format!(
                 "d2|account-change|{}|{}",
                 ev.path,
@@ -588,7 +544,6 @@ pub struct AccountChange {
     pub title: &'static str,
 }
 
-/// One /etc/passwd entry, as far as the diff cares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasswdEntry {
     uid: String,
@@ -597,18 +552,15 @@ struct PasswdEntry {
     shell: String,
 }
 
-/// Numeric id 0, however it's written ("0", "00", " 0").
 fn is_zero_id(s: &str) -> bool {
     s.trim().parse::<u64>() == Ok(0)
 }
 
-/// Shells that mean "no interactive login".
 pub fn is_nologin(shell: &str) -> bool {
     let base = shell.rsplit('/').next().unwrap_or("");
     shell.is_empty() || matches!(base, "nologin" | "false" | "sync" | "halt" | "shutdown")
 }
 
-/// Accounts that can log in: those with a real shell in /etc/passwd.
 pub fn login_users(passwd: &str) -> std::collections::HashSet<String> {
     parse_passwd(passwd)
         .into_iter()
@@ -617,7 +569,6 @@ pub fn login_users(passwd: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// The three responses offered with a suspicious login.
 fn login_offers(f: Finding, ev: &AuthEvent, rhost: std::net::IpAddr) -> Finding {
     use crate::response::ResponseAction;
     f.offer(ResponseAction::Ignore {
@@ -647,7 +598,7 @@ fn parse_passwd(s: &str) -> Vec<(String, PasswdEntry)> {
             it.next()?;
             let uid = it.next()?.to_string();
             let gid = it.next().unwrap_or("").to_string();
-            it.next(); // gecos
+            it.next();
             let home = it.next().unwrap_or("").to_string();
             let shell = it.next().unwrap_or("").trim().to_string();
             Some((
@@ -686,8 +637,6 @@ fn diff_accounts(old: &str, new: &str) -> Option<AccountChange> {
                 }
                 if o.shell != e.shell {
                     what.push(format!("shell {} -> {}", o.shell, e.shell));
-                    // A service account that suddenly gets a login shell is
-                    // a classic backdoor.
                     privileged |= is_nologin(&o.shell) && !is_nologin(&e.shell);
                 }
                 if o.home != e.home {
@@ -711,9 +660,6 @@ fn diff_accounts(old: &str, new: &str) -> Option<AccountChange> {
     })
 }
 
-/// Groups whose members are root, or close to it: sudo/wheel/admin by
-/// policy, docker/lxd/incus/libvirt via the daemons they control, disk and
-/// shadow via raw access to block devices and password hashes.
 const PRIVILEGED_GROUPS: &[&str] = &[
     "sudo",
     "wheel",
@@ -807,8 +753,6 @@ fn diff_groups(old: &str, new: &str) -> Option<AccountChange> {
 mod tests {
     use super::*;
 
-    /// The test VPS: a drop-in added /dev/.cache/rdpii as an extra key file
-    /// and nothing noticed. Ordinary key locations stay quiet.
     #[test]
     fn hidden_key_paths() {
         for p in [
@@ -856,7 +800,6 @@ mod tests {
                 "AuthorizedKeysCommand /tmp/.k/fetch"
             ]
         );
-        // A command's arguments aren't paths.
         assert!(hidden_key_sources("authorizedkeyscommand /usr/bin/fetch /tmp/x\n").is_empty());
         let f = hidden_key_source_finding("AuthorizedKeysFile", "/dev/.cache/rdpii", "x");
         assert_eq!(f.severity, Severity::High);
@@ -897,7 +840,6 @@ mod tests {
         let d = diff_accounts(old, new).unwrap();
         assert!(d.privileged);
         assert!(d.summary.contains("shell"), "{}", d.summary);
-        // Home and gid changes are reported too.
         let moved = "www-data:x:33:0:www-data:/root:/usr/sbin/nologin\n";
         let d = diff_accounts(old, moved).unwrap();
         assert!(d.privileged, "gid 0");

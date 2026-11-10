@@ -1,5 +1,3 @@
-//! eBPF loader and perf-buffer readers.
-
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,7 +10,6 @@ use aya::{include_bytes_aligned, Ebpf};
 use bytes::BytesMut;
 use tokio::sync::mpsc;
 
-/// Must match `hermian_ebpf::ExecEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawExec {
@@ -28,7 +25,6 @@ pub struct RawExec {
     pub comm: [u8; 16],
 }
 
-/// Must match `hermian_ebpf::ConnectEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawConnect {
@@ -40,7 +36,6 @@ pub struct RawConnect {
     pub daddr6: [u8; 16],
 }
 
-/// Must match `hermian_ebpf::PtraceEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawPtrace {
@@ -51,7 +46,6 @@ pub struct RawPtrace {
     pub request: u64,
 }
 
-/// Must match `hermian_ebpf::PrivEvent`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawPriv {
@@ -61,14 +55,12 @@ pub struct RawPriv {
     pub mode: u32,
     pub kind: u8,
     pub _pad: [u8; 3],
-    /// Kernel dev_t and inode of what `fd` stands for; 0 if unknown.
     pub dev: u32,
     pub ino: u64,
     pub comm: [u8; 16],
     pub path: [u8; 256],
 }
 
-/// `RawPriv::kind`: setuid/setgid bits, or the security.capability xattr.
 pub const PRIV_SETID: u8 = 1;
 pub const PRIV_CAPS: u8 = 2;
 
@@ -97,12 +89,9 @@ pub fn connect_to_ip(raw: &RawConnect) -> Option<IpAddr> {
     }
 }
 
-/// Keeps the loaded programs alive; dropping it detaches everything.
 pub struct EbpfRuntime {
     _bpf: Ebpf,
-    /// Human-readable list of attached tracepoints, for `hermian status`.
     pub attached: Vec<&'static str>,
-    /// The ones of those hooked through a kprobe on the syscall instead.
     pub kprobes: Vec<&'static str>,
 }
 
@@ -111,16 +100,9 @@ struct Hook {
     category: &'static str,
     tracepoint: &'static str,
     required: bool,
-    /// (program, syscall): a kprobe on the syscall wrapper, tried first.
-    /// From 6.19 (7.0 on Ubuntu 26.04) a syscall tracepoint with a user
-    /// string argument drops events before BPF runs: on 7.0, 0 of 50
-    /// chmods and some execs never reached the tracepoint program.
     kprobe: Option<(&'static str, &'static str)>,
 }
 
-/// The running arch for the kprobes: id for the object, the wrappers'
-/// prefix, and where each syscall argument sits in `struct pt_regs`, in u64
-/// words. Must match KPROBE_ARCH in hermian-ebpf.
 #[cfg(target_arch = "x86_64")]
 const KPROBE_ARCH: Option<(u32, &str, [u32; 6])> = Some((1, "__x64_sys_", [14, 13, 12, 7, 9, 8]));
 #[cfg(target_arch = "aarch64")]
@@ -129,8 +111,6 @@ const KPROBE_ARCH: Option<(u32, &str, [u32; 6])> = Some((2, "__arm64_sys_", [0, 
 const KPROBE_ARCH: Option<(u32, &str, [u32; 6])> = None;
 
 const HOOKS: &[Hook] = &[
-    // Exec is observed at sched_process_exec (image is live: correct comm and
-    // resolved path). The sys_enter_* hooks only stash argv0/envp intent.
     Hook {
         program: "hermian_sched_exec",
         category: "sched",
@@ -166,10 +146,6 @@ const HOOKS: &[Hook] = &[
         kprobe: None,
         required: false,
     },
-    // A file given setuid/setgid bits or capabilities, as it happens. The
-    // setuid sweep stays as the safety net (files created with those bits,
-    // or brought in from another filesystem). chmod doesn't exist on arm64,
-    // fchmodat2 before 6.6.
     Hook {
         program: "hermian_fchmodat",
         category: "syscalls",
@@ -223,17 +199,12 @@ const HOOKS: &[Hook] = &[
 
 pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
     let mut loader = aya::EbpfLoader::new();
-    // Hand the programs the running kernel's task_struct layout so they can
-    // read the parent tgid directly. Without BTF they fall back to ppid=0 and
-    // userspace resolves it from /proc (racy for short-lived processes).
     let offsets = crate::btf::task_struct_offsets();
     let (parent_off, tgid_off) = offsets.unwrap_or((0, 0));
     if offsets.is_some() {
         loader.set_global("TASK_REAL_PARENT_OFF", &parent_off, true);
         loader.set_global("TASK_TGID_OFF", &tgid_off, true);
     }
-    // The inode behind an fd, for chmod/setcap callers gone before /proc
-    // can be read. Without BTF those events fall back to the sweep.
     let file_offs = crate::btf::file_offsets();
     if let Some(offs) = &file_offs {
         loader.set_global("FILE_OFFS", offs, true);
@@ -260,8 +231,6 @@ pub fn load_and_attach(tx: mpsc::Sender<RawEvent>) -> Result<EbpfRuntime> {
                     kprobes.push(hook.tracepoint);
                     continue;
                 }
-                // Falls back to the tracepoint below; chmod has no wrapper
-                // on arm64, fchmodat2 none before 6.6.
                 Err(e) => eprintln!(
                     "hermian: kprobe {}{} unavailable ({}); using the tracepoint",
                     prefix, syscall, e
@@ -320,8 +289,6 @@ enum MapKind {
 }
 
 fn decode(kind: MapKind, buf: &BytesMut) -> Option<RawEvent> {
-    // SAFETY: the BPF side writes a `#[repr(C)]` struct of exactly this layout;
-    // we check the length and use an unaligned read.
     unsafe {
         match kind {
             MapKind::Exec => (buf.len() >= std::mem::size_of::<RawExec>()).then(|| {
@@ -338,16 +305,11 @@ fn decode(kind: MapKind, buf: &BytesMut) -> Option<RawEvent> {
     }
 }
 
-/// Perf ring size per CPU, in pages (power of two). aya's default is small:
-/// at ~430 bytes per exec event it held only a few dozen, so a fork/exec
-/// burst overflowed it. 64 pages is 256 KiB per CPU on 4 KiB pages.
 const EXEC_PAGES: usize = 64;
 const OTHER_PAGES: usize = 16;
 
-/// Events the kernel dropped because a perf ring was full, since startup.
 pub static LOST_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/// Log lost events at most once a minute, with the running total.
 fn report_lost(map: &str, cpu: u32, lost: usize, last_report: &mut Option<std::time::Instant>) {
     let total = LOST_EVENTS.fetch_add(lost as u64, Ordering::Relaxed) + lost as u64;
     let due = last_report
@@ -366,12 +328,8 @@ fn report_lost(map: &str, cpu: u32, lost: usize, last_report: &mut Option<std::t
     }
 }
 
-/// CPUs that have perf readers. A CPU brought online later has none: its
-/// events are neither delivered nor counted as lost.
 static READER_CPUS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
 
-/// Online CPUs without a reader (hot-plugged since the daemon started).
-/// Empty when eBPF isn't in use.
 pub fn unmonitored_cpus() -> Vec<u32> {
     let Some(have) = READER_CPUS.get() else {
         return Vec::new();
@@ -453,9 +411,6 @@ mod tests {
         assert_eq!(LOST_EVENTS.load(Ordering::Relaxed) - before, 5);
     }
 
-    /// Loads the embedded object into the running kernel, so the verifier
-    /// checks every program. Needs root; CI runs it with sudo:
-    ///   sudo <test-binary> --ignored ebpf_object_loads
     #[test]
     #[ignore]
     fn ebpf_object_loads_and_sees_ld_preload() {
@@ -469,12 +424,9 @@ mod tests {
             let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
             assert!(runtime.attached.contains(&"sched_process_exec"));
             assert!(runtime.attached.contains(&"sys_enter_execve"));
-            // Through the wrapper kprobe: the tracepoint loses events on 6.19+.
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             assert!(runtime.kprobes.contains(&"sys_enter_execve"));
 
-            // Filler variables sort before LD_PRELOAD (Command keeps env
-            // sorted), pushing it past the old 12-entry scan.
             let mut cmd = std::process::Command::new("/bin/true");
             cmd.env_clear();
             for i in 0..20 {
@@ -502,7 +454,6 @@ mod tests {
         });
     }
 
-    /// LD_AUDIT counts like LD_PRELOAD, and the scan reaches past 32 vars.
     #[test]
     #[ignore]
     fn ebpf_sees_ld_audit_past_many_vars() {
@@ -540,9 +491,6 @@ mod tests {
         });
     }
 
-    /// A sockaddr_in that ends exactly at a page boundary, with nothing
-    /// mapped after it. The old fixed 28-byte read failed there and the
-    /// connect went unreported.
     #[test]
     #[ignore]
     fn ebpf_sees_connect_with_sockaddr_at_page_end() {
@@ -555,8 +503,6 @@ mod tests {
             let (tx, mut rx) = mpsc::channel(4096);
             let runtime = load_and_attach(tx).expect("eBPF object must load and attach");
             let page = crate::procsrc::page_size() as usize;
-            // SAFETY: anonymous mapping of two pages; the second is made
-            // inaccessible, and all access stays inside the first.
             let port: u16 = unsafe {
                 let base = libc::mmap(
                     std::ptr::null_mut(),
@@ -579,7 +525,6 @@ mod tests {
                 (*sa).sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
                 let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
                 assert!(fd >= 0);
-                // Nothing listens: ECONNREFUSED is fine, the attempt is what counts.
                 libc::connect(
                     fd,
                     sa as *const libc::sockaddr,
@@ -607,8 +552,6 @@ mod tests {
         });
     }
 
-    /// setuid bits and capabilities come up as they're set; a plain chmod and
-    /// the ptrace requests a tracer makes after attaching don't.
     #[test]
     #[ignore]
     fn ebpf_sees_setuid_and_caps_but_not_trace_steps() {
@@ -641,13 +584,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::set_permissions(&suid, std::fs::Permissions::from_mode(0o4755)).unwrap();
-            // VFS_CAP_REVISION_2 with cap_net_raw permitted; the hook fires on
-            // entry, so it's reported even if the kernel refused the value.
             let mut blob = [0u8; 20];
             blob[..4].copy_from_slice(&0x0200_0000u32.to_le_bytes());
             blob[4..8].copy_from_slice(&(1u32 << 13).to_le_bytes());
             let cpath = std::ffi::CString::new(caps.to_str().unwrap()).unwrap();
-            // SAFETY: valid C strings and a 20-byte buffer.
             unsafe {
                 libc::setxattr(
                     cpath.as_ptr(),
@@ -656,7 +596,6 @@ mod tests {
                     blob.len(),
                     0,
                 );
-                // setcap's way: by fd. The path has to come from the inode.
                 let f = std::fs::File::open(&byfd).unwrap();
                 use std::os::fd::AsRawFd;
                 libc::fsetxattr(
@@ -666,8 +605,6 @@ mod tests {
                     blob.len(),
                     0,
                 );
-                // A tracer's step on a pid that doesn't exist (ESRCH), then an
-                // attach to another: only the attach should come up.
                 libc::ptrace(libc::PTRACE_PEEKDATA, 999_999 as libc::pid_t, 0, 0);
                 libc::ptrace(libc::PTRACE_ATTACH, 999_998 as libc::pid_t, 0, 0);
             }
@@ -718,8 +655,6 @@ mod tests {
         });
     }
 
-    /// Failed execs leave their intent behind. With a plain hash map, 4096 of
-    /// them filled it and every later exec lost argv0/LD_PRELOAD.
     #[test]
     #[ignore]
     fn ebpf_intents_survive_a_failed_exec_flood() {

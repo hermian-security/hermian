@@ -1,7 +1,3 @@
-//! `/proc` and libc-backed host introspection. Everything here is best-effort:
-//! processes vanish mid-scan, so every per-pid read tolerates failure and a
-//! failure for one pid never aborts a scan of the others.
-
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -14,9 +10,7 @@ use hermian_core::ProcInfo;
 use libc::{sysconf, uname, utsname, _SC_CLK_TCK, _SC_PAGESIZE};
 
 pub fn kernel_release() -> String {
-    // SAFETY: utsname is a plain C struct; uname fills it in.
     let mut uts: utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: valid pointer to a utsname.
     unsafe {
         uname(&mut uts);
     }
@@ -24,7 +18,6 @@ pub fn kernel_release() -> String {
         .release
         .iter()
         .take_while(|c| **c != 0)
-        // c_char is i8 on x86_64 and u8 on aarch64; this reads the byte either way.
         .map(|c| c.to_ne_bytes()[0])
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
@@ -44,12 +37,10 @@ pub fn kernel_supports_ebpf() -> bool {
 }
 
 pub fn page_size() -> u64 {
-    // SAFETY: sysconf with a valid name.
     unsafe { sysconf(_SC_PAGESIZE) as u64 }
 }
 
 pub fn clock_ticks() -> u64 {
-    // SAFETY: sysconf with a valid name.
     let t = unsafe { sysconf(_SC_CLK_TCK) };
     if t <= 0 {
         100
@@ -64,7 +55,6 @@ pub fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Read up to 1 MiB of a file as UTF-8 (lossy).
 pub fn read_file(path: &str) -> Option<String> {
     let f = fs::File::open(path).ok()?;
     let mut buf = Vec::new();
@@ -72,15 +62,8 @@ pub fn read_file(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Largest file [`read_regular_file`] will return.
 const MAX_WATCHED_READ: u64 = 1024 * 1024;
 
-/// Read a watched file that an unprivileged user may control (dotfiles,
-/// `authorized_keys`, spool files) without letting them steer a root read.
-///
-/// Refuses symlinks (final component and parent directories), FIFOs, devices
-/// and sockets. `O_NONBLOCK` keeps a FIFO swapped in after the check from
-/// hanging the caller.
 pub fn read_regular_file(path: &str) -> Option<String> {
     let (f, _) = open_regular(path)?;
     let mut buf = Vec::new();
@@ -88,19 +71,12 @@ pub fn read_regular_file(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Open `path` read-only if, and only if, it's a regular file reached without
-/// following any symlink. See [`read_regular_file`].
 pub fn open_regular(path: &str) -> Option<(fs::File, fs::Metadata)> {
     use std::os::unix::fs::OpenOptionsExt;
     let p = std::path::Path::new(path);
     let f = match open_no_symlinks(path) {
         Ok(f) => f,
-        // Kernels before 5.6 (or a seccomp filter) lack openat2: fall back
-        // to checking the parent, then O_NOFOLLOW on the last component.
-        // That leaves a small race (the parent can be swapped for a symlink
-        // in between), which openat2 closes.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) => {
-            // A symlinked parent (e.g. ~/.ssh -> /root/.ssh) would redirect the read.
             let parent = p.parent()?;
             if fs::canonicalize(parent).ok()? != parent {
                 return None;
@@ -122,19 +98,15 @@ pub fn open_regular(path: &str) -> Option<(fs::File, fs::Metadata)> {
     Some((f, meta))
 }
 
-/// Open read-only with no symlink anywhere in the path, atomically
-/// (`openat2` with `RESOLVE_NO_SYMLINKS`, Linux 5.6+).
 fn open_no_symlinks(path: &str) -> std::io::Result<fs::File> {
     use std::os::fd::FromRawFd;
     let c = std::ffi::CString::new(path)
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
-    // SAFETY: open_how is plain data; zeroed is a valid value.
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags =
         (libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY)
             as u64;
     how.resolve = libc::RESOLVE_NO_SYMLINKS;
-    // SAFETY: valid C string and open_how of the size passed.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -147,17 +119,11 @@ fn open_no_symlinks(path: &str) -> std::io::Result<fs::File> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: the kernel just returned this fd and nothing else owns it.
     Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) })
 }
 
-/// PATH for the system tools Hermian runs.
 const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// A system tool (journalctl, nft, systemctl, dpkg...) by absolute path and
-/// with a clean environment, so an LD_PRELOAD, LD_LIBRARY_PATH or PATH that
-/// reached Hermian's environment never reaches the tool, and a planted
-/// `nft` earlier in PATH is never the one that runs.
 pub fn system_command(name: &str) -> std::process::Command {
     let path = SAFE_PATH
         .split(':')
@@ -169,14 +135,8 @@ pub fn system_command(name: &str) -> std::process::Command {
     c
 }
 
-/// Files the unit hides from the daemon's own mount namespace
-/// (`InaccessiblePaths=` in hermian.service), so a preload rootkit can't
-/// hook the daemon or the tools it runs. Hermian still has to judge them, so
-/// it reads the host's copies, through PID 1's root.
 pub const HIDDEN_FROM_DAEMON: &[&str] = &["/etc/ld.so.preload"];
 
-/// Where to look at `path` from inside the daemon: the host's view for the
-/// files above, the path itself otherwise.
 pub fn host_view(path: &str) -> std::borrow::Cow<'_, str> {
     if HIDDEN_FROM_DAEMON.contains(&path) {
         std::borrow::Cow::Owned(format!("/proc/1/root{}", path))
@@ -185,9 +145,6 @@ pub fn host_view(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// [`read_regular_file`], but for the host's copy of a file hidden from the
-/// daemon. /proc/1/root is a link we pick ourselves; the file itself is
-/// opened without following a symlink and must be a regular file.
 pub fn read_host_view(path: &str) -> Option<String> {
     if !HIDDEN_FROM_DAEMON.contains(&path) {
         return read_regular_file(path);
@@ -231,7 +188,6 @@ pub fn cmdline_of(pid: u32) -> Option<String> {
     }
 }
 
-/// The raw argument vector from `/proc/<pid>/cmdline` (at most 64 args).
 pub fn argv_of(pid: u32) -> Vec<String> {
     let Ok(f) = fs::File::open(format!("/proc/{}/cmdline", pid)) else {
         return Vec::new();
@@ -247,21 +203,12 @@ pub fn argv_of(pid: u32) -> Vec<String> {
         .collect()
 }
 
-/// The exe the engine's trust checks should see for `pid`. Normally `exe`
-/// unchanged; for a script tool (`dnf`, `adduser`...) the script's own path,
-/// so a shell script at `/tmp/dnf` isn't trusted as the package manager.
-/// See [`hermian_core::proctree::script_tool_exe`].
 pub fn judged_exe(pid: u32, comm: &str, exe: &str) -> String {
     mark_unowned(script_exe(pid, comm, exe), root_owned_cached)
 }
 
-/// Prefix put on an exe the engine would trust by path but that root doesn't
-/// actually own. No trusted-dir check accepts it.
 pub const NOT_ROOT_OWNED: &str = "(not root-owned) ";
 
-/// The engine trusts install dirs (`/usr/bin/`, `/opt/`...) by path alone.
-/// `/opt/<app>` is often a deploy user's, so `/opt/app/bin/apt` passed as
-/// the package manager. Only paths root really owns keep that trust.
 fn mark_unowned(exe: String, root_owned: impl Fn(&str) -> bool) -> String {
     if hermian_core::proctree::is_trusted_exe(&exe) && !root_owned(&exe) {
         format!("{}{}", NOT_ROOT_OWNED, exe)
@@ -270,10 +217,6 @@ fn mark_unowned(exe: String, root_owned: impl Fn(&str) -> bool) -> String {
     }
 }
 
-/// `path` and every directory above it are owned by root, and nobody else
-/// can replace them: no group (other than root) or world write, except on
-/// sticky directories like `/nix/store` (1775 root:nixbld), where others
-/// can't rename or delete root's entries.
 pub fn root_owned_path(path: &str) -> bool {
     use std::os::unix::fs::MetadataExt;
     let mut p = Some(std::path::Path::new(path));
@@ -295,7 +238,6 @@ pub fn root_owned_path(path: &str) -> bool {
     true
 }
 
-/// [`root_owned_path`] with a short cache: it runs on every exec.
 fn root_owned_cached(path: &str) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -324,11 +266,8 @@ fn root_owned_cached(path: &str) -> bool {
 fn script_exe(pid: u32, comm: &str, exe: &str) -> String {
     let unchanged = hermian_core::proctree::script_tool_exe(comm, exe, &[]);
     if unchanged == exe {
-        // Not a script tool under an interpreter: no need to read cmdline.
         return unchanged;
     }
-    // Mid-exec, comm is already the new one while the argument area isn't
-    // set up yet and cmdline reads empty. Give it a moment.
     let mut argv = argv_of(pid);
     for _ in 0..5 {
         if !argv.is_empty() {
@@ -351,16 +290,15 @@ pub fn comm_of(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..n]).trim().to_string())
 }
 
-/// `(ppid, tty_nr, starttime)` from `/proc/<pid>/stat`.
 pub fn stat_of(pid: u32) -> Option<(u32, i64, u64)> {
     let content = read_file(&format!("/proc/{}/stat", pid))?;
     let comm_end = content.rfind(')')?;
     let rest = content.get(comm_end + 2..)?;
     let mut it = rest.split_whitespace();
-    it.next()?; // state
+    it.next()?;
     let ppid: u32 = it.next()?.parse().ok()?;
-    it.next()?; // pgrp
-    it.next()?; // session
+    it.next()?;
+    it.next()?;
     let tty_nr: i64 = it.next()?.parse().ok()?;
     for _ in 0..14 {
         it.next()?;
@@ -377,7 +315,6 @@ pub fn gid_of(pid: u32) -> Option<u32> {
     status_id(pid, "Gid:")
 }
 
-/// The real id from a `Uid:`/`Gid:` line of /proc/<pid>/status.
 fn status_id(pid: u32, key: &str) -> Option<u32> {
     let content = read_file(&format!("/proc/{}/status", pid))?;
     content.lines().find_map(|l| {
@@ -438,7 +375,6 @@ fn proc_pids() -> Vec<u32> {
         .collect()
 }
 
-/// Every pid that exists right now.
 pub fn live_pids() -> std::collections::HashSet<u32> {
     proc_pids().into_iter().collect()
 }
@@ -476,7 +412,6 @@ pub fn scan_processes() -> Vec<ProcInfo> {
         .collect()
 }
 
-/// Identify a process that currently has `path` open for writing.
 pub fn pid_for_path(path: &str) -> Option<(u32, String, String, u32, i64)> {
     for pid in proc_pids() {
         let Ok(fds) = fs::read_dir(format!("/proc/{}/fd", pid)) else {
@@ -496,7 +431,6 @@ pub fn pid_for_path(path: &str) -> Option<(u32, String, String, u32, i64)> {
     None
 }
 
-/// `(pid, comm, exe, uid, tty_nr)` of a process that changed a file.
 pub fn writer_info(pid: u32) -> Option<(u32, String, String, u32, i64)> {
     let comm = comm_of(pid).unwrap_or_default();
     let (exe, _) = exe_of(pid).unwrap_or_default();
@@ -506,9 +440,6 @@ pub fn writer_info(pid: u32) -> Option<(u32, String, String, u32, i64)> {
     Some((pid, comm, exe, uid, tty_nr))
 }
 
-/// The file a syscall of `pid` named: `path` relative to the directory open
-/// on `fd` (`AT_FDCWD`: its working directory), or the file open on `fd`
-/// itself when `path` is empty.
 pub fn path_at(pid: u32, fd: i32, path: &str) -> Option<String> {
     if path.starts_with('/') {
         return Some(path.to_string());
@@ -523,8 +454,6 @@ pub fn path_at(pid: u32, fd: i32, path: &str) -> Option<String> {
     join_at(&base.to_string_lossy(), path)
 }
 
-/// `path` under `base`; `base` alone when `path` is empty. A base that isn't
-/// a path (a socket, a deleted file) resolves to nothing.
 pub fn join_at(base: &str, path: &str) -> Option<String> {
     if !base.starts_with('/') || base.ends_with(" (deleted)") {
         return None;
@@ -584,9 +513,6 @@ fn parse_tcp_table(content: &str, proto: &'static str) -> Vec<TcpEntry> {
             let local = it.next()?;
             let remote = it.next()?;
             let state = u8::from_str_radix(it.next()?, 16).ok()?;
-            // tx_queue:rx_queue, tr:tm->when, retrnsmt. Skipping four here
-            // used to read the timeout as uid and the refcount as the inode,
-            // so socket owners (listener pids) were never found.
             for _ in 0..3 {
                 it.next()?;
             }
@@ -619,8 +545,6 @@ pub fn read_tcp_tables() -> Vec<TcpEntry> {
     out
 }
 
-/// Every pid holding any of these socket inodes (a forked sshd and its
-/// monitor share the connection's socket), in one pass over `/proc/*/fd`.
 pub fn all_pids_for_inodes(inodes: &[u64]) -> Vec<u32> {
     let mut out = Vec::new();
     if inodes.is_empty() {
@@ -648,7 +572,6 @@ pub fn all_pids_for_inodes(inodes: &[u64]) -> Vec<u32> {
     out
 }
 
-/// Map many socket inodes to owning pids in one pass over `/proc/*/fd`.
 pub fn pids_for_inodes(inodes: &[u64]) -> HashMap<u64, u32> {
     let mut out = HashMap::new();
     if inodes.is_empty() {
@@ -681,7 +604,6 @@ pub fn pids_for_inodes(inodes: &[u64]) -> HashMap<u64, u32> {
     out
 }
 
-/// `(cpu ticks consumed, wall clock seconds)` for this process.
 pub fn self_cpu_sample() -> (u64, f64) {
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -721,8 +643,6 @@ pub fn has_file_capabilities(path: &str) -> bool {
     let Ok(cpath) = std::ffi::CString::new(path) else {
         return false;
     };
-    // lgetxattr: don't follow a user-planted symlink to some capability binary.
-    // SAFETY: valid C strings; null buffer with size 0 queries the attribute length.
     let rc = unsafe {
         libc::lgetxattr(
             cpath.as_ptr(),
@@ -736,17 +656,12 @@ pub fn has_file_capabilities(path: &str) -> bool {
 
 pub fn is_suid_or_sgid(path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    // symlink_metadata: a symlink to /usr/bin/sudo isn't a new setuid file.
     fs::symlink_metadata(path)
         .map(|m| m.is_file() && m.permissions().mode() & (libc::S_ISUID | libc::S_ISGID) != 0)
         .unwrap_or(false)
 }
 
-/// Whether `path` is owned by an installed package. `None` when no package
-/// manager could answer.
 pub fn file_in_package_database(path: &str) -> Option<bool> {
-    // `dpkg-query -S` takes a glob: a file named `x*` or `[a]` could match
-    // some packaged file and pass as package-owned. Don't ask about those.
     if path.contains(['*', '?', '[', ']', '\\']) {
         return None;
     }
@@ -769,9 +684,6 @@ pub fn file_in_package_database(path: &str) -> Option<bool> {
     None
 }
 
-/// Whether `path` is a 32-bit ELF on a 64-bit x86 host. Such programs make
-/// compat (int 0x80 / ia32) syscalls, which the `sys_enter_*` tracepoints
-/// don't see, so their connects and ptrace calls are invisible to eBPF.
 pub fn is_compat_binary(path: &str) -> bool {
     if !cfg!(target_arch = "x86_64") || path.is_empty() {
         return false;
@@ -806,7 +718,6 @@ mod tests {
         assert_eq!(join_at("/tmp/sh", "").as_deref(), Some("/tmp/sh"));
         assert_eq!(join_at("socket:[1234]", "x"), None);
         assert_eq!(join_at("/tmp/gone (deleted)", ""), None);
-        // Absolute paths ignore the directory.
         assert_eq!(path_at(1, 99_999, "/tmp/x").as_deref(), Some("/tmp/x"));
         assert_eq!(path_at(1, -5, "x"), None);
         let cwd = std::env::current_dir().unwrap();
@@ -818,8 +729,6 @@ mod tests {
 
     #[test]
     fn system_tools_run_by_absolute_path_with_a_clean_environment() {
-        // Any variable proves the environment is cleared; LD_PRELOAD itself
-        // would leak into tests running alongside.
         std::env::set_var("HERMIAN_TEST_LEAK", "leaked");
         let c = system_command("sh");
         let prog = c.get_program().to_string_lossy().into_owned();
@@ -853,7 +762,6 @@ mod tests {
             mark_unowned("/usr/bin/apt".into(), |_| true),
             "/usr/bin/apt"
         );
-        // Untrusted paths stay as they are; nothing to downgrade.
         assert_eq!(mark_unowned("/tmp/apt".into(), |_| false), "/tmp/apt");
     }
 
@@ -865,10 +773,8 @@ mod tests {
         let f = dir.join("tool");
         fs::write(&f, "x").unwrap();
         if unsafe { libc::geteuid() } != 0 {
-            // Our own file and directory: not root's.
             assert!(!root_owned_path(f.to_str().unwrap()));
         }
-        // A binary anyone can rewrite never counts, whoever owns it.
         fs::set_permissions(&f, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!root_owned_path(f.to_str().unwrap()));
         assert!(!root_owned_path("/nonexistent/hermian/tool"));
@@ -879,13 +785,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hermian-{}-{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        // temp_dir itself may be a symlink (macOS-style setups); use the real path.
         fs::canonicalize(&dir).unwrap()
     }
 
     #[test]
     fn tcp_table_rows_carry_both_ends() {
-        // Copied from a real /proc/net/tcp (uid 991, inode 4242).
         let t = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:0016 0764A8C6:C350 01 00000000:00000000 00:00000000 00000000   991        0 4242 1 0000000000000000 20 4 30 10 -1\n";
         let rows = parse_tcp_table(t, "tcp");
         assert_eq!(rows.len(), 1);
@@ -904,7 +808,6 @@ mod tests {
         assert!(is_elf32(b"\x7fELF\x01"));
         assert!(!is_elf32(b"\x7fELF\x02"));
         assert!(!is_elf32(b"#!/bi"));
-        // Our own binary is 64-bit.
         let me = current_exe_path().unwrap();
         assert!(!is_compat_binary(me.to_str().unwrap()));
         assert!(!is_compat_binary("/nonexistent"));
@@ -919,8 +822,6 @@ mod tests {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
         let mut child = std::process::Command::new(&script).spawn().unwrap();
         let pid = child.id();
-        // Wait for the exec to land: comm switches to "dnf", then the new
-        // argument area appears.
         let mut comm = String::new();
         for _ in 0..200 {
             comm = comm_of(pid).unwrap_or_default();
@@ -959,9 +860,7 @@ mod tests {
         let dir = scratch("fifo");
         let f = dir.join(".bashrc");
         let c = std::ffi::CString::new(f.to_str().unwrap()).unwrap();
-        // SAFETY: valid C string.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
-        // A blocking open would hang this test forever.
         assert!(read_regular_file(f.to_str().unwrap()).is_none());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -976,7 +875,6 @@ mod tests {
         assert!(read_regular_file(link.to_str().unwrap()).is_none());
         assert!(!is_suid_or_sgid(link.to_str().unwrap()));
 
-        // Symlinked parent directory: ~/.ssh -> somewhere else.
         let real = dir.join("real");
         fs::create_dir(&real).unwrap();
         fs::write(real.join("authorized_keys"), "ssh-ed25519 AAAA\n").unwrap();

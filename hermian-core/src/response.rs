@@ -1,39 +1,31 @@
-//! Response actions an alert can offer (as Telegram buttons, for now).
-//!
-//! The engine only *describes* what could be done; it never does it. The
-//! daemon decides whether actions are enabled, who may trigger them, and
-//! carries them out.
-
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResponseAction {
-    /// Do nothing. With sources and hours set (brute-force digest), stop
-    /// reporting those sources for that long. Successful logins from them
-    /// still alert.
-    Ignore { sources: Vec<IpAddr>, hours: u32 },
-    /// Block these sources in the firewall for `response.block_duration_hours`.
-    Block { sources: Vec<IpAddr> },
-    /// End the SSH session from `source` (and `port`, when known), blocking
-    /// the source first if `block` is set.
+    Ignore {
+        sources: Vec<IpAddr>,
+        hours: u32,
+    },
+    Block {
+        sources: Vec<IpAddr>,
+    },
     Disconnect {
         source: IpAddr,
         port: Option<u16>,
         user: String,
         block: bool,
     },
-    /// Stop adding the "root can log in with a password" warning to digests
-    /// for this many days.
-    SnoozeRootPasswordWarning { days: u32 },
-    /// Lift blocks made from an alert's buttons (the Undo on a Block result).
-    /// Offered by the daemon after a block, never by the engine.
-    Unblock { sources: Vec<IpAddr> },
+    SnoozeRootPasswordWarning {
+        days: u32,
+    },
+    Unblock {
+        sources: Vec<IpAddr>,
+    },
 }
 
 impl ResponseAction {
-    /// Button label.
     pub fn label(&self) -> String {
         match self {
             ResponseAction::Ignore { sources, hours } if !sources.is_empty() && *hours > 0 => {
@@ -56,9 +48,6 @@ impl ResponseAction {
         }
     }
 
-    /// The same thing from a root shell, for when the button can't be used
-    /// any more (expired, or the daemon restarted). None for choices that
-    /// only matter while the alert is fresh.
     pub fn cli_twin(&self) -> Option<String> {
         let each = |verb: &str, ips: &[IpAddr]| {
             ips.iter()
@@ -93,8 +82,6 @@ impl ResponseAction {
         }
     }
 
-    /// Whether choosing this settles the alert, so its other buttons go away.
-    /// Blocking one source of a digest leaves the rest open.
     pub fn settles(&self) -> bool {
         !matches!(self, ResponseAction::Block { sources } if sources.len() == 1)
             && !matches!(
@@ -131,7 +118,6 @@ mod tests {
             hours: 0,
         };
         assert_eq!(i.label(), "Ignore");
-        // Round-trips through JSON (alerts are stored as JSON).
         let back: ResponseAction =
             serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back, d);

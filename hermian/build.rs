@@ -1,17 +1,3 @@
-//! Builds the `hermian-ebpf` crate for `bpfel-unknown-none` and exposes the
-//! resulting object path to the daemon via `HERMIAN_EBPF_OBJECT`.
-//!
-//! Two build strategies are attempted in order:
-//!
-//! 1. A toolchain that already has a `bpfel-unknown-none` std (rare: it's a
-//!    tier-3 target, so rustup can't install one).
-//! 2. A nightly toolchain with `rust-src`, using `-Zbuild-std=core`. The
-//!    toolchain name comes from `HERMIAN_EBPF_NIGHTLY` (default `nightly`);
-//!    CI pins a dated one, since the vendored object is compared byte for
-//!    byte and any codegen change in a newer nightly would fail that check.
-//!
-//! Both require `bpf-linker` on PATH.
-
 use std::{
     env,
     path::{Path, PathBuf},
@@ -29,7 +15,6 @@ fn toolchain_has_target() -> bool {
         .unwrap_or(false)
 }
 
-/// The nightly toolchain used for the BPF build.
 fn nightly() -> String {
     env::var("HERMIAN_EBPF_NIGHTLY")
         .ok()
@@ -64,8 +49,6 @@ fn bpf_linker_available() -> bool {
         .unwrap_or(false)
 }
 
-/// A cargo invocation that does not inherit the outer build's toolchain pins or
-/// rustflags (those are for the host target and break the BPF target).
 fn clean_cargo() -> Command {
     let mut cmd = Command::new("cargo");
     for var in [
@@ -85,11 +68,7 @@ fn clean_cargo() -> Command {
 }
 
 enum BuildError {
-    /// No usable BPF toolchain: falling back to the vendored object is fine.
     NoToolchain(String),
-    /// A toolchain ran and the build failed: most likely an error in
-    /// hermian-ebpf itself. Falling back would silently ship an object that
-    /// doesn't match the source (and may not match `RawExec`'s layout).
     Failed(String),
 }
 
@@ -175,11 +154,8 @@ fn build_ebpf(ebpf_dir: &Path, out_dir: &Path) -> Result<PathBuf, BuildError> {
 
 #[derive(PartialEq)]
 enum SourceMode {
-    /// Build from source if a toolchain exists, else use the vendored object.
     Auto,
-    /// `HERMIAN_EBPF_FROM_SOURCE=1`: build from source or fail (CI).
     Force,
-    /// `HERMIAN_EBPF_FROM_SOURCE=0`: always use the vendored object.
     Never,
 }
 
@@ -197,13 +173,8 @@ fn main() {
     let ebpf_dir = manifest_dir.join("../hermian-ebpf");
 
     println!("cargo:rerun-if-env-changed=HERMIAN_EBPF_PREBUILT");
-    // A pre-built object (from a release pipeline or a host with a newer LLVM)
-    // skips the BPF toolchain requirement entirely. The object is
-    // target-independent, so it may be produced on any machine.
     if let Some(prebuilt) = env::var_os("HERMIAN_EBPF_PREBUILT") {
         let given = PathBuf::from(prebuilt);
-        // include_bytes! resolves relative paths against src/ebpf.rs, not the
-        // package dir, so hand it an absolute path.
         let p = given
             .canonicalize()
             .unwrap_or_else(|_| panic!("HERMIAN_EBPF_PREBUILT={} is not a file", given.display()));
@@ -215,15 +186,6 @@ fn main() {
         return;
     }
 
-    // Order of preference:
-    //   1. build from source when a BPF toolchain is present (developers);
-    //   2. the vendored object in hermian-ebpf/prebuilt (release builds and
-    //      hosts whose LLVM is too old for bpf-linker);
-    //   3. fail with instructions.
-    // HERMIAN_EBPF_FROM_SOURCE=1 forces (1) and refuses to fall back, so CI
-    // can prove the vendored object is up to date; =0 skips straight to (2).
-    // A toolchain that runs but fails to compile is an error, not a reason
-    // to fall back.
     let vendored = ebpf_dir.join("prebuilt/hermian-ebpf.o");
     println!("cargo:rerun-if-changed={}", vendored.display());
     println!("cargo:rerun-if-env-changed=HERMIAN_EBPF_FROM_SOURCE");
@@ -258,7 +220,6 @@ fn main() {
     println!("cargo:rustc-env=HERMIAN_EBPF_OBJECT={}", obj_path.display());
     println!("cargo:rerun-if-changed=../hermian-ebpf/src/main.rs");
     println!("cargo:rerun-if-changed=../hermian-ebpf/Cargo.toml");
-    // An aya-ebpf bump changes the object too.
     println!("cargo:rerun-if-changed=../Cargo.lock");
     println!("cargo:rerun-if-env-changed=HERMIAN_EBPF_NIGHTLY");
 }

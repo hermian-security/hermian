@@ -84,11 +84,7 @@ pub enum ConfigError {
 #[serde(default, deny_unknown_fields)]
 pub struct General {
     pub hostname: String,
-    /// Retired: accepted so configs from early betas still load, but nothing
-    /// reads it. `hermian enable` comments it out; dropped at v0.1.0.
     pub log_level: String,
-    /// Stored alert records and collect bundles older than this are deleted
-    /// (0 keeps them forever). `alerts.log` is rotated by size regardless.
     pub alert_retention_days: u32,
 }
 
@@ -102,7 +98,6 @@ impl Default for General {
     }
 }
 
-/// Upper bound for `general.alert_retention_days` (ten years).
 pub const MAX_RETENTION_DAYS: u32 = 3650;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,35 +119,16 @@ impl Default for BaselineCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SshCfg {
-    /// Treat root SSH logins as expected (suppresses the root-login alert
-    /// entirely). When `false` (default) a root login is HIGH the first time it
-    /// is seen from a given source and INFO for repeats from that source; new
-    /// sources are covered by the baseline novelty rule.
     pub permit_root: bool,
     pub failed_burst_count: u32,
     pub failed_burst_window_secs: u64,
-    /// Retired: off-hours weighting was removed. Accepted so old configs
-    /// still load, but nothing reads them. `hermian enable` comments them
-    /// out; dropped at v0.1.0.
     pub off_hours_start: u32,
     pub off_hours_end: u32,
-    /// Retired: the digest is weekly now (`brute_digest_days`). Accepted so
-    /// old configs still load; `hermian enable` comments it out.
     pub brute_digest_hours: u32,
-    /// Failed logins against *existing* accounts are summed up in a digest
-    /// every this many days. It's sent only when one of those accounts
-    /// accepts a password; otherwise it's recorded.
     pub brute_digest_days: u32,
-    /// One source failing this many times within `brute_alert_window_secs`,
-    /// against an account that exists and accepts a password, pages at once.
     pub brute_alert_count: u32,
     pub brute_alert_window_secs: u64,
-    /// A source needs at least this many failures against existing accounts
-    /// in a digest period to be listed.
     pub brute_min_attempts: u32,
-    /// A login with a key the account has used before, from a network it
-    /// hasn't: "alert" pages it (root) as usual, "log" records it without
-    /// sending. Passwords and new keys always page.
     pub known_key_new_network: String,
 }
 
@@ -200,9 +176,7 @@ impl Default for DetectionsCfg {
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookCfg {
     pub url: String,
-    /// generic | slack | discord | ntfy
     pub format: String,
-    /// Optional bearer token / ntfy access token sent as `Authorization`.
     pub token: String,
     pub timeout_secs: u64,
 }
@@ -221,23 +195,13 @@ impl Default for WebhookCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelegramCfg {
-    /// Bot token from @BotFather, e.g. "123456789:AAH...".
     pub bot_token: String,
-    /// Chat, group or channel id (negative for groups). Get it from
-    /// https://api.telegram.org/bot<token>/getUpdates after messaging the bot.
     pub chat_id: String,
-    /// Optional topic id for forum-style supergroups.
     pub message_thread_id: Option<i64>,
-    /// Send CRITICAL alerts with notification sound (others are silent).
     pub silent_below_critical: bool,
     pub timeout_secs: u64,
-    /// Show response buttons (Block IP, Disconnect...) under alerts that
-    /// offer them. Off by default: it turns the bot into a remote control.
     pub actions: bool,
-    /// Telegram user ids allowed to press those buttons. Required when
-    /// `actions` is on; presses from anyone else are refused and logged.
     pub allowed_user_ids: Vec<i64>,
-    /// Buttons stop working after this many minutes.
     pub action_ttl_mins: u32,
 }
 
@@ -257,7 +221,6 @@ impl Default for TelegramCfg {
 }
 
 impl TelegramCfg {
-    /// Whether response buttons are in use.
     pub fn actions_enabled(&self) -> bool {
         self.actions && !self.allowed_user_ids.is_empty()
     }
@@ -266,21 +229,16 @@ impl TelegramCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmailCfg {
-    /// smtp | sendmail
     pub transport: String,
     pub from: String,
     pub to: Vec<String>,
-    /// Prefix for the subject line, e.g. "[Hermian]".
     pub subject_prefix: String,
-    // --- smtp transport ---
     pub smtp_host: String,
     pub smtp_port: u16,
-    /// starttls | tls | none
     pub smtp_security: String,
     pub smtp_username: String,
     pub smtp_password: String,
     pub timeout_secs: u64,
-    // --- sendmail transport ---
     pub sendmail_path: String,
 }
 
@@ -307,12 +265,7 @@ impl Default for EmailCfg {
 pub struct NotificationsCfg {
     pub channels: Vec<String>,
     pub dedup_window_secs: u64,
-    /// Minimum severity that is *notified* (sent to webhook/telegram/email/
-    /// stdout). Everything is always written to journald/file regardless.
     pub min_severity: String,
-    /// What leaves the host: "full" (default) or "minimal" (severity, rule
-    /// family, reference and host only; see [`crate::Alert::minimal`]).
-    /// journald and the alert file always get everything.
     pub content: String,
     pub webhook: WebhookCfg,
     pub telegram: TelegramCfg,
@@ -348,11 +301,7 @@ impl NotificationsCfg {
 pub struct ResponseCfg {
     pub auto_isolate: bool,
     pub management_cidrs: Vec<String>,
-    /// Lift an automatic isolation after this many minutes (0 = stay
-    /// isolated until `hermian unisolate`). A dead-man switch in case the
-    /// management CIDRs turn out to be wrong.
     pub auto_isolate_revert_mins: u32,
-    /// How long a "Block IP" lasts, in hours.
     pub block_duration_hours: u32,
 }
 
@@ -367,10 +316,8 @@ impl Default for ResponseCfg {
     }
 }
 
-/// Upper bound for `block_duration_hours` (one year).
 pub const MAX_BLOCK_HOURS: u32 = 24 * 365;
 
-/// Upper bound for `auto_isolate_revert_mins` (one week).
 pub const MAX_REVERT_MINS: u32 = 7 * 24 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -399,8 +346,6 @@ impl Config {
         toml::from_str(toml_text)
     }
 
-    /// A hint for a parse error on a line that reads like an explanation that
-    /// lost its `#`: the commonest way to break this file by hand.
     pub fn parse_hint(toml_text: &str, err: &toml::de::Error) -> Option<String> {
         let start = err.span()?.start.min(toml_text.len());
         let line_no = toml_text.get(..start)?.matches('\n').count() + 1;
@@ -422,9 +367,6 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Upper bounds too: chrono panics on out-of-range durations, so a
-        // typo like duration_hours = 99999999999 used to crash the daemon on
-        // (re)load instead of being rejected.
         if !(1..=MAX_BASELINE_HOURS).contains(&self.baseline.duration_hours) {
             return Err(ConfigError::BaselineDuration);
         }
@@ -539,8 +481,6 @@ impl Config {
         for cidr in &self.response.management_cidrs {
             match crate::allowlist::parse_cidr(cidr) {
                 None => return Err(ConfigError::BadCidr(cidr.clone())),
-                // 0.0.0.0/0 or ::/0 keeps everything reachable: isolation
-                // would silently do nothing.
                 Some((_, 0)) => return Err(ConfigError::CatchAllCidr(cidr.clone())),
                 Some(_) => {}
             }
@@ -725,11 +665,6 @@ block_duration_hours = 24     # how long a "Block IP" button blocks a source
 mod tests {
     use super::*;
 
-    /// `##` explains, a single `#` switches a setting off: removing one `#`
-    /// from an explanation must leave a comment, and removing it from a
-    /// setting (or from each line of an allowlist block) must give a valid
-    /// config. Nothing in between, so nobody can uncomment their way into a
-    /// broken file.
     #[test]
     fn template_comments_are_either_explanations_or_settings() {
         let lines: Vec<&str> = DEFAULT_CONFIG_TOML.lines().collect();
@@ -752,7 +687,6 @@ mod tests {
                 i += 1;
                 continue;
             }
-            // One setting, or a whole allowlist block.
             let mut end = i + 1;
             if t.starts_with("#[[") {
                 while end < lines.len()
@@ -788,7 +722,6 @@ mod tests {
         let hint = Config::parse_hint(&broken, &err).expect("a hint");
         assert!(hint.contains("1. Message @BotFather"), "{}", hint);
         assert!(hint.contains("Put the '#' back"), "{}", hint);
-        // A real typo in a setting isn't blamed on a lost '#'.
         let typo = "[ssh]\npermit_root = flase\n";
         let err = Config::parse(typo).unwrap_err();
         assert_eq!(Config::parse_hint(typo, &err), None);
@@ -823,13 +756,10 @@ mod tests {
         assert!(matches!(digest.validate(), Err(ConfigError::DigestDays)));
         let fast = Config::parse("[ssh]\nbrute_alert_count = 1\n").unwrap();
         assert!(matches!(fast.validate(), Err(ConfigError::BruteAlert)));
-        // An old config's digest hours still load (retired, ignored).
         assert!(Config::parse("[ssh]\nbrute_digest_hours = 2\n")
             .unwrap()
             .validate()
             .is_ok());
-        // Defaults: off, 24 h blocks, weekly digest, 10 attempts, 20 in a
-        // minute pages, buttons last a day.
         let d = Config::default();
         assert!(!d.notifications.telegram.actions_enabled());
         assert_eq!(d.response.block_duration_hours, 24);

@@ -1,5 +1,3 @@
-//! Integrity hashes for the binary and configuration.
-
 use std::fs;
 use std::path::Path;
 
@@ -39,8 +37,6 @@ pub struct IntegrityStatus {
     pub config_ok: bool,
     pub binary_hash: String,
     pub config_hash: String,
-    /// The stored hash was missing (first start without `hermian enable`,
-    /// or someone deleted it), so there was nothing to compare against.
     pub binary_record_missing: bool,
     pub config_record_missing: bool,
 }
@@ -61,10 +57,6 @@ pub fn verify_at_startup() -> IntegrityStatus {
     let config_hash = sha256_file(&paths::config_path()).unwrap_or_default();
     let stored_binary = read_hash(&paths::binary_hash_file());
     let stored_config = stored_config_hash();
-    // `hermian enable` (and the package) record both hashes before the first
-    // start, so a missing one means someone deleted it, or a tarball upgrade
-    // skipped `enable`. Deleting binary.sha256 and swapping the binary used to
-    // pass silently: record the current value, but report it.
     if stored_binary.is_none() && !binary_hash.is_empty() {
         let _ = write_secure(&paths::binary_hash_file(), &binary_hash);
     }
@@ -83,8 +75,6 @@ pub fn verify_at_startup() -> IntegrityStatus {
     }
 }
 
-/// `(matches, record_missing)` for a stored hash against the current one.
-/// A missing record isn't a mismatch, but it is reported.
 fn judge(stored: Option<&str>, current: &str) -> (bool, bool) {
     match stored {
         Some(s) => (s == current, false),

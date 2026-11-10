@@ -3,8 +3,6 @@ use std::net::IpAddr;
 
 use crate::config::ConfigError;
 
-/// Operator-declared exceptions. Every rule carries a mandatory `reason` so the
-/// config file doubles as the audit trail of suppression decisions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Allowlist {
@@ -19,8 +17,6 @@ pub struct Allowlist {
     pub destinations: Vec<DestinationRule>,
     #[serde(alias = "debugger")]
     pub debuggers: Vec<DebuggerRule>,
-    /// Keys whose logins are never "from a new source": CI runners and
-    /// other automation that log in from a different address every time.
     #[serde(alias = "ssh_key")]
     pub ssh_keys: Vec<KeyRule>,
 }
@@ -66,16 +62,12 @@ pub struct DebuggerRule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyRule {
-    /// As sshd logs it: "SHA256:..." (ssh-keygen -lf key.pub).
     pub fingerprint: String,
-    /// Only for this account; any account when unset.
     #[serde(default)]
     pub user: Option<String>,
     pub reason: String,
 }
 
-/// Parse `a.b.c.d`, `a.b.c.d/nn`, or an IPv6 equivalent. A bare address is a
-/// host route (/32 or /128).
 pub fn parse_cidr(s: &str) -> Option<(IpAddr, u32)> {
     let (ip, prefix) = match s.split_once('/') {
         Some((ip, p)) => (ip.trim(), Some(p.trim().parse::<u32>().ok()?)),
@@ -109,7 +101,6 @@ fn ip_matches(ip: IpAddr, (net, prefix): (IpAddr, u32)) -> bool {
             let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
             u128::from(a) & mask == u128::from(n) & mask
         }
-        // Allow a v4 rule to match a v4-mapped v6 address.
         (IpAddr::V6(a), IpAddr::V4(_)) => a
             .to_ipv4_mapped()
             .map(|v4| ip_matches(IpAddr::V4(v4), (net, prefix)))
@@ -219,7 +210,6 @@ impl Allowlist {
         self.binaries.iter().any(|r| path_matches(clean, &r.path))
     }
 
-    /// A login with this key, as this user, is allowlisted.
     pub fn key_allowed(&self, user: &str, fingerprint: &str) -> bool {
         self.ssh_keys
             .iter()
@@ -321,7 +311,6 @@ mod tests {
         assert!(a.chain_allowed("deploy-agent", "bash", Some(1001), Some("deploy")));
         assert!(!a.chain_allowed("deploy-agent", "bash", Some(0), Some("root")));
         assert!(!a.chain_allowed("other", "bash", Some(1001), Some("deploy")));
-        // Numeric user rule.
         let mut b = sample();
         b.process_chains[0].user = Some("1001".into());
         assert!(b.chain_allowed("deploy-agent", "bash", Some(1001), None));

@@ -1,10 +1,3 @@
-//! Polling sources used when eBPF is unavailable, plus pollers that are always
-//! on because no event source covers them well:
-//! * listeners: `/proc/net/tcp*` is the authoritative view of bound ports;
-//! * setuid/capability sweep: inotify cannot watch every user-writable tree
-//!   and `chmod` leaves no exec trace, so transient and home directories are
-//!   swept for newly privileged executables.
-
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -18,14 +11,6 @@ use tokio::sync::mpsc;
 
 use crate::procsrc;
 
-/// Directories swept for setuid/setgid/capability executables, with how many
-/// sweeps go by between two walks of each, without and with the eBPF chmod
-/// and setxattr hooks. Without them, transient directories, where a dropped
-/// binary usually lands, every sweep; homes and service trees, which can
-/// hold tens of thousands of entries, every third. With them, a chmod or
-/// setcap is reported as it happens and the sweep is only the safety net
-/// for files created with those bits. Depth-limited so a large home
-/// directory cannot turn the sweep into a filesystem crawl.
 const SUID_SWEEP_ROOTS: &[(&[&str], u32, u32)] = &[
     (&["/tmp", "/var/tmp", "/dev/shm"], 1, 3),
     (&["/home", "/root", "/var/www", "/srv", "/opt"], 3, 15),
@@ -33,15 +18,10 @@ const SUID_SWEEP_ROOTS: &[(&[&str], u32, u32)] = &[
 const SUID_SWEEP_DEPTH: usize = 4;
 const SUID_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
 
-/// Set once the eBPF chmod/setxattr hooks are attached.
 pub static PRIV_HOOKED: AtomicBool = AtomicBool::new(false);
 
-/// Files the hooks already reported, so the sweep doesn't report them again.
 static PRIV_REPORTED: Mutex<Option<HashSet<(u64, u64)>>> = Mutex::new(None);
 
-/// A setuid/setgid or capability file at `path`, as a file event, if `path`
-/// is a regular file that really has them. `None` otherwise (a chmod that
-/// failed, a directory given setgid).
 pub fn privileged_file_event(
     path: String,
     kind: FileKind,
@@ -72,8 +52,6 @@ pub fn privileged_file_event(
     })
 }
 
-/// Note a file the hooks reported. Bounded: past the cap the oldest
-/// knowledge goes, and the sweep may report one of those again.
 pub fn note_priv_reported(dev: u64, ino: u64) {
     if let Ok(mut g) = PRIV_REPORTED.lock() {
         let set = g.get_or_insert_with(HashSet::new);
@@ -84,20 +62,12 @@ pub fn note_priv_reported(dev: u64, ino: u64) {
     }
 }
 
-/// The kernel's dev_t (12-bit major, 20-bit minor) as stat's st_dev.
 pub fn st_dev_of_kernel(dev: u32) -> u64 {
     libc::makedev(dev >> 20, dev & 0xf_ffff)
 }
 
-/// When the last inode search ran, for [`find_inode`]'s rate limit.
 static LAST_INODE_SEARCH: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// Where `(st_dev, ino)` is under the swept roots, as deep as the sweep goes.
-/// For a chmod or setcap whose caller is gone before /proc can say what its
-/// fd or working directory was. Only those roots: elsewhere the rules don't
-/// page. Inode numbers come with the directory listing, so only a match is
-/// stat'ed. At most once a second, so a flood can't stall the event thread;
-/// past that the sweep is the safety net.
 pub fn find_inode(st_dev: u64, ino: u64) -> Option<String> {
     if ino == 0 {
         return None;
@@ -167,8 +137,6 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, u64, u64)>) {
         return;
     };
     for e in rd.flatten() {
-        // The entry's type comes with the directory listing: only regular
-        // files need a stat for their mode.
         let Ok(ft) = e.file_type() else {
             continue;
         };
@@ -176,7 +144,6 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, u64, u64)>) {
             continue;
         }
         if ft.is_dir() {
-            // Skip huge/noisy trees that never legitimately hold setuid files.
             let name = e.file_name();
             let name = name.to_string_lossy();
             if matches!(
@@ -212,7 +179,6 @@ fn scan_roots(roots: &[&str]) -> Vec<(String, u64, u64)> {
     out
 }
 
-/// Setuid files in `current` that `known` hasn't seen; `known` becomes `current`.
 fn newly_privileged(
     known: &mut HashSet<(u64, u64)>,
     current: Vec<(String, u64, u64)>,
@@ -239,8 +205,6 @@ pub fn writer_from(
 }
 
 fn suid_sweep_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
-    // Whatever exists at start is pre-existing; only new appearances alert.
-    // Each group keeps its own: a group not walked this round keeps what it knew.
     let mut known: Vec<HashSet<(u64, u64)>> = SUID_SWEEP_ROOTS
         .iter()
         .map(|(roots, _, _)| {
@@ -293,8 +257,6 @@ pub fn spawn_listener_poller(
     Ok(())
 }
 
-/// Emits an Exec event for every process that appears between polls. Uses
-/// `(pid, starttime)` as identity so PID reuse is not mistaken for "already seen".
 fn proc_poller_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     let mut seen: HashMap<u32, u64> = procsrc::scan_processes()
         .into_iter()
@@ -334,9 +296,6 @@ fn proc_poller_loop(tx: mpsc::Sender<Event>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-/// `(proto, local address, port)`. The address is part of it: a second bind
-/// of a known port on another address (`127.0.0.1:8080`, then
-/// `0.0.0.0:8080`) is a new exposure.
 pub type ListenerKey = (String, std::net::IpAddr, u16);
 
 fn listener_poller_loop(
@@ -429,7 +388,6 @@ mod tests {
         let new = newly_privileged(&mut known, vec![f(1), f(2)]);
         assert_eq!(new, vec![f(2)]);
         assert!(newly_privileged(&mut known, vec![f(1), f(2)]).is_empty());
-        // Removed, then back: reported again.
         assert!(newly_privileged(&mut known, vec![f(1)]).is_empty());
         assert_eq!(newly_privileged(&mut known, vec![f(1), f(2)]), vec![f(2)]);
     }
@@ -448,8 +406,6 @@ mod tests {
                 root
             );
         }
-        // Without the hooks, homes at least once a minute; with them, the
-        // safety net still comes by every few minutes.
         for (_, every, every_hooked) in SUID_SWEEP_ROOTS {
             assert!(SUID_SWEEP_INTERVAL * *every <= Duration::from_secs(60));
             assert!(SUID_SWEEP_INTERVAL * *every_hooked <= Duration::from_secs(300));
@@ -469,7 +425,6 @@ mod tests {
             let found = find_inode_under(&d, md.dev(), md.ino(), 4);
             assert_eq!(found.as_deref(), p.to_str(), "{}", p.display());
         }
-        // Too deep, or not there.
         let md = std::fs::metadata(d.join("a/b/f")).unwrap();
         assert_eq!(find_inode_under(&d, md.dev(), md.ino(), 1), None);
         assert_eq!(find_inode_under(&d, md.dev(), u64::MAX, 4), None);
@@ -478,7 +433,6 @@ mod tests {
 
     #[test]
     fn kernel_dev_t_becomes_st_dev() {
-        // 8:1 is /dev/sda1; 259:65536 needs the wide minor.
         assert_eq!(st_dev_of_kernel((8 << 20) | 1), libc::makedev(8, 1));
         assert_eq!(
             st_dev_of_kernel((259 << 20) | 65536),
@@ -494,17 +448,14 @@ mod tests {
         let f = d.join("sh");
         std::fs::write(&f, b"x").unwrap();
         let p = f.to_str().unwrap().to_string();
-        // A chmod that didn't happen (or failed): nothing.
         assert!(privileged_file_event(p.clone(), FileKind::Modified, None).is_none());
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o4755)).unwrap();
         let ev = privileged_file_event(p.clone(), FileKind::Modified, None).unwrap();
         assert!(ev.is_suid && ev.path == p);
-        // A directory given setgid (shared folders) isn't a privileged file.
         std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o2755)).unwrap();
         assert!(
             privileged_file_event(d.to_str().unwrap().into(), FileKind::Modified, None).is_none()
         );
-        // Reported by a hook: the sweep leaves it alone.
         assert!(!priv_reported(ev.dev, ev.ino));
         note_priv_reported(ev.dev, ev.ino);
         assert!(priv_reported(ev.dev, ev.ino));

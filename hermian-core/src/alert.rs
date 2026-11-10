@@ -1,17 +1,9 @@
-//! Alert model and rendering.
-//!
-//! A [`Finding`] is what a detection rule produces. The engine promotes it to an
-//! [`Alert`] by attaching a reference id, host, and timestamp. Rendering is a
-//! pure function of the alert plus a [`Theme`], so the exact same alert can be
-//! written to journald (plain), a terminal (ansi) or a chat webhook (compact).
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::events::{DetectionId, ProcInfo, Severity};
 
-/// One node of a process ancestry, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainNode {
     pub pid: u32,
@@ -19,7 +11,6 @@ pub struct ChainNode {
     pub user: Option<String>,
     pub comm: String,
     pub exe: String,
-    /// Marks the process the detection is about (rendered with emphasis).
     #[serde(default)]
     pub focus: bool,
 }
@@ -44,7 +35,6 @@ impl ChainNode {
     }
 }
 
-/// Build a chain from a process tree slice, marking the last node as the focus.
 pub fn chain_from_procs(chain: &[ProcInfo], user_names: &HashMap<u32, String>) -> Vec<ChainNode> {
     let mut out: Vec<ChainNode> = chain
         .iter()
@@ -56,7 +46,6 @@ pub fn chain_from_procs(chain: &[ProcInfo], user_names: &HashMap<u32, String>) -
     out
 }
 
-/// A labelled fact shown in the alert's evidence block (e.g. `Path`, `Writer`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
     pub label: String,
@@ -79,12 +68,8 @@ pub struct Finding {
     pub signature: String,
     #[serde(default)]
     pub pids: Vec<u32>,
-    /// Responses an operator could choose (shown as buttons where supported).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offers: Vec<crate::response::ResponseAction>,
-    /// What differs between repeats of one incident (a destination, an
-    /// executable). Not part of the signature: the dedup summary lists the
-    /// values it folded instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub varies: Option<Fact>,
 }
@@ -107,8 +92,6 @@ impl Finding {
         }
     }
 
-    /// Name the detail that changes from one repeat to the next. `label` is
-    /// the plural used in the summary ("Destinations").
     pub fn varies(mut self, label: impl Into<String>, value: impl Into<String>) -> Self {
         self.varies = Some(Fact {
             label: label.into(),
@@ -117,7 +100,6 @@ impl Finding {
         self
     }
 
-    /// Offer a response the operator can choose.
     pub fn offer(mut self, action: crate::response::ResponseAction) -> Self {
         self.offers.push(action);
         self
@@ -128,7 +110,6 @@ impl Finding {
         self
     }
 
-    /// Attach a process chain; also records the chain's PIDs for correlation.
     pub fn chain(mut self, chain: Vec<ChainNode>) -> Self {
         if self.pids.is_empty() {
             self.pids = chain.iter().map(|n| n.pid).collect();
@@ -137,7 +118,6 @@ impl Finding {
         self
     }
 
-    /// Several facts at once, in order (empty values skipped, as in `fact`).
     pub fn facts_from(self, facts: Vec<(&'static str, String)>) -> Self {
         facts.into_iter().fold(self, |f, (l, v)| f.fact(l, v))
     }
@@ -202,10 +182,8 @@ pub struct Alert {
     #[serde(default)]
     pub actions: Vec<String>,
     pub signature: String,
-    /// Number of identical occurrences folded into this alert (>= 1).
     #[serde(default = "one")]
     pub repeats: u32,
-    /// Responses offered with this alert (see [`Finding::offers`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub offers: Vec<crate::response::ResponseAction>,
 }
@@ -214,10 +192,6 @@ fn one() -> u32 {
     1
 }
 
-/// Make untrusted text safe to print: control characters (ESC sequences can
-/// rewrite a terminal, a newline can forge a log line) and bidi overrides
-/// (which reorder what the operator reads) become visible `\x1b` / `\u{202e}`
-/// escapes. Idempotent: the output contains nothing it would escape again.
 pub fn escape_untrusted(s: &str) -> String {
     if !s.chars().any(needs_escape) {
         return s.to_string();
@@ -244,9 +218,6 @@ fn needs_escape(c: char) -> bool {
 }
 
 impl Alert {
-    /// Escape every field that can carry attacker-controlled text (process
-    /// names, paths, usernames, quoted file content). Applied when an alert
-    /// is created and when one is read back from disk.
     pub fn sanitized(mut self) -> Self {
         let e = |s: &mut String| *s = escape_untrusted(s);
         e(&mut self.host);
@@ -294,14 +265,6 @@ impl Alert {
         }
     }
 
-    /// Whether this alert may trigger automatic isolation.
-    ///
-    /// Only CRITICAL alerts qualify, and not when the chain rests on a web
-    /// server or database identified by name alone. Those roles add suspicion
-    /// by name, so any local user can run a program called `nginx` and walk
-    /// it through shell -> curl -> payload. That's still worth a page, but
-    /// cutting the host off the network shouldn't be something an
-    /// unprivileged user can do. See [`crate::proctree::genuine_service`].
     pub fn auto_isolate_eligible(&self) -> bool {
         use crate::proctree::{genuine_service, role_of, Role};
         self.severity == Severity::Critical
@@ -311,10 +274,6 @@ impl Alert {
             })
     }
 
-    /// The alert as a channel sees it with `notifications.content =
-    /// "minimal"`: severity, rule family, reference and host, and the command
-    /// to read the rest on the host. No addresses, users, paths, commands or
-    /// process names, and no buttons (they'd need that context).
     pub fn minimal(&self) -> Alert {
         let short = self.short_ref();
         Alert {
@@ -341,12 +300,10 @@ impl Alert {
         }
     }
 
-    /// "025" for HER-2026-1017-025: what `hermian show` takes for today.
     pub fn short_ref(&self) -> &str {
         self.ref_id.rsplit('-').next().unwrap_or(&self.ref_id)
     }
 
-    /// One-line summary suitable for logs and chat previews.
     pub fn headline(&self) -> String {
         format!(
             "{} {} {} - {} [{}]",
@@ -359,13 +316,6 @@ impl Alert {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reference ids
-// ---------------------------------------------------------------------------
-
-/// Generates `HER-YYYY-MMDD-NNN` ids that reset daily. The counter is meant to
-/// be persisted by the daemon and restored via [`RefGen::resume`] so a restart
-/// never reissues an id already used today.
 #[derive(Debug, Clone)]
 pub struct RefGen {
     day: String,
@@ -376,7 +326,6 @@ fn day_key(now: DateTime<Utc>) -> String {
     now.format("%Y-%m%d").to_string()
 }
 
-/// `YYYY-MMDD`, as written by [`day_key`].
 fn is_day_key(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 9
@@ -394,9 +343,6 @@ impl RefGen {
         }
     }
 
-    /// Resume from a persisted `(day, seq)` pair. An older day starts fresh;
-    /// today's, or a later one (the clock went back), carries on so no id
-    /// is issued twice.
     pub fn resume(now: DateTime<Utc>, day: &str, seq: u32) -> Self {
         let today = day_key(now);
         if day >= today.as_str() && is_day_key(day) {
@@ -411,9 +357,6 @@ impl RefGen {
 
     pub fn next(&mut self, now: DateTime<Utc>) -> String {
         let day = day_key(now);
-        // Only move forward. A clock stepped back across midnight would
-        // otherwise restart yesterday's (or today's) sequence and reissue ids
-        // that name existing alert files. The key sorts as a date.
         if day > self.day {
             self.day = day;
             self.seq = 0;
@@ -427,12 +370,6 @@ impl RefGen {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
-/// Output theme. `Plain` is safe for journald/files, `Ansi` for a TTY, `Compact`
-/// is a dense single-block form for chat webhooks and `hermian alerts`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
     Plain,
@@ -467,8 +404,6 @@ fn palette(theme: Theme, severity: Severity) -> Palette {
         return NO_COLOR;
     }
     let sev = match severity {
-        // The identity's palette: CRITICAL in the brand red, HIGH in the
-        // accent purple, LOW and INFO in quieter greys.
         Severity::Critical => "\x1b[1;38;5;204m",
         Severity::High => "\x1b[1;38;5;141m",
         Severity::Low => "\x1b[1;38;5;146m",
@@ -484,14 +419,12 @@ fn palette(theme: Theme, severity: Severity) -> Palette {
     }
 }
 
-/// A four-step severity meter: lit dots count up with severity, echoing the
-/// logo's dot. Shared by the CLI, Telegram and email.
 pub fn severity_meter(s: Severity) -> &'static str {
     match s {
-        Severity::Critical => "\u{25C9}\u{25C9}\u{25C9}\u{25C9}", // ◉◉◉◉
-        Severity::High => "\u{25C9}\u{25C9}\u{25C9}\u{25CB}",     // ◉◉◉○
-        Severity::Low => "\u{25C9}\u{25C9}\u{25CB}\u{25CB}",      // ◉◉○○
-        Severity::Info => "\u{25C9}\u{25CB}\u{25CB}\u{25CB}",     // ◉○○○
+        Severity::Critical => "\u{25C9}\u{25C9}\u{25C9}\u{25C9}",
+        Severity::High => "\u{25C9}\u{25C9}\u{25C9}\u{25CB}",
+        Severity::Low => "\u{25C9}\u{25C9}\u{25CB}\u{25CB}",
+        Severity::Info => "\u{25C9}\u{25CB}\u{25CB}\u{25CB}",
     }
 }
 
@@ -499,7 +432,6 @@ fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Greedy word wrap that respects explicit newlines.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for para in text.split('\n') {
@@ -515,7 +447,6 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         lines.push(line);
     }
-    // Trim trailing empties produced by a trailing newline.
     while lines.last().map(|l| l.is_empty()).unwrap_or(false) && lines.len() > 1 {
         lines.pop();
     }
@@ -544,11 +475,8 @@ fn push_kv(out: &mut String, p: &Palette, label: &str, value: &str) {
     push_kv_w(out, p, label, value, LABEL_W);
 }
 
-/// Key/value row with an explicit label column width (used so every row in a
-/// block shares one width even when a label is long).
 fn push_kv_w(out: &mut String, p: &Palette, label: &str, value: &str, label_w: usize) {
     let indent = " ".repeat(GUTTER);
-    // Always leave at least two spaces between label and value, even for long labels.
     let width = label_w.max(char_len(label) + 2);
     let lab = format!("{:<w$}", label, w = width);
     let avail = WIDTH.saturating_sub(GUTTER + width);
@@ -566,7 +494,6 @@ fn shorten_path(path: &str, max: usize) -> String {
     if char_len(path) <= max {
         return path.to_string();
     }
-    // Keep the tail (file name is what matters), prefix with an ellipsis.
     let tail: String = path
         .chars()
         .rev()
@@ -617,7 +544,6 @@ fn push_chain(out: &mut String, p: &Palette, chain: &[ChainNode]) {
     }
 }
 
-/// Render an alert in the given theme.
 pub fn render(alert: &Alert, theme: Theme) -> String {
     match theme {
         Theme::Compact => render_compact(alert),
@@ -625,7 +551,6 @@ pub fn render(alert: &Alert, theme: Theme) -> String {
     }
 }
 
-/// Backwards-compatible default: plain theme.
 pub fn render_alert(alert: &Alert) -> String {
     render(alert, Theme::Plain)
 }
@@ -634,7 +559,6 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
     let p = palette(theme, alert.severity);
     let mut out = String::with_capacity(1024);
 
-    // Header band: severity left, ref right.
     let heavy = rule('\u{2501}', WIDTH);
     let light = rule('\u{2500}', WIDTH);
     let left = format!(
@@ -657,7 +581,6 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
     ));
     out.push_str(&format!("{}{}{}\n", p.sev, heavy, p.reset));
 
-    // Title
     out.push('\n');
     for l in wrap(&alert.title, WIDTH) {
         out.push_str(&format!("{}{}{}\n", p.bold, l, p.reset));
@@ -670,7 +593,6 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
     }
     out.push('\n');
 
-    // Metadata grid
     push_kv(&mut out, &p, "Host", &alert.host);
     push_kv(
         &mut out,
@@ -685,7 +607,6 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
         &format!("{}  {}", alert.detection.short(), alert.detection.name()),
     );
 
-    // Evidence
     if !alert.what.is_empty() || !alert.chain.is_empty() || !alert.facts.is_empty() {
         push_section(&mut out, &p, "What happened");
         if !alert.what.is_empty() {
@@ -742,7 +663,6 @@ fn render_block(alert: &Alert, theme: Theme) -> String {
         }
     }
 
-    // Footer
     out.push('\n');
     out.push_str(&format!("{}{}{}\n", p.dim, light, p.reset));
     let footer_l = format!("hermian show {}", alert.ref_id);
@@ -796,8 +716,6 @@ mod tests {
     use super::*;
     use crate::events::DetectionId;
 
-    /// What leaves the host in minimal mode: nothing about the machine but
-    /// its name, and how to read the alert there.
     #[test]
     fn minimal_alert_carries_no_details() {
         let f = Finding::new(
@@ -975,15 +893,12 @@ mod tests {
         let t1 = t2 - chrono::Duration::days(1);
         let mut g = RefGen::new(t2);
         let a = g.next(t2);
-        // A late event or a clock step back to yesterday.
         let b = g.next(t1);
         assert_ne!(a, b);
         assert!(b.ends_with("-002"), "{}", b);
-        // Restart with yesterday's clock but today's persisted state.
         let (day, seq) = g.state();
         let mut r = RefGen::resume(t1, day, seq);
         assert!(r.next(t1).ends_with("-003"));
-        // Garbage in the state file is ignored.
         let mut junk = RefGen::resume(t1, "zzzz", 5);
         assert!(junk.next(t1).ends_with("-001"));
     }

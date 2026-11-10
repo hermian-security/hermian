@@ -1,23 +1,10 @@
-//! Keep the alert store and logs from growing without bound.
-//!
-//! - `alerts/*.json` and `collections/*` older than
-//!   `general.alert_retention_days` are deleted (0 keeps them).
-//! - `alerts.log` is rotated by size: `alerts.log` -> `.1` -> ... -> `.N`.
-//!
-//! Runs from the daemon about once an hour, on a blocking thread.
-
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-/// Rotate `alerts.log` once it passes this size.
 pub const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
-/// Rotated copies kept (`alerts.log.1` .. `.3`).
 pub const KEEP_ROTATED: u32 = 3;
 
-/// Delete regular files (and directories, for collect bundles) directly in
-/// `dir` last modified before `now - max_age`. Symlinks are removed, never
-/// followed. Returns how many entries were deleted.
 pub fn prune_older_than(dir: &Path, max_age: Duration, now: SystemTime) -> usize {
     let Some(cutoff) = now.checked_sub(max_age) else {
         return 0;
@@ -46,7 +33,6 @@ pub fn prune_older_than(dir: &Path, max_age: Duration, now: SystemTime) -> usize
     removed
 }
 
-/// Rotate `path` if it's larger than `max_bytes`. Returns true if it did.
 pub fn rotate_if_large(path: &Path, max_bytes: u64, keep: u32) -> bool {
     let big = fs::symlink_metadata(path)
         .map(|m| m.is_file() && m.len() > max_bytes)
@@ -63,11 +49,9 @@ pub fn rotate_if_large(path: &Path, max_bytes: u64, keep: u32) -> bool {
     for n in (1..keep).rev() {
         let _ = fs::rename(numbered(n), numbered(n + 1));
     }
-    // The next append creates a fresh file (mode 0600, see write_secure_append).
     fs::rename(path, numbered(1)).is_ok()
 }
 
-/// One retention pass over the daemon's directories.
 pub fn run(retention_days: u32) {
     let now = SystemTime::now();
     let mut removed = 0;
@@ -75,8 +59,6 @@ pub fn run(retention_days: u32) {
         let age = Duration::from_secs(u64::from(retention_days) * 86_400);
         removed += prune_older_than(&crate::paths::alerts_dir(), age, now);
         removed += prune_older_than(&crate::paths::collections_dir(), age, now);
-        // Undelivered queue copies: a channel that has been broken for the
-        // whole retention window shouldn't grow the disk without bound.
         removed += prune_older_than(&crate::paths::pending_dir(), age, now);
     }
     let rotated = rotate_if_large(&crate::paths::alerts_log(), MAX_LOG_BYTES, KEEP_ROTATED);
@@ -110,7 +92,6 @@ mod tests {
         fs::write(d.join("a.json"), "{}").unwrap();
         fs::create_dir(d.join("bundle")).unwrap();
         fs::write(d.join("bundle/x"), "x").unwrap();
-        // Everything was just written: "now" a year later makes all of it old.
         let later = SystemTime::now() + Duration::from_secs(365 * 86_400);
         assert_eq!(
             prune_older_than(&d, Duration::from_secs(90 * 86_400), SystemTime::now()),
