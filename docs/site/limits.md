@@ -60,13 +60,3 @@ tell you on a channel you'll see.
   interactive activity is taken as the operator's. That can downgrade an
   unrelated write made while someone is typing to INFO.
 - **A quiet host isn't proof it's clean.** It means nothing matched.
-
-## Maturity
-
-Hermian is in beta. Ubuntu 22.04 hosts have passed the full attack and
-false-positive suites, Ubuntu 24.04 has run live on a compromised host and on
-a test host for several days, and the eBPF hooks pass their live tests on
-Ubuntu 26.04 (kernel 7.0) and on arm64 in CI. Other distributions, the RHEL
-family with SELinux, the older-kernel fallback and arm64 hardware haven't
-been verified in the field yet. What's proven, where and when, is in [Evidence](evidence), along with
-what has to happen before a stable release.
