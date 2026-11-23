@@ -61,7 +61,7 @@ class DocsSite(unittest.TestCase):
         anchors = {slug: headings(p.read_text(encoding="utf-8")) for slug, p in pages.items()}
         for slug, path in pages.items():
             if not in_site(path):
-                continue  # FLEET, EVIDENCE and BETA keep their GitHub-relative links
+                continue  # FLEET and BETA keep their GitHub-relative links
             md = strip_code(path.read_text(encoding="utf-8"))
             for target in re.findall(r"\]\(([^)\s]+)\)", md):
                 if re.match(r"[a-z]+:", target):

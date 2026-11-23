@@ -1,9 +1,8 @@
 Hermian project notes
 =====================
 
-How Hermian works inside. To install and use it, see README.md. To build,
-test and release, see CONTRIBUTING.md. What has been verified so far is in
-docs/EVIDENCE.md.
+How Hermian works inside. To install and use it, see README.md. To build
+and test, see CONTRIBUTING.md.
 
 Hermian watches a single Linux host and sends a short list of useful
 alerts, with no separate server to run. It's in beta. It isn't a full EDR,
@@ -213,5 +212,4 @@ host's glibc. Releases build on Ubuntu 22.04 (glibc 2.34 and newer).
 Portable tests cover the engine; Linux CI builds the daemon and eBPF and
 runs the self-test. Neither proves collection works on a real host: the
 attack and false-positive suites do, and they modify real auth and
-persistence files, so run them only on disposable hosts. Results and the
-burn-in plan are in docs/EVIDENCE.md.
+persistence files, so run them only on disposable hosts.

@@ -13,8 +13,9 @@ and your name on the early testers wall.
 - A Linux server with systemd: a VPS, a homelab box, a quiet production
   host. Root access.
 - Kernel 5.4 or newer (5.8+ for full coverage). amd64 or arm64.
-- Ubuntu 22.04 is the tested system, and 24.04 has run live. Others should work, and that's
-  exactly what we want to find out.
+- Validated distributions are Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13;
+  CentOS 9; and Kali Linux. Others should work, and that's exactly what we
+  want to find out.
 - No container or Kubernetes node: Hermian watches the host, not pods.
 
 
