@@ -757,15 +757,17 @@ fn call_at(
             r.body_mut().read_json::<Value>().map_err(|e| e.to_string())
         }
         Ok(mut r) => {
-            let desc = r
-                .body_mut()
-                .read_json::<Value>()
+            let status = r.status().as_u16();
+            let body = r.body_mut().read_to_string().unwrap_or_default();
+            let desc = serde_json::from_str::<Value>(&body)
                 .ok()
                 .and_then(|v| v["description"].as_str().map(str::to_string))
                 .unwrap_or_default();
-            Err(format!("HTTP {} {}", r.status().as_u16(), desc)
-                .trim()
-                .to_string())
+            if desc.is_empty() {
+                Err(format!("HTTP {status}"))
+            } else {
+                Err(format!("HTTP {status} {desc}"))
+            }
         }
         Err(e) => Err(crate::notify::webhook::strip_url_paths(
             &e.to_string().replace(&cfg.bot_token, "<token>"),
