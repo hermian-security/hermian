@@ -37,7 +37,7 @@ tool.
 
 Around 0.1% of a CPU and 15 to 25 MB of memory on the hosts measured so far.
 On the reference host it processed 925,648 events in 11 h 44 min at 0.06% of
-one core and 23 MB. See [Evidence](evidence).
+one core and 23 MB.
 
 ### Does anything leave my server?
 
@@ -85,8 +85,7 @@ commercially included, with the licence and notices kept.
 Any Linux with systemd and kernel 5.4+, amd64 or arm64. Ubuntu 22.04 has
 passed the full suites, Ubuntu 24.04 has run live, and the eBPF hooks pass
 their live tests on Ubuntu 26.04 (kernel 7.0); Debian, the RHEL family and
-arm64 hardware are being verified
-([Evidence](evidence)). Reports from other systems are
+arm64 hardware are being verified. Reports from other systems are
 welcome.
 
 ### How do I report a false positive?

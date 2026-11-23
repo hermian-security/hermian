@@ -37,5 +37,4 @@ Operations
   faq                            faq.md
 Project
   limits                         limits.md
-  evidence                       ../EVIDENCE.md  Evidence
   beta                           ../BETA.md  Beta testing
