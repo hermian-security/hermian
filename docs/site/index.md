@@ -61,5 +61,4 @@ machine, and alerts go to the channels you choose.
 
 A VPS, a homelab, or a handful of servers you look after yourself, when you
 want alerts in chat or your logs rather than another dashboard. It watches the
-host, not what runs inside containers, and it isn't a fleet console. The
-[limits page](limits) lists what it doesn't do.
+host, not what runs inside containers. You can deploy it on a fleet, the only feature you'll lose is the action buttons on telegram.
