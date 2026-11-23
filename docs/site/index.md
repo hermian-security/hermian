@@ -12,14 +12,7 @@ compromise. Then it tells you, with the evidence, the risk and what to do
 next.
 
 It runs on the host it protects. There's no agent manager, no account and no
-server to run: the daemon, its rules and its alert store all live on the
-machine, and alerts go to the channels you choose.
-
-> [!NOTE]
-> Hermian is in beta. Ubuntu 22.04 hosts have passed the full attack suite
-> and Ubuntu 24.04 has run live; other distros and longer runs are still
-> being verified. See
-> [Evidence](evidence) for what's proven and what isn't yet.
+server to run.
 
 ## Start here
 
@@ -61,5 +54,4 @@ machine, and alerts go to the channels you choose.
 
 A VPS, a homelab, or a handful of servers you look after yourself, when you
 want alerts in chat or your logs rather than another dashboard. It watches the
-host, not what runs inside containers, and it isn't a fleet console. The
-[limits page](limits) lists what it doesn't do.
+host, not what runs inside containers, you can deploy it on a fleet, but without actionable alerts.
