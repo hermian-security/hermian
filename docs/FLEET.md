@@ -1,12 +1,14 @@
 # Running Hermian on several servers
 
-How to put Hermian on 5, 20 or 50 servers that all report into one Telegram
-group. There's no central server to run: every host works on its own, and
-the group is where you see them all.
+How to put Hermian on 5, 20 or 50 servers... Note that this page is to help those who wanna deploy hermian, while using telegram, if you use mail or webhook, there will be no problem.
 
-Time: about 15 minutes once, then a minute or two per server.
+There a two methods to run hermian on a fleet :
+- One bot for all server (but you loose the feature of action buttons on telegram)
+- One bot per host, and a group chat where you add all bots (action buttons are kept since each bot is unique)
 
-## The setup in short
+We'll discuss about the 2nd method since the first os already detailed in [This page](telegram)
+
+## The setup 
 
 - **One Telegram bot and one group for every server.** You don't need a bot
   per server: many hosts can send through the same bot at the same time.
