@@ -11,6 +11,9 @@ exclude = ["hermian-ebpf"]
 # upstream release first. Vulnerabilities always fail.
 unmaintained = "workspace"
 yanked = "deny"
+# chrono has no compatible maintained drop-in replacement for this codebase yet.
+# Track removal of this temporary exception with RUSTSEC-2026-0543.
+ignore = ["RUSTSEC-2026-0543"]
 
 [licenses]
 # Exactly what the current tree uses; a new license shows up as a failure to
