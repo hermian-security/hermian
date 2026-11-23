@@ -24,9 +24,8 @@ It learns the host's normal behavior for 24 hours, folds repeats into one incide
 on itself if it's stopped or tampered and can block a source or isolate the host when you turn that on.
 
 > [!NOTE]
-> Tested with the full suites on Ubuntu 22.04, live runs on Ubuntu 24.04,
-> and live eBPF tests on Ubuntu 26.04. Debian, the RHEL family and arm64
-> hardware are still being verified.
+> Validated on Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13; CentOS 9;
+> and Kali Linux.
 
 ## Install
 
@@ -59,7 +58,8 @@ in the [install guide](https://hermian.me/docs/install/).
 
 ## Limits
 
-- RHEL with SELinux is untested yet
+- CentOS 9 and Kali Linux are validated; RHEL-family SELinux configurations
+  outside those releases may need testing.
 - **The dead-man switch is local.** It isn't an out-of-band monitor.
 
 ## Docs

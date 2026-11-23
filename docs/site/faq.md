@@ -82,11 +82,9 @@ commercially included, with the licence and notices kept.
 
 ### Which distros are supported?
 
-Any Linux with systemd and kernel 5.4+, amd64 or arm64. Ubuntu 22.04 has
-passed the full suites, Ubuntu 24.04 has run live, and the eBPF hooks pass
-their live tests on Ubuntu 26.04 (kernel 7.0); Debian, the RHEL family and
-arm64 hardware are being verified. Reports from other systems are
-welcome.
+Any Linux with systemd and kernel 5.4+, amd64 or arm64. Validated distributions
+are Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13; CentOS 9; and Kali Linux.
+Reports from other systems are welcome.
 
 ### How do I report a false positive?
 

@@ -13,7 +13,7 @@ description: Install Hermian on a Linux server with one command, from the signed
 | Kernel | 5.4 or newer. eBPF needs **5.8+**; older kernels run with reduced coverage (see [How it works](how-it-works#collectors)) |
 | Architecture | amd64 or arm64 |
 | Access | root (Hermian runs as root) |
-| Tested | Ubuntu 22.04 (full suites), 24.04 (live run) and 26.04 (live eBPF) in the field; Debian, the RHEL family and arm64 hardware are being verified |
+| Validated | Ubuntu 22.04, 24.04 and 26.04; Debian 12 and 13; CentOS 9; Kali Linux |
 
 It watches the host. On a container host it sees the host's processes and
 files, not what runs inside containers.
