@@ -8,8 +8,8 @@
 
 ![How Hermian works: it watches the server through eBPF, works out who started what, judges it against five rule families, and sends one alert per incident.](docs/how-it-works.png)
 
-Hermian is a security daemon for Linux servers. It detect intrusions and write alerts in logs,
-and send them via Telegram, email, or a webhook. There's no dashboard, no account, and no server to run.
+Hermian is a security daemon for Linux servers. It detects intrusions, writes alerts to logs,
+and sends them via Telegram, email, or a webhook. There's no dashboard, no account, and no server to run.
 
 It judges what happens with its context, who started it, from where, and whether
 someone was logged in or not, and the judgement is done across five rule families:
@@ -20,11 +20,13 @@ someone was logged in or not, and the judgement is done across five rule familie
 - **Privilege escalation:** setuid files, sudoers and shadow edits, LD_PRELOAD, ptrace
 - **Network:** C2 from a flagged chain, new destinations, new listening ports
 
-It runs a baselinne on the host's normal for 24 hours, folds repeats into one page, reports
+It learns the host's normal behavior for 24 hours, folds repeats into one incident, reports
 on itself if it's stopped or tampered and can block a source or isolate the host when you turn that on.
 
 > [!NOTE]
-> It's Validated on Ubuntu 22-24-26, Debian12-13, CentOS 9, Kali Linux.
+> Tested with the full suites on Ubuntu 22.04, live runs on Ubuntu 24.04,
+> and live eBPF tests on Ubuntu 26.04. Debian, the RHEL family and arm64
+> hardware are still being verified.
 
 ## Install
 
